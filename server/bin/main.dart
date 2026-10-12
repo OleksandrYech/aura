@@ -1,0 +1,33 @@
+import 'dart:io';
+
+import 'package:server/server.dart';
+import 'package:shelf/shelf.dart';
+import 'package:shelf/shelf_io.dart' as io;
+import 'package:shelf_static/shelf_static.dart';
+
+/// AURA_DB — файл базы (по умолчанию aura.db), AURA_WEB — папка Web-сборки, PORT — порт (8080).
+Future<void> main() async {
+  final env = Platform.environment;
+  final aura = AuraServer(env['AURA_DB'] ?? 'aura.db');
+  final webDir = env['AURA_WEB'];
+
+  var handler = aura.handler;
+  if (webDir != null && Directory(webDir).existsSync()) {
+    final web = createStaticHandler(webDir, defaultDocument: 'index.html');
+    handler = Cascade().add(aura.handler).add(web).handler;
+  }
+
+  final port = int.parse(env['PORT'] ?? '8080');
+  final server = await io.serve(
+    const Pipeline().addMiddleware(logRequests()).addHandler(handler),
+    InternetAddress.anyIPv4,
+    port,
+  );
+  print('AURA server on :${server.port}');
+
+  ProcessSignal.sigterm.watch().listen((_) async {
+    await server.close();
+    aura.close();
+    exit(0);
+  });
+}
