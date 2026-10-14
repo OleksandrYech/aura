@@ -46,7 +46,7 @@ server/   Dart-сервер
 
 ## Этап 3. Сквозное шифрование
 
-- [x] Android ходит только по HTTPS через туннель (`aura.cir-matrix.space`), HTTP запрещён
+- [x] Android ходит только по HTTPS через туннель (`web.aura-msg.space`), HTTP запрещён, адрес сервера зашит в приложение
 - [x] Ключи устройства: identity key, signed prekey, one-time prekeys; приватные ключи только на устройстве
 - [x] Сервер хранит и выдаёт публичные prekey bundles
 - [x] X3DH для установки сессии, Double Ratchet для сообщений

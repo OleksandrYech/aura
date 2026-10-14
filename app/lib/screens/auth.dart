@@ -1,6 +1,5 @@
 import 'dart:ui';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../client.dart';
@@ -138,7 +137,6 @@ class _AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<_AuthScreen> {
-  final _server = TextEditingController(text: client.server ?? AuraClient.defaultServer);
   final _nick = TextEditingController();
   final _pwd = TextEditingController();
   final _pwd2 = TextEditingController();
@@ -147,9 +145,7 @@ class _AuthScreenState extends State<_AuthScreen> {
 
   Future<void> _submit() async {
     final nick = _nick.text.trim();
-    final error = _server.text.trim().isEmpty
-        ? 'Укажите адрес сервера'
-        : !widget.register
+    final error = !widget.register
             ? (nick.isEmpty || _pwd.text.isEmpty ? 'Введите никнейм и пароль' : null)
             : nick.length < 3
                 ? 'Никнейм должен быть не короче 3 символов'
@@ -163,7 +159,7 @@ class _AuthScreenState extends State<_AuthScreen> {
 
     setState(() => _loading = true);
     try {
-      await (widget.register ? client.register : client.login)(_server.text, nick, _pwd.text);
+      await (widget.register ? client.register : client.login)(nick, _pwd.text);
       // Корневой экран сам переключится на чаты.
       if (mounted) Navigator.popUntil(context, (r) => r.isFirst);
     } on ApiException catch (e) {
@@ -203,8 +199,6 @@ class _AuthScreenState extends State<_AuthScreen> {
                   style: TextStyle(fontSize: 14, color: c.ink.withValues(alpha: 0.6)),
                 ),
                 const SizedBox(height: 20),
-                // В Web адрес подставляется сам: приложение открыто с этого сервера.
-                if (!kIsWeb) field('Сервер', _server, 'https://aura.example.com'),
                 field('Никнейм', _nick, 'aura_user'),
                 field('Пароль', _pwd, widget.register ? 'Минимум 6 символов' : '••••••••', obscure: true),
                 if (widget.register) field('Повторите пароль', _pwd2, '••••••••', obscure: true),

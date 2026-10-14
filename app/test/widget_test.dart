@@ -18,13 +18,13 @@ void main() {
     }
 
     final field = find.byType(TextField);
-    await tester.enterText(field.at(0), 'aura.example.com');
+    expect(find.text('Сервер'), findsNothing, reason: 'адрес сервера зашит в приложение');
     await submit();
     expect(find.textContaining('не короче 3'), findsOneWidget);
 
-    await tester.enterText(field.at(1), 'anna');
-    await tester.enterText(field.at(2), 'secret1');
-    await tester.enterText(field.at(3), 'secret2');
+    await tester.enterText(field.at(0), 'anna');
+    await tester.enterText(field.at(1), 'secret1');
+    await tester.enterText(field.at(2), 'secret2');
     await submit();
     expect(find.textContaining('не совпадают'), findsOneWidget);
   });
