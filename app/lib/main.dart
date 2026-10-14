@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 
 import 'client.dart';
+import 'lock.dart';
 import 'screens/auth.dart';
 import 'screens/home.dart';
 import 'theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await client.load();
+  await Future.wait([client.load(), AppLock.load()]);
   runApp(const AuraApp());
 }
 
@@ -24,6 +25,7 @@ class AuraApp extends StatelessWidget {
         theme: buildTheme(Brightness.light),
         darkTheme: buildTheme(Brightness.dark),
         themeMode: mode,
+        builder: (context, child) => LockGate(child: child!),
         // Корневой экран следует за состоянием входа: вход и выход переключают его сами.
         home: ListenableBuilder(
           listenable: client,
