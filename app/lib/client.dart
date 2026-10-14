@@ -7,6 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'signal.dart';
+
 class Message {
   Message({required this.id, required this.mine, required this.text, required this.time, this.pending = false});
 
@@ -28,7 +30,8 @@ class ApiException implements Exception {
 }
 
 /// Связь с сервером AURA и локальная история переписки.
-/// Сервер хранит сообщение только до доставки, история живёт на устройстве.
+/// Сообщения шифруются Signal Protocol отдельно для каждого устройства собеседника и для своих
+/// других устройств. Сервер хранит шифротекст только до доставки, история живёт на устройстве.
 // ponytail: история в SharedPreferences (JSON на собеседника), перейти на базу на устройстве, когда чаты станут длинными.
 class AuraClient extends ChangeNotifier {
   AuraClient._();
@@ -46,6 +49,18 @@ class AuraClient extends ChangeNotifier {
   /// Время последнего прочтения чата.
   final lastRead = <String, int>{};
 
+  /// Ключи этого устройства; есть, пока выполнен вход.
+  SignalKeys? _keys;
+
+  /// Номер этого устройства на сервере.
+  int? device;
+
+  /// Известные устройства по никнейму; сбрасываются, когда сервер говорит, что список изменился.
+  final _devices = <String, List<int>>{};
+
+  /// Шифрование и расшифровка идут строго по очереди: сессии Signal нельзя менять параллельно.
+  Future<void> _queue = Future.value();
+
   bool connected = false;
   WebSocketChannel? _ws;
   Timer? _retry;
@@ -62,6 +77,9 @@ class AuraClient extends ChangeNotifier {
     token = _prefs.getString('token');
     nick = _prefs.getString('nick');
     name = _prefs.getString('name');
+    device = _prefs.getInt('device');
+    final keys = _prefs.getString('signal');
+    if (keys != null) _keys = SignalKeys.fromJson(keys);
     final raw = _prefs.getString('chats');
     if (raw != null) {
       final j = jsonDecode(raw) as Map<String, dynamic>;
@@ -71,7 +89,11 @@ class AuraClient extends ChangeNotifier {
       names.addAll((j['names'] as Map<String, dynamic>).cast());
       lastRead.addAll((j['lastRead'] as Map<String, dynamic>).cast());
     }
-    if (signedIn) _connect();
+    if (signedIn && _keys != null) {
+      _connect();
+    } else if (signedIn) {
+      await logout(); // вход сделан до шифрования: нужно войти заново
+    }
   }
 
   // --- Аккаунт ---
@@ -88,12 +110,24 @@ class AuraClient extends ChangeNotifier {
     final res = await _request('POST', Uri.parse('$server$path'), body);
     this.server = server;
     token = res['token'];
+    // Каждый вход — новое устройство со своими ключами. Публикуем их до того, как считать вход выполненным.
+    final keys = SignalKeys.generate();
+    try {
+      await _request('PUT', _api('/api/keys'), keys.publicBundle());
+    } catch (_) {
+      token = null;
+      rethrow;
+    }
+    _keys = keys;
     nick = res['nick'];
     name = res['name'];
+    device = res['device'];
     await _prefs.setString('server', server);
     await _prefs.setString('token', token!);
     await _prefs.setString('nick', nick!);
     await _prefs.setString('name', name!);
+    await _prefs.setInt('device', device!);
+    await _saveKeys();
     notifyListeners();
     _connect();
   }
@@ -114,18 +148,29 @@ class AuraClient extends ChangeNotifier {
     return users;
   }
 
+  /// Код безопасности с собеседником: сверьте его при встрече или по другому каналу.
+  Future<String> safetyNumber(String peer) async {
+    Future<List<String>> keys(String n) async => [
+      for (final d in await _request('GET', _api('/api/devices/$n'), null) as List) d['identityKey'] as String,
+    ];
+    return SignalKeys.safetyNumber(nick!, await keys(nick!), peer, await keys(peer));
+  }
+
   Future<void> logout() async {
     _retry?.cancel();
     final ws = _ws;
     _ws = null;
     await ws?.sink.close();
-    token = nick = name = null;
+    // Сервер удаляет устройство и его ключи; если связи нет, просто забываем их здесь.
+    if (token != null && server != null) _request('POST', _api('/api/logout'), {}).ignore();
+    token = nick = name = device = _keys = null;
     connected = false;
     chats.clear();
     names.clear();
     lastRead.clear();
+    _devices.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
-    for (final k in ['token', 'nick', 'name', 'chats']) {
+    for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats']) {
       await _prefs.remove(k);
     }
     notifyListeners();
@@ -155,7 +200,7 @@ class AuraClient extends ChangeNotifier {
     final m = Message(id: _newId(), mine: true, text: text, time: DateTime.now().millisecondsSinceEpoch, pending: true);
     chats.putIfAbsent(to, () => []).add(m);
     _save();
-    _wsSend({'type': 'send', 'id': m.id, 'to': to, 'text': text});
+    _deliver(to, m);
   }
 
   void markRead(String peer) {
@@ -168,16 +213,63 @@ class AuraClient extends ChangeNotifier {
     return last != null && !last.mine && last.time > (lastRead[peer] ?? 0);
   }
 
+  Future<void> _serial(Future<void> Function() job) => _queue = _queue.then((_) => job()).catchError((Object e) {
+    debugPrint('AURA: $e');
+  });
+
+  /// Собеседнику, а затем копия на свои другие устройства, чтобы переписка была видна везде.
+  Future<void> _deliver(String to, Message m) => _serial(() async {
+    if (await _sendCopy(to, m, {'text': m.text})) await _sendCopy(nick!, m, {'text': m.text, 'peer': to});
+  });
+
+  /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
+  Future<bool> _sendCopy(String target, Message m, Map<String, dynamic> content) async {
+    if (!connected || _keys == null) return false;
+    final keys = _keys!;
+    final devices = _devices[target] ??= [
+      for (final d in await _request('GET', _api('/api/devices/$target'), null) as List)
+        if (target != nick || d['device'] != device) d['device'] as int,
+    ];
+    if (devices.isEmpty) return false;
+    final payloads = [];
+    for (final d in devices) {
+      if (!keys.hasSession(target, d)) {
+        await keys.startSession(target, await _request('GET', _api('/api/keys/$target/$d'), null));
+      }
+      payloads.add(await keys.encrypt(target, d, jsonEncode(content)));
+    }
+    await _saveKeys();
+    _wsSend({'type': 'send', 'id': m.id, 'to': target, 'payloads': payloads});
+    return true;
+  }
+
+  Future<void> _receive(Map<String, dynamic> msg) async {
+    final String id = msg['id'], from = msg['from'];
+    // Дубль (повторная доставка) не расшифровываем второй раз.
+    if (!chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
+      var peer = from;
+      String text;
+      try {
+        final content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
+        text = content['text'];
+        if (from == nick) peer = content['peer']; // копия своего сообщения с другого устройства
+      } catch (e) {
+        debugPrint('AURA: не расшифровано $id от $from: $e');
+        text = '⚠ Не удалось расшифровать сообщение';
+      }
+      await _saveKeys();
+      chats.putIfAbsent(peer, () => []).add(Message(id: id, mine: from == nick, text: text, time: msg['sentAt']));
+      _save();
+    }
+    _wsSend({'type': 'ack', 'id': id});
+  }
+
   void _connect() {
     _retry?.cancel();
     final ws = WebSocketChannel.connect(Uri.parse(server!.replaceFirst('http', 'ws')).replace(path: '/ws'));
     _ws = ws;
     ws.sink.add(jsonEncode({'type': 'auth', 'token': token}));
-    ws.stream.listen(
-      (raw) => _onMessage(jsonDecode(raw as String)),
-      onDone: () => _onClosed(ws),
-      onError: (_) {},
-    );
+    ws.stream.listen((raw) => _onMessage(jsonDecode(raw as String)), onDone: () => _onClosed(ws), onError: (_) {});
   }
 
   void _onClosed(WebSocketChannel ws) {
@@ -197,28 +289,49 @@ class AuraClient extends ChangeNotifier {
       case 'ready':
         connected = true;
         _backoff = 1;
+        if ((msg['preKeys'] as int) < SignalKeys.preKeyBatch ~/ 2) _refillPreKeys();
         // Переотправляем то, что не дошло до сервера; сервер отбрасывает дубли по id.
         for (final MapEntry(key: to, value: list) in chats.entries) {
           for (final m in list.where((m) => m.pending)) {
-            _wsSend({'type': 'send', 'id': m.id, 'to': to, 'text': m.text});
+            _deliver(to, m);
           }
         }
-      case 'sent':
+      case 'sent' when msg['to'] != nick:
         for (final list in chats.values) {
           for (final m in list.where((m) => m.id == msg['id'])) {
             m.pending = false;
           }
         }
         _save();
-      case 'message':
-        final list = chats.putIfAbsent(msg['from'], () => []);
-        if (!list.any((m) => m.id == msg['id'])) {
-          list.add(Message(id: msg['id'], mine: false, text: msg['text'], time: msg['sentAt']));
-          _save();
+      case 'error' when msg['error'] == 'devices':
+        // У получателя появилось или пропало устройство: берём новый список и шифруем заново.
+        final String to = msg['to'];
+        _devices.remove(to);
+        for (final MapEntry(key: peer, value: list) in chats.entries) {
+          for (final m in list.where((m) => m.id == msg['id'])) {
+            if (to == nick) {
+              _serial(() async => await _sendCopy(nick!, m, {'text': m.text, 'peer': peer}));
+            } else {
+              _deliver(peer, m);
+            }
+          }
         }
-        _wsSend({'type': 'ack', 'id': msg['id']});
+      case 'message':
+        _serial(() => _receive(msg));
     }
     notifyListeners();
+  }
+
+  /// Одноразовые prekey расходуются собеседниками, когда те начинают с нами переписку.
+  void _refillPreKeys() => _serial(() async {
+    final keys = _keys!;
+    final preKeys = keys.newPreKeys();
+    await _saveKeys(); // сначала сохраняем приватные части, потом публикуем
+    await _request('PUT', _api('/api/keys'), {'preKeys': preKeys});
+  });
+
+  Future<void> _saveKeys() async {
+    if (_keys != null) await _prefs.setString('signal', _keys!.toJson());
   }
 
   void _wsSend(Map<String, dynamic> msg) {

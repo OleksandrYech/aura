@@ -14,8 +14,12 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 final _nickRe = RegExp(r'^[a-z0-9_]{3,32}$');
 final _random = Random.secure();
 
-/// Сервер AURA: аккаунты, сессии и доставка сообщений «сохранить и переслать».
-/// Сообщение хранится только пока получатель его не подтвердил, затем удаляется.
+typedef Device = ({String nick, int device});
+
+/// Сервер AURA: аккаунты, устройства, публичные ключи и доставка зашифрованных сообщений
+/// «сохранить и переслать». Открытого текста сервер не видит: у каждого устройства свои ключи
+/// Signal Protocol, отправитель шифрует сообщение отдельно для каждого устройства получателя.
+/// Сообщение хранится только пока устройство его не подтвердило, затем удаляется.
 class AuraServer {
   AuraServer(String dbPath) : db = sqlite3.open(dbPath) {
     db.execute('''
@@ -25,35 +29,71 @@ class AuraServer {
         nick TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         password_hash TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        next_device INTEGER NOT NULL DEFAULT 1
       ) STRICT;
-      CREATE TABLE IF NOT EXISTS sessions (
+    ''');
+    if (db.select('PRAGMA user_version').first.values.first == 0) {
+      // Этап 3: сессии стали устройствами с ключами, очередь с открытым текстом удаляется,
+      // всем нужно войти заново.
+      db.execute('DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS sessions;');
+      if (!db.select('PRAGMA table_info(users)').any((c) => c['name'] == 'next_device')) {
+        db.execute('ALTER TABLE users ADD COLUMN next_device INTEGER NOT NULL DEFAULT 1');
+      }
+    }
+    db.execute('''
+      PRAGMA user_version = 1;
+      CREATE TABLE IF NOT EXISTS devices (
         token_hash TEXT PRIMARY KEY,
         nick TEXT NOT NULL REFERENCES users(nick) ON DELETE CASCADE,
-        created_at INTEGER NOT NULL
+        device INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        registration_id INTEGER,
+        identity_key TEXT,
+        signed_prekey_id INTEGER,
+        signed_prekey TEXT,
+        signed_prekey_sig TEXT,
+        UNIQUE (nick, device)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS prekeys (
+        nick TEXT NOT NULL,
+        device INTEGER NOT NULL,
+        key_id INTEGER NOT NULL,
+        public_key TEXT NOT NULL,
+        PRIMARY KEY (nick, device, key_id),
+        FOREIGN KEY (nick, device) REFERENCES devices(nick, device) ON DELETE CASCADE
       ) STRICT;
       CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        sender TEXT NOT NULL REFERENCES users(nick) ON DELETE CASCADE,
-        recipient TEXT NOT NULL REFERENCES users(nick) ON DELETE CASCADE,
+        id TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        sender_device INTEGER NOT NULL,
+        recipient TEXT NOT NULL,
+        recipient_device INTEGER NOT NULL,
+        type INTEGER NOT NULL,
         body TEXT NOT NULL,
-        sent_at INTEGER NOT NULL
+        sent_at INTEGER NOT NULL,
+        PRIMARY KEY (id, recipient, recipient_device),
+        FOREIGN KEY (recipient, recipient_device) REFERENCES devices(nick, device) ON DELETE CASCADE
       ) STRICT;
-      CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, sent_at);
+      CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, recipient_device, sent_at);
     ''');
   }
 
   final Database db;
 
-  /// Открытые WebSocket-соединения по никнейму (несколько устройств на аккаунт).
-  final _online = <String, Set<WebSocketChannel>>{};
+  /// Открытые WebSocket-соединения по устройству.
+  final _online = <Device, WebSocketChannel>{};
 
   Handler get handler {
     final api = Router()
       ..post('/api/register', _register)
       ..post('/api/login', _login)
+      ..post('/api/logout', _authed(_logout))
       ..get('/api/users', _authed(_searchUsers))
       ..put('/api/me', _authed(_updateMe))
+      ..put('/api/keys', _authed(_putKeys))
+      ..get('/api/devices/<nick>', _authed(_devices))
+      ..get('/api/keys/<nick>/<device>', _authed(_bundle))
       ..get('/ws', webSocketHandler(_onSocket, pingInterval: const Duration(seconds: 30)));
     return api.call;
   }
@@ -74,7 +114,12 @@ class AuraServer {
     if (db.select('SELECT 1 FROM users WHERE nick = ?', [nick]).isNotEmpty) {
       return _error(409, 'Этот никнейм уже занят');
     }
-    db.execute('INSERT INTO users VALUES (?, ?, ?, ?)', [nick, name.isEmpty ? nick : name, hash, _now()]);
+    db.execute('INSERT INTO users (nick, name, password_hash, created_at) VALUES (?, ?, ?, ?)', [
+      nick,
+      name.isEmpty ? nick : name,
+      hash,
+      _now(),
+    ]);
     return _session(nick);
   }
 
@@ -93,44 +138,145 @@ class AuraServer {
   }
 
   /// Найти можно только по точному никнейму: список всех пользователей не раскрывается.
-  Response _searchUsers(Request req, String me) {
+  Response _searchUsers(Request req, Device me) {
     final q = (req.url.queryParameters['q'] ?? '').trim().toLowerCase();
-    final rows = db.select('SELECT nick, name FROM users WHERE nick = ? AND nick != ?', [q, me]);
+    final rows = db.select('SELECT nick, name FROM users WHERE nick = ? AND nick != ?', [q, me.nick]);
     return _ok([
       for (final r in rows) {'nick': r['nick'], 'name': r['name']},
     ]);
   }
 
-  Future<Response> _updateMe(Request req, String me) async {
+  Future<Response> _updateMe(Request req, Device me) async {
     final name = ((await _json(req))['name'] as String? ?? '').trim();
     if (name.isEmpty || name.length > 64) return _error(400, 'Введите имя');
-    db.execute('UPDATE users SET name = ? WHERE nick = ?', [name, me]);
-    return _ok({'nick': me, 'name': name});
+    db.execute('UPDATE users SET name = ? WHERE nick = ?', [name, me.nick]);
+    return _ok({'nick': me.nick, 'name': name});
   }
 
+  /// Каждый вход создаёт новое устройство. Номера устройств не повторяются,
+  /// поэтому ключ на одном адресе «ник:устройство» никогда не меняется.
   Response _session(String nick) {
     final token = base64Url.encode(List.generate(32, (_) => _random.nextInt(256)));
-    db.execute('INSERT INTO sessions VALUES (?, ?, ?)', [_sha(token), nick, _now()]);
-    final name = db.select('SELECT name FROM users WHERE nick = ?', [nick]).first['name'];
-    return _ok({'token': token, 'nick': nick, 'name': name});
+    final user = db.select(
+      'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, next_device - 1 AS device',
+      [nick],
+    ).first;
+    db.execute('INSERT INTO devices (token_hash, nick, device, created_at) VALUES (?, ?, ?, ?)', [
+      _sha(token),
+      nick,
+      user['device'],
+      _now(),
+    ]);
+    return _ok({'token': token, 'nick': nick, 'name': user['name'], 'device': user['device']});
   }
 
-  String? _userFor(String? token) => token == null
-      ? null
-      : db.select('SELECT nick FROM sessions WHERE token_hash = ?', [_sha(token)]).firstOrNull?['nick'] as String?;
+  Response _logout(Request req, Device me) {
+    _online.remove(me)?.sink.close(4401, 'logout');
+    db.execute('DELETE FROM devices WHERE nick = ? AND device = ?', [me.nick, me.device]);
+    return _ok({});
+  }
 
-  Handler _authed(FutureOr<Response> Function(Request, String nick) h) => (req) {
+  // --- Ключи Signal Protocol (только публичные части) ---
+
+  /// {registrationId, identityKey, signedPreKey: {id, key, signature}, preKeys: [{id, key}]}.
+  /// Ключ личности задаётся один раз, остальное можно обновлять и пополнять.
+  Future<Response> _putKeys(Request req, Device me) async {
+    final body = await _json(req);
+    final identity = body['identityKey'], reg = body['registrationId'], spk = body['signedPreKey'];
+    final preKeys = body['preKeys'] ?? [];
+    bool key(Object? k) => k is String && k.isNotEmpty && k.length <= 200;
+    if ((identity != null && !key(identity)) ||
+        (identity != null && reg is! int) ||
+        (spk != null && (spk is! Map || spk['id'] is! int || !key(spk['key']) || !key(spk['signature']))) ||
+        preKeys is! List ||
+        preKeys.length > 200 ||
+        preKeys.any((p) => p is! Map || p['id'] is! int || !key(p['key']))) {
+      return _error(400, 'Некорректные ключи');
+    }
+    final current = db.select('SELECT identity_key FROM devices WHERE nick = ? AND device = ?', [
+      me.nick,
+      me.device,
+    ]).first;
+    if (identity != null) {
+      if (current['identity_key'] != null && current['identity_key'] != identity) {
+        return _error(409, 'Ключ устройства уже задан');
+      }
+      db.execute('UPDATE devices SET identity_key = ?, registration_id = ? WHERE nick = ? AND device = ?', [
+        identity,
+        reg,
+        me.nick,
+        me.device,
+      ]);
+    }
+    if (spk is Map) {
+      db.execute(
+        'UPDATE devices SET signed_prekey_id = ?, signed_prekey = ?, signed_prekey_sig = ? WHERE nick = ? AND device = ?',
+        [spk['id'], spk['key'], spk['signature'], me.nick, me.device],
+      );
+    }
+    for (final p in preKeys) {
+      db.execute('INSERT OR REPLACE INTO prekeys VALUES (?, ?, ?, ?)', [me.nick, me.device, p['id'], p['key']]);
+    }
+    return _ok({'preKeys': _preKeyCount(me)});
+  }
+
+  int _preKeyCount(Device d) =>
+      db.select('SELECT count(*) AS n FROM prekeys WHERE nick = ? AND device = ?', [d.nick, d.device]).first['n']
+          as int;
+
+  /// Устройства собеседника, готовые принимать сообщения (с ключами).
+  List<Row> _readyDevices(String nick) => db.select(
+    'SELECT device, identity_key FROM devices WHERE nick = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL ORDER BY device',
+    [nick],
+  );
+
+  Response _devices(Request req, Device me, String nick) => _ok([
+    for (final r in _readyDevices(nick.toLowerCase())) {'device': r['device'], 'identityKey': r['identity_key']},
+  ]);
+
+  /// Набор ключей для X3DH. Одноразовый prekey выдаётся один раз и удаляется.
+  Response _bundle(Request req, Device me, String nick, String device) {
+    final d = db.select(
+      'SELECT * FROM devices WHERE nick = ? AND device = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL',
+      [nick.toLowerCase(), int.tryParse(device)],
+    ).firstOrNull;
+    if (d == null) return _error(404, 'Устройство не найдено');
+    final pk = db.select(
+      'DELETE FROM prekeys WHERE rowid = (SELECT rowid FROM prekeys WHERE nick = ? AND device = ? LIMIT 1) RETURNING key_id, public_key',
+      [d['nick'], d['device']],
+    ).firstOrNull;
+    return _ok({
+      'device': d['device'],
+      'registrationId': d['registration_id'],
+      'identityKey': d['identity_key'],
+      'signedPreKey': {'id': d['signed_prekey_id'], 'key': d['signed_prekey'], 'signature': d['signed_prekey_sig']},
+      'preKey': pk == null ? null : {'id': pk['key_id'], 'key': pk['public_key']},
+    });
+  }
+
+  Device? _deviceFor(Object? token) {
+    if (token is! String) return null;
+    final r = db.select('SELECT nick, device FROM devices WHERE token_hash = ?', [_sha(token)]).firstOrNull;
+    return r == null ? null : (nick: r['nick'] as String, device: r['device'] as int);
+  }
+
+  Handler _authed(Function h) => (req) {
     final auth = req.headers['authorization'];
-    final nick = _userFor(auth != null && auth.startsWith('Bearer ') ? auth.substring(7) : null);
-    return nick == null ? _error(401, 'Нужно войти') : h(req, nick);
+    final me = _deviceFor(auth != null && auth.startsWith('Bearer ') ? auth.substring(7) : null);
+    if (me == null) return _error(401, 'Нужно войти');
+    // Параметры пути (<nick>, <device>) идут следом за устройством.
+    return Function.apply(h, [req, me, ...req.params.values]) as FutureOr<Response>;
   };
 
   // --- WebSocket ---
-  // Клиент → сервер: {type: auth, token}, {type: send, id, to, text}, {type: ack, id}
-  // Сервер → клиент: {type: ready}, {type: sent, id}, {type: message, id, from, text, sentAt}, {type: error, id?, error}
+  // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}]}, {type: ack, id}
+  // Сервер → клиент: {type: ready, device, preKeys}, {type: sent, id, to},
+  //   {type: message, id, from, device, ctype, body, sentAt}, {type: error, id?, to?, error}
+  // body — шифротекст Signal (base64), ctype — его тип (2 обычное, 3 с установкой сессии).
+  // error: devices — список устройств получателя изменился, нужно запросить его заново.
 
   void _onSocket(WebSocketChannel ws, String? _) {
-    String? me;
+    Device? me;
     ws.stream.listen(
       (raw) {
         final Map<String, dynamic> msg;
@@ -141,61 +287,105 @@ class AuraServer {
           return;
         }
         if (me == null) {
-          final token = msg['token'];
-          me = msg['type'] == 'auth' && token is String ? _userFor(token) : null;
-          if (me == null) {
+          final d = msg['type'] == 'auth' ? _deviceFor(msg['token']) : null;
+          if (d == null) {
             ws.sink.close(4401, 'unauthorized');
             return;
           }
-          _online.putIfAbsent(me!, () => {}).add(ws);
-          ws.sink.add(jsonEncode({'type': 'ready'}));
-          _flush(me!, ws);
+          me = d;
+          _online.remove(d)?.sink.close(); // то же устройство переподключилось
+          _online[d] = ws;
+          ws.sink.add(jsonEncode({'type': 'ready', 'device': d.device, 'preKeys': _preKeyCount(d)}));
+          _flush(d, ws);
           return;
         }
         switch (msg['type']) {
           case 'send':
             _send(me!, ws, msg);
           case 'ack' when msg['id'] is String:
-            db.execute('DELETE FROM messages WHERE id = ? AND recipient = ?', [msg['id'], me]);
+            db.execute('DELETE FROM messages WHERE id = ? AND recipient = ? AND recipient_device = ?', [
+              msg['id'],
+              me!.nick,
+              me!.device,
+            ]);
         }
       },
       onDone: () {
-        if (me == null) return;
-        _online[me]?.remove(ws);
-        if (_online[me]?.isEmpty ?? false) _online.remove(me);
+        if (me != null && _online[me] == ws) _online.remove(me);
       },
     );
   }
 
-  void _send(String me, WebSocketChannel ws, Map<String, dynamic> msg) {
-    final id = msg['id'], to = msg['to'], text = msg['text'];
+  void _send(Device me, WebSocketChannel ws, Map<String, dynamic> msg) {
+    final id = msg['id'], to = msg['to'], payloads = msg['payloads'];
+    void error(String e) => ws.sink.add(jsonEncode({'type': 'error', 'id': id, 'to': to, 'error': e}));
     if (id is! String ||
         id.isEmpty ||
         id.length > 64 ||
         to is! String ||
-        text is! String ||
-        text.isEmpty ||
-        text.length > 64000) {
-      return ws.sink.add(jsonEncode({'type': 'error', 'id': id, 'error': 'Некорректное сообщение'}));
+        payloads is! List ||
+        payloads.any(
+          (p) =>
+              p is! Map ||
+              p['device'] is! int ||
+              (p['type'] != 2 && p['type'] != 3) ||
+              p['body'] is! String ||
+              (p['body'] as String).length > 100000,
+        )) {
+      return error('Некорректное сообщение');
     }
-    if (db.select('SELECT 1 FROM users WHERE nick = ?', [to]).isEmpty) {
-      return ws.sink.add(jsonEncode({'type': 'error', 'id': id, 'error': 'Пользователь не найден'}));
+    // Шифротекст должен быть ровно для каждого готового устройства получателя (кроме самого отправителя).
+    final expected = {for (final r in _readyDevices(to)) r['device'] as int}
+      ..removeWhere((d) => to == me.nick && d == me.device);
+    final given = {for (final p in payloads) p['device'] as int};
+    if (expected.isEmpty) return error('Собеседник ещё не вошёл ни на одном устройстве');
+    if (given.length != payloads.length || !given.containsAll(expected) || !expected.containsAll(given)) {
+      return error('devices');
     }
     final sentAt = _now();
-    // Повтор того же id (переотправка после обрыва связи) не создаёт дубль.
-    db.execute('INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?)', [id, me, to, text, sentAt]);
-    ws.sink.add(jsonEncode({'type': 'sent', 'id': id}));
-    final out = jsonEncode({'type': 'message', 'id': id, 'from': me, 'text': text, 'sentAt': sentAt});
-    for (final s in _online[to] ?? const <WebSocketChannel>{}) {
-      s.sink.add(out);
+    for (final p in payloads) {
+      // Повтор того же id (переотправка после обрыва связи) не создаёт дубль.
+      db.execute('INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [
+        id,
+        me.nick,
+        me.device,
+        to,
+        p['device'],
+        p['type'],
+        p['body'],
+        sentAt,
+      ]);
+      _online[(nick: to, device: p['device'] as int)]?.sink.add(
+        jsonEncode({
+          'type': 'message',
+          'id': id,
+          'from': me.nick,
+          'device': me.device,
+          'ctype': p['type'],
+          'body': p['body'],
+          'sentAt': sentAt,
+        }),
+      );
     }
+    ws.sink.add(jsonEncode({'type': 'sent', 'id': id, 'to': to}));
   }
 
-  void _flush(String me, WebSocketChannel ws) {
-    final rows = db.select('SELECT id, sender, body, sent_at FROM messages WHERE recipient = ? ORDER BY sent_at', [me]);
+  void _flush(Device me, WebSocketChannel ws) {
+    final rows = db.select(
+      'SELECT id, sender, sender_device, type, body, sent_at FROM messages WHERE recipient = ? AND recipient_device = ? ORDER BY sent_at',
+      [me.nick, me.device],
+    );
     for (final r in rows) {
       ws.sink.add(
-        jsonEncode({'type': 'message', 'id': r['id'], 'from': r['sender'], 'text': r['body'], 'sentAt': r['sent_at']}),
+        jsonEncode({
+          'type': 'message',
+          'id': r['id'],
+          'from': r['sender'],
+          'device': r['sender_device'],
+          'ctype': r['type'],
+          'body': r['body'],
+          'sentAt': r['sent_at'],
+        }),
       );
     }
   }
