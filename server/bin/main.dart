@@ -5,10 +5,11 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_static/shelf_static.dart';
 
-/// AURA_DB — файл базы (по умолчанию aura.db), AURA_WEB — папка Web-сборки, PORT — порт (8080).
+/// AURA_DB — файл базы (по умолчанию aura.db), AURA_FILES — папка зашифрованных файлов
+/// (по умолчанию files рядом с базой), AURA_WEB — папка Web-сборки, PORT — порт (8080).
 Future<void> main() async {
   final env = Platform.environment;
-  final aura = AuraServer(env['AURA_DB'] ?? 'aura.db');
+  final aura = AuraServer(env['AURA_DB'] ?? 'aura.db', files: env['AURA_FILES']);
   final webDir = env['AURA_WEB'];
 
   var handler = aura.handler;

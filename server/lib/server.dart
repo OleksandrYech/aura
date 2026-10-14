@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
@@ -20,8 +22,12 @@ typedef Device = ({String nick, int device});
 /// «сохранить и переслать». Открытого текста сервер не видит: у каждого устройства свои ключи
 /// Signal Protocol, отправитель шифрует сообщение отдельно для каждого устройства получателя.
 /// Сообщение хранится только пока устройство его не подтвердило, затем удаляется.
+/// Файлы клиент шифрует сам случайным ключом и отправляет ключ внутри сообщения: сервер хранит
+/// только зашифрованные байты в [files] и удаляет их через [fileDays] дней.
 class AuraServer {
-  AuraServer(String dbPath) : db = sqlite3.open(dbPath) {
+  AuraServer(String dbPath, {String? files})
+    : db = sqlite3.open(dbPath),
+      files = Directory(files ?? p.join(p.dirname(dbPath), 'files'))..createSync(recursive: true) {
     db.execute('''
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -80,6 +86,10 @@ class AuraServer {
   }
 
   final Database db;
+  final Directory files;
+
+  static const maxFile = 25 << 20;
+  static const fileDays = 30;
 
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
@@ -94,6 +104,8 @@ class AuraServer {
       ..put('/api/keys', _authed(_putKeys))
       ..get('/api/devices/<nick>', _authed(_devices))
       ..get('/api/keys/<nick>/<device>', _authed(_bundle))
+      ..post('/api/files', _authed(_upload))
+      ..get('/api/files/<id>', _authed(_download))
       ..get('/ws', webSocketHandler(_onSocket, pingInterval: const Duration(seconds: 30)));
     return api.call;
   }
@@ -267,6 +279,36 @@ class AuraServer {
     // Параметры пути (<nick>, <device>) идут следом за устройством.
     return Function.apply(h, [req, me, ...req.params.values]) as FutureOr<Response>;
   };
+
+  // --- Файлы ---
+
+  Future<Response> _upload(Request req, Device me) async {
+    final tooBig = _error(413, 'Файл больше ${maxFile >> 20} МБ');
+    if ((req.contentLength ?? 0) > maxFile) return tooBig;
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in req.read()) {
+      bytes.add(chunk);
+      if (bytes.length > maxFile) return tooBig;
+    }
+    if (bytes.isEmpty) return _error(400, 'Пустой файл');
+    final id = List.generate(16, (_) => _random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+    await File(p.join(files.path, id)).writeAsBytes(bytes.takeBytes());
+    _pruneFiles();
+    return _ok({'id': id});
+  }
+
+  Response _download(Request req, Device me, String id) {
+    final f = File(p.join(files.path, id));
+    if (!RegExp(r'^[0-9a-f]{32}$').hasMatch(id) || !f.existsSync()) return _error(404, 'Файл не найден или уже удалён');
+    return Response.ok(f.openRead(), headers: {'content-type': 'application/octet-stream', 'content-length': '${f.lengthSync()}'});
+  }
+
+  void _pruneFiles() {
+    final old = DateTime.now().subtract(const Duration(days: fileDays));
+    for (final f in files.listSync().whereType<File>()) {
+      if (f.statSync().modified.isBefore(old)) f.deleteSync();
+    }
+  }
 
   // --- WebSocket ---
   // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}]}, {type: ack, id}

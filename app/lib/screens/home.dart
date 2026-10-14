@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../client.dart';
+import '../media.dart';
 import '../theme.dart';
 import 'settings.dart';
 
@@ -135,7 +138,7 @@ class ChatsTab extends StatelessWidget {
                             Expanded(child: Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500))),
                             Text(formatTime(last.time), style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.5))),
                           ]),
-                          subtitle: Text('${last.mine ? 'Вы: ' : ''}${last.text}',
+                          subtitle: Text('${last.mine ? 'Вы: ' : ''}${last.preview}',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6))),
@@ -246,6 +249,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _draft = TextEditingController();
+  int _uploading = 0;
 
   @override
   void initState() {
@@ -269,6 +273,19 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     client.send(widget.peer, text);
     _draft.clear();
+  }
+
+  Future<void> _attach() async {
+    for (final f in await FilePicker.pickFiles()) {
+      setState(() => _uploading++);
+      try {
+        await client.sendFile(widget.peer, f.name, await f.readAsBytes());
+      } on ApiException catch (e) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${f.name}: $e')));
+      } finally {
+        if (mounted) setState(() => _uploading--);
+      }
+    }
   }
 
   @override
@@ -322,10 +339,12 @@ class _ChatScreenState extends State<ChatScreen> {
                           borderRadius: BorderRadius.circular(radiusLg),
                         ),
                         child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: SelectableText(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
-                          ),
+                          if (m.file != null) Attachment(m.file!),
+                          if (m.text.isNotEmpty)
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: SelectableText(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
+                            ),
                           const SizedBox(height: 4),
                           Row(mainAxisSize: MainAxisSize.min, children: [
                             Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
@@ -342,9 +361,16 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
+          if (_uploading > 0) const LinearProgressIndicator(minHeight: 2),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
             child: Row(children: [
+              IconButton(
+                tooltip: 'Прикрепить файл',
+                icon: Icon(Icons.attach_file, color: c.ink),
+                onPressed: _attach,
+              ),
+              const SizedBox(width: 4),
               Expanded(
                 child: TextField(
                   controller: _draft,
@@ -371,6 +397,81 @@ class _ChatScreenState extends State<ChatScreen> {
             ]),
           ),
         ]),
+      ),
+    );
+  }
+}
+
+/// Вложение в пузыре: фото показываем сразу, остальные файлы сохраняются по нажатию.
+/// Байты скачиваются с сервера и расшифровываются на устройстве.
+class Attachment extends StatelessWidget {
+  const Attachment(this.file, {super.key});
+  final Map<String, dynamic> file;
+
+  Future<void> _save(Uint8List bytes) => FilePicker.saveFile(fileName: file['name'], bytes: bytes);
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    final String name = file['name'];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: FutureBuilder(
+        future: isImage(name) ? client.fileBytes(file) : null,
+        builder: (context, snap) {
+          if (snap.data case final bytes?) {
+            return GestureDetector(
+              onTap: () => showDialog(
+                context: context,
+                builder: (_) => Dialog(
+                  insetPadding: const EdgeInsets.all(12),
+                  child: Stack(alignment: Alignment.topRight, children: [
+                    InteractiveViewer(child: Image.memory(bytes)),
+                    IconButton(
+                      tooltip: 'Сохранить',
+                      icon: const Icon(Icons.download_outlined),
+                      onPressed: () => _save(bytes),
+                    ),
+                  ]),
+                ),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(radiusMd),
+                child: Image.memory(bytes, fit: BoxFit.cover, semanticLabel: name),
+              ),
+            );
+          }
+          final loading = isImage(name) && snap.connectionState != ConnectionState.done;
+          return InkWell(
+            borderRadius: BorderRadius.circular(radiusMd),
+            onTap: loading
+                ? null
+                : () async {
+                    final messenger = ScaffoldMessenger.of(context);
+                    try {
+                      final bytes = await client.fileBytes(file);
+                      if (context.mounted) await _save(bytes);
+                    } catch (e) {
+                      messenger.showSnackBar(SnackBar(content: Text('$name: $e')));
+                    }
+                  },
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              loading
+                  ? const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                  : Icon(snap.hasError ? Icons.broken_image_outlined : Icons.insert_drive_file_outlined, color: c.ink),
+              const SizedBox(width: 10),
+              Flexible(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
+                  Text(
+                    snap.hasError ? '${snap.error}' : formatSize(file['size']),
+                    style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.6)),
+                  ),
+                ]),
+              ),
+            ]),
+          );
+        },
       ),
     );
   }

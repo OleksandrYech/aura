@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'media.dart';
 import 'signal.dart';
 
 /// Статус сообщения. Свои: в очереди → отправлено → доставлено → прочитано.
@@ -14,19 +15,35 @@ import 'signal.dart';
 enum Status { pending, sent, delivered, read }
 
 class Message {
-  Message({required this.id, required this.mine, required this.text, required this.time, required this.status});
+  Message({required this.id, required this.mine, required this.text, required this.time, required this.status, this.file});
 
   final String id, text;
   final bool mine;
   final int time; // мс с эпохи
   Status status;
 
-  Map<String, dynamic> toJson() => {'id': id, 'mine': mine, 'text': text, 'time': time, 'status': status.name};
+  /// Вложение: {id, key, name, size} — id файла на сервере и ключ, которым он зашифрован.
+  final Map<String, dynamic>? file;
+
+  /// То, что уходит собеседнику внутри зашифрованного сообщения.
+  Map<String, dynamic> get content => {'text': text, 'file': ?file};
+
+  /// Строка для списка чатов.
+  String get preview => text.isNotEmpty
+      ? text
+      : file == null
+      ? ''
+      : isImage(file!['name'])
+      ? 'Фото'
+      : '📎 ${file!['name']}';
+
+  Map<String, dynamic> toJson() => {'id': id, 'mine': mine, 'text': text, 'time': time, 'status': status.name, 'file': ?file};
   factory Message.fromJson(Map<String, dynamic> j) => Message(
     id: j['id'],
     mine: j['mine'],
     text: j['text'],
     time: j['time'],
+    file: j['file'],
     // До статусов было поле pending.
     status: j['status'] != null
         ? Status.values.byName(j['status'])
@@ -175,6 +192,7 @@ class AuraClient extends ChangeNotifier {
     token = nick = name = device = _keys = null;
     connected = false;
     chats.clear();
+    _files.clear();
     names.clear();
     lastRead.clear();
     _devices.clear();
@@ -205,12 +223,60 @@ class AuraClient extends ChangeNotifier {
 
   // --- Сообщения ---
 
-  void send(String to, String text) {
-    final m = Message(id: _newId(), mine: true, text: text, time: DateTime.now().millisecondsSinceEpoch, status: Status.pending);
+  void send(String to, String text, {Map<String, dynamic>? file}) {
+    final m = Message(
+      id: _newId(),
+      mine: true,
+      text: text,
+      time: DateTime.now().millisecondsSinceEpoch,
+      status: Status.pending,
+      file: file,
+    );
     chats.putIfAbsent(to, () => []).add(m);
     _save();
     _deliver(to, m);
   }
+
+  static const maxFile = 25 << 20;
+
+  /// Шифрует файл новым ключом, загружает на сервер и отправляет сообщение с id и ключом.
+  Future<void> sendFile(String to, String name, Uint8List bytes) async {
+    if (bytes.length > maxFile - 28) throw ApiException('Файл больше ${maxFile >> 20} МБ');
+    final key = FileCrypto.newKey();
+    final http.Response res;
+    try {
+      final req = http.Request('POST', _api('/api/files'))
+        ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'})
+        ..bodyBytes = FileCrypto.encrypt(key, bytes);
+      res = await http.Response.fromStream(await req.send()).timeout(const Duration(minutes: 3));
+    } catch (_) {
+      throw ApiException('Нет связи с сервером');
+    }
+    final data = jsonDecode(utf8.decode(res.bodyBytes));
+    if (res.statusCode != 200) throw ApiException(data['error'] ?? 'Ошибка сервера');
+    _files[data['id']] = Future.value(bytes);
+    send(to, '', file: {'id': data['id'], 'key': base64.encode(key), 'name': name, 'size': bytes.length});
+  }
+
+  /// Расшифрованные вложения этого запуска приложения.
+  // ponytail: только в памяти, сохранять на устройство, когда понадобится просмотр без сети.
+  final _files = <String, Future<Uint8List>>{};
+
+  /// Скачивает и расшифровывает вложение.
+  Future<Uint8List> fileBytes(Map<String, dynamic> file) => _files[file['id']] ??= () async {
+    final http.Response res;
+    try {
+      res = await http.get(_api('/api/files/${file['id']}'), headers: {'authorization': 'Bearer $token'});
+    } catch (_) {
+      _files.remove(file['id']);
+      throw ApiException('Нет связи с сервером');
+    }
+    if (res.statusCode != 200) {
+      _files.remove(file['id']);
+      throw ApiException(res.statusCode == 404 ? 'Файл удалён с сервера' : 'Ошибка сервера');
+    }
+    return FileCrypto.decrypt(base64.decode(file['key']), res.bodyBytes);
+  }();
 
   void markRead(String peer) {
     lastRead[peer] = DateTime.now().millisecondsSinceEpoch;
@@ -239,7 +305,7 @@ class AuraClient extends ChangeNotifier {
 
   /// Собеседнику, а затем копия на свои другие устройства, чтобы переписка была видна везде.
   Future<void> _deliver(String to, Message m) => _serial(() async {
-    if (await _sendCopy(to, m.id, {'text': m.text})) await _sendCopy(nick!, m.id, {'text': m.text, 'peer': to});
+    if (await _sendCopy(to, m.id, m.content)) await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
   });
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
@@ -269,10 +335,11 @@ class AuraClient extends ChangeNotifier {
     if (!chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
       String text;
-      Map<String, dynamic>? content;
+      Map<String, dynamic>? content, file;
       try {
         content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
         text = content!['text'] ?? '';
+        file = content['file'];
         if (from == nick) peer = content['peer']; // копия своего сообщения с другого устройства
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
@@ -285,7 +352,16 @@ class AuraClient extends ChangeNotifier {
         final mine = from == nick;
         chats
             .putIfAbsent(peer, () => [])
-            .add(Message(id: id, mine: mine, text: text, time: msg['sentAt'], status: mine ? Status.sent : Status.delivered));
+            .add(
+              Message(
+                id: id,
+                mine: mine,
+                text: text,
+                time: msg['sentAt'],
+                status: mine ? Status.sent : Status.delivered,
+                file: file,
+              ),
+            );
         if (!mine) _sendReceipt(from, Status.delivered, [id]);
       }
       _save();
@@ -346,7 +422,7 @@ class AuraClient extends ChangeNotifier {
         for (final MapEntry(key: peer, value: list) in chats.entries) {
           for (final m in list.where((m) => m.id == msg['id'])) {
             if (to == nick) {
-              _serial(() async => await _sendCopy(nick!, m.id, {'text': m.text, 'peer': peer}));
+              _serial(() async => await _sendCopy(nick!, m.id, {...m.content, 'peer': peer}));
             } else {
               _deliver(peer, m);
             }

@@ -14,7 +14,7 @@ void main() {
   late Uri base;
 
   setUp(() async {
-    aura = AuraServer(':memory:');
+    aura = AuraServer(':memory:', files: Directory.systemTemp.createTempSync('aura').path);
     http = await io.serve(aura.handler, 'localhost', 0);
     base = Uri.parse('http://localhost:${http.port}');
   });
@@ -228,6 +228,30 @@ void main() {
     upgraded.close();
     AuraServer(path).close(); // повторный запуск ничего не ломает
     await dir.delete(recursive: true);
+  });
+
+  test('файлы: загрузка, выдача, ограничения', () async {
+    final (_, reg) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final String token = reg['token'];
+    Future<HttpClientResponse> send(String method, String path, {List<int>? body, String? auth}) async {
+      final req = await HttpClient().openUrl(method, base.resolve(path));
+      if (auth != null) req.headers.set('authorization', 'Bearer $auth');
+      if (body != null) req
+        ..contentLength = body.length
+        ..add(body);
+      return req.close();
+    }
+
+    final bytes = List.generate(1000, (i) => i % 256);
+    expect((await send('POST', '/api/files', body: bytes)).statusCode, 401);
+    final up = await send('POST', '/api/files', body: bytes, auth: token);
+    expect(up.statusCode, 200);
+    final String id = jsonDecode(await up.transform(utf8.decoder).join())['id'];
+    final down = await send('GET', '/api/files/$id', auth: token);
+    expect(await down.fold<List<int>>([], (a, b) => a..addAll(b)), bytes);
+    expect((await send('GET', '/api/files/../aura.db', auth: token)).statusCode, 404);
+    expect((await send('GET', '/api/files/${'0' * 32}', auth: token)).statusCode, 404);
+    expect((await send('POST', '/api/files', body: List.filled(AuraServer.maxFile + 1, 0), auth: token)).statusCode, 413);
   });
 
   test('без токена сокет закрывается', () async {
