@@ -1,11 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../client.dart';
 import '../theme.dart';
 import 'home.dart';
-
-// ponytail: профиль живёт в памяти до появления сервера (этап 2).
-final profileName = ValueNotifier('Анна');
-const nickname = '@aura_user';
 
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
@@ -30,13 +27,13 @@ class _SettingsTabState extends State<SettingsTab> {
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
           child: Text('Настройки', style: Theme.of(context).textTheme.headlineSmall),
         ),
-        ValueListenableBuilder(
-          valueListenable: profileName,
-          builder: (context, name, _) => ListTile(
+        ListenableBuilder(
+          listenable: client,
+          builder: (context, _) => ListTile(
             contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-            leading: Avatar(name.isEmpty ? 'A' : name[0].toUpperCase(), size: 56),
-            title: Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
-            subtitle: Text('$nickname · Изменить профиль', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+            leading: Avatar(client.name ?? '', size: 56),
+            title: Text(client.name ?? '', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
+            subtitle: Text('@${client.nick} · Изменить профиль', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen())),
           ),
         ),
@@ -69,7 +66,7 @@ class _SettingsTabState extends State<SettingsTab> {
           padding: const EdgeInsets.all(20),
           child: FilledButton(
             style: FilledButton.styleFrom(backgroundColor: c.beige),
-            onPressed: () => Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false),
+            onPressed: client.logout,
             child: const Text('Выйти'),
           ),
         ),
@@ -86,23 +83,31 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  final _name = TextEditingController(text: profileName.value);
+  final _name = TextEditingController(text: client.name);
   String? _error;
-  bool _saved = false;
+  bool _saved = false, _saving = false;
 
-  void _save() {
+  Future<void> _save() async {
     final name = _name.text.trim();
     setState(() {
       _error = name.isEmpty ? 'Введите имя' : null;
-      _saved = name.isNotEmpty;
+      _saved = false;
     });
-    if (name.isNotEmpty) profileName.value = name;
+    if (name.isEmpty) return;
+    setState(() => _saving = true);
+    try {
+      await client.updateName(name);
+      if (mounted) setState(() => _saved = true);
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
-    final initial = _name.text.trim().isEmpty ? 'A' : _name.text.trim()[0].toUpperCase();
     return Scaffold(
       appBar: AppBar(backgroundColor: Colors.transparent, title: Text('Профиль', style: Theme.of(context).textTheme.titleMedium)),
       body: SafeArea(
@@ -112,7 +117,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(28, 16, 28, 32),
               children: [
-                Center(child: Avatar(initial, size: 96)),
+                Center(child: Avatar(_name.text, size: 96)),
                 const SizedBox(height: 28),
                 TextField(
                   controller: _name,
@@ -122,7 +127,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 const SizedBox(height: 22),
                 TextField(
                   enabled: false,
-                  controller: TextEditingController(text: nickname),
+                  controller: TextEditingController(text: '@${client.nick}'),
                   decoration: const InputDecoration(labelText: 'Никнейм'),
                 ),
                 const SizedBox(height: 32),
@@ -132,7 +137,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     child: Text('Изменения сохранены',
                         textAlign: TextAlign.center, style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6))),
                   ),
-                FilledButton(onPressed: _save, child: const Text('Сохранить')),
+                FilledButton(onPressed: _saving ? null : _save, child: Text(_saving ? 'Сохранение…' : 'Сохранить')),
               ],
             ),
           ),

@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 
+import 'client.dart';
 import 'screens/auth.dart';
 import 'screens/home.dart';
 import 'theme.dart';
 
-void main() => runApp(const AuraApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await client.load();
+  runApp(const AuraApp());
+}
 
 class AuraApp extends StatelessWidget {
   const AuraApp({super.key});
@@ -19,11 +24,14 @@ class AuraApp extends StatelessWidget {
         theme: buildTheme(Brightness.light),
         darkTheme: buildTheme(Brightness.dark),
         themeMode: mode,
+        // Корневой экран следует за состоянием входа: вход и выход переключают его сами.
+        home: ListenableBuilder(
+          listenable: client,
+          builder: (context, _) => client.signedIn ? const HomeScreen() : const WelcomeScreen(),
+        ),
         routes: {
-          '/': (_) => const WelcomeScreen(),
           '/sign-in': (_) => const SignInScreen(),
           '/register': (_) => const RegisterScreen(),
-          '/home': (_) => const HomeScreen(),
         },
       ),
     );

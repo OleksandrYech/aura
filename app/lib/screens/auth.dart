@@ -1,7 +1,9 @@
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../client.dart';
 import '../theme.dart';
 
 class WelcomeScreen extends StatelessWidget {
@@ -113,131 +115,78 @@ class AuraLogo extends StatelessWidget {
   }
 }
 
-class SignInScreen extends StatefulWidget {
+class SignInScreen extends StatelessWidget {
   const SignInScreen({super.key});
 
   @override
-  State<SignInScreen> createState() => _SignInScreenState();
+  Widget build(BuildContext context) => const _AuthScreen(register: false);
 }
 
-class _SignInScreenState extends State<SignInScreen> {
-  final _nick = TextEditingController();
-  final _pwd = TextEditingController();
-  bool _remember = true;
-  String? _error;
-
-  void _submit() {
-    if (_nick.text.trim().isEmpty || _pwd.text.isEmpty) {
-      setState(() => _error = 'Введите никнейм и пароль');
-      return;
-    }
-    // ponytail: без сервера любой вход успешен, настоящая проверка на этапе 2.
-    Navigator.pushNamedAndRemoveUntil(context, '/home', (_) => false);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return _AuthForm(
-      title: 'Вход в AURA',
-      subtitle: 'Введите никнейм и пароль.',
-      error: _error,
-      fields: [
-        _field('Никнейм', _nick, 'aura_user', _clearError),
-        _field('Пароль', _pwd, '••••••••', _clearError, obscure: true),
-        CheckboxListTile(
-          value: _remember,
-          onChanged: (v) => setState(() => _remember = v!),
-          title: const Text('Запомнить меня', style: TextStyle(fontSize: 14)),
-          controlAffinity: ListTileControlAffinity.leading,
-          contentPadding: EdgeInsets.zero,
-        ),
-      ],
-      switchLabel: 'Нет аккаунта? Создать',
-      switchRoute: '/register',
-      buttonLabel: 'Войти',
-      onSubmit: _submit,
-    );
-  }
-
-  void _clearError(String _) => setState(() => _error = null);
-}
-
-class RegisterScreen extends StatefulWidget {
+class RegisterScreen extends StatelessWidget {
   const RegisterScreen({super.key});
 
   @override
-  State<RegisterScreen> createState() => _RegisterScreenState();
+  Widget build(BuildContext context) => const _AuthScreen(register: true);
 }
 
-class _RegisterScreenState extends State<RegisterScreen> {
+class _AuthScreen extends StatefulWidget {
+  const _AuthScreen({required this.register});
+  final bool register;
+
+  @override
+  State<_AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<_AuthScreen> {
+  final _server = TextEditingController(text: client.server ?? AuraClient.defaultServer);
   final _nick = TextEditingController();
   final _pwd = TextEditingController();
   final _pwd2 = TextEditingController();
   String? _error;
+  bool _loading = false;
 
-  void _submit() {
-    final error = _nick.text.trim().length < 3
-        ? 'Никнейм должен быть не короче 3 символов'
-        : _pwd.text.length < 6
-            ? 'Пароль должен быть не короче 6 символов'
-            : _pwd.text != _pwd2.text
-                ? 'Пароли не совпадают'
-                : null;
-    if (error != null) {
-      setState(() => _error = error);
-      return;
+  Future<void> _submit() async {
+    final nick = _nick.text.trim();
+    final error = _server.text.trim().isEmpty
+        ? 'Укажите адрес сервера'
+        : !widget.register
+            ? (nick.isEmpty || _pwd.text.isEmpty ? 'Введите никнейм и пароль' : null)
+            : nick.length < 3
+                ? 'Никнейм должен быть не короче 3 символов'
+                : _pwd.text.length < 6
+                    ? 'Пароль должен быть не короче 6 символов'
+                    : _pwd.text != _pwd2.text
+                        ? 'Пароли не совпадают'
+                        : null;
+    setState(() => _error = error);
+    if (error != null) return;
+
+    setState(() => _loading = true);
+    try {
+      await (widget.register ? client.register : client.login)(_server.text, nick, _pwd.text);
+      // Корневой экран сам переключится на чаты.
+      if (mounted) Navigator.popUntil(context, (r) => r.isFirst);
+    } on ApiException catch (e) {
+      setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
-    Navigator.pushNamedAndRemoveUntil(context, '/home', (_) => false);
   }
-
-  @override
-  Widget build(BuildContext context) {
-    void clearError(String _) => setState(() => _error = null);
-    return _AuthForm(
-      title: 'Создать аккаунт',
-      subtitle: 'Придумайте никнейм и пароль — без номера телефона и почты.',
-      error: _error,
-      fields: [
-        _field('Никнейм', _nick, 'aura_user', clearError),
-        _field('Пароль', _pwd, 'Минимум 6 символов', clearError, obscure: true),
-        _field('Повторите пароль', _pwd2, '••••••••', clearError, obscure: true),
-      ],
-      switchLabel: 'Уже есть аккаунт? Войти',
-      switchRoute: '/sign-in',
-      buttonLabel: 'Зарегистрироваться',
-      onSubmit: _submit,
-    );
-  }
-}
-
-Widget _field(String label, TextEditingController c, String hint, ValueChanged<String> onChanged, {bool obscure = false}) =>
-    TextField(
-      controller: c,
-      obscureText: obscure,
-      onChanged: onChanged,
-      decoration: InputDecoration(labelText: label, hintText: hint),
-    );
-
-class _AuthForm extends StatelessWidget {
-  const _AuthForm({
-    required this.title,
-    required this.subtitle,
-    required this.error,
-    required this.fields,
-    required this.switchLabel,
-    required this.switchRoute,
-    required this.buttonLabel,
-    required this.onSubmit,
-  });
-
-  final String title, subtitle, switchLabel, switchRoute, buttonLabel;
-  final String? error;
-  final List<Widget> fields;
-  final VoidCallback onSubmit;
 
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
+    Widget field(String label, TextEditingController ctrl, String hint, {bool obscure = false}) => Padding(
+          padding: const EdgeInsets.only(bottom: 14),
+          child: TextField(
+            controller: ctrl,
+            obscureText: obscure,
+            autocorrect: false,
+            onChanged: (_) => setState(() => _error = null),
+            onSubmitted: (_) => _submit(),
+            decoration: InputDecoration(labelText: label, hintText: hint),
+          ),
+        );
     return Scaffold(
       appBar: AppBar(backgroundColor: Colors.transparent),
       body: SafeArea(
@@ -247,19 +196,34 @@ class _AuthForm extends StatelessWidget {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(28, 8, 28, 32),
               children: [
-                Text(title, style: Theme.of(context).textTheme.headlineSmall),
+                Text(widget.register ? 'Создать аккаунт' : 'Вход в AURA', style: Theme.of(context).textTheme.headlineSmall),
                 const SizedBox(height: 8),
-                Text(subtitle, style: TextStyle(fontSize: 14, color: c.ink.withValues(alpha: 0.6))),
+                Text(
+                  widget.register ? 'Придумайте никнейм и пароль — без номера телефона и почты.' : 'Введите никнейм и пароль.',
+                  style: TextStyle(fontSize: 14, color: c.ink.withValues(alpha: 0.6)),
+                ),
                 const SizedBox(height: 20),
-                for (final f in fields) ...[f, const SizedBox(height: 14)],
-                if (error != null) Text('⚠ $error', style: TextStyle(fontSize: 13, color: c.ink)),
+                // В Web адрес подставляется сам: приложение открыто с этого сервера.
+                if (!kIsWeb) field('Сервер', _server, 'https://aura.example.com'),
+                field('Никнейм', _nick, 'aura_user'),
+                field('Пароль', _pwd, widget.register ? 'Минимум 6 символов' : '••••••••', obscure: true),
+                if (widget.register) field('Повторите пароль', _pwd2, '••••••••', obscure: true),
+                if (_error != null) Text('⚠ $_error', style: TextStyle(fontSize: 13, color: c.ink)),
                 TextButton(
                   style: TextButton.styleFrom(alignment: Alignment.centerLeft, padding: EdgeInsets.zero),
-                  onPressed: () => Navigator.pushReplacementNamed(context, switchRoute),
-                  child: Text(switchLabel, style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6))),
+                  onPressed: () => Navigator.pushReplacementNamed(context, widget.register ? '/sign-in' : '/register'),
+                  child: Text(
+                    widget.register ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Создать',
+                    style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6)),
+                  ),
                 ),
                 const SizedBox(height: 24),
-                FilledButton(onPressed: onSubmit, child: Text(buttonLabel)),
+                FilledButton(
+                  onPressed: _loading ? null : _submit,
+                  child: Text(_loading
+                      ? (widget.register ? 'Создание…' : 'Вход…')
+                      : (widget.register ? 'Зарегистрироваться' : 'Войти')),
+                ),
               ],
             ),
           ),

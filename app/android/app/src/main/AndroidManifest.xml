@@ -1,6 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- HTTP разрешён для проверки по локальной сети до появления домена.
+         После настройки Cloudflare Tunnel (HTTPS) убрать на этапе 3. -->
     <application
         android:label="AURA"
+        android:usesCleartextTraffic="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

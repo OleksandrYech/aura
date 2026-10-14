@@ -13,6 +13,28 @@ defaults:
     working-directory: app
 
 jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t aura .
+        working-directory: .
+
   web:
     runs-on: ubuntu-latest
     steps:
