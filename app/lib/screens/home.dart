@@ -160,15 +160,10 @@ class ContactsTab extends StatefulWidget {
 }
 
 class _ContactsTabState extends State<ContactsTab> {
-  List<({String nick, String name})> _users = [];
+  // Пустой запрос: собеседники из переписки, иначе результат поиска на сервере.
+  List<({String nick, String name})>? _found;
   String? _error;
   Timer? _debounce;
-
-  @override
-  void initState() {
-    super.initState();
-    _search('');
-  }
 
   @override
   void dispose() {
@@ -177,11 +172,15 @@ class _ContactsTabState extends State<ContactsTab> {
   }
 
   Future<void> _search(String q) async {
+    if (q.trim().isEmpty) {
+      setState(() => _found = null);
+      return;
+    }
     try {
       final users = await client.searchUsers(q);
       if (mounted) {
         setState(() {
-          _users = users;
+          _found = users;
           _error = null;
         });
       }
@@ -193,6 +192,7 @@ class _ContactsTabState extends State<ContactsTab> {
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
+    final users = _found ?? [for (final n in client.chats.keys) (nick: n, name: client.names[n] ?? n)];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -207,26 +207,28 @@ class _ContactsTabState extends State<ContactsTab> {
               _debounce?.cancel();
               _debounce = Timer(const Duration(milliseconds: 300), () => _search(q));
             },
-            decoration: const InputDecoration(hintText: 'Поиск по никнейму или имени', prefixIcon: Icon(Icons.search)),
+            decoration: const InputDecoration(hintText: 'Точный никнейм собеседника', prefixIcon: Icon(Icons.search)),
           ),
         ),
         if (_error != null)
           Padding(padding: const EdgeInsets.all(20), child: Text('⚠ $_error', style: TextStyle(color: c.ink))),
         Expanded(
-          child: RefreshIndicator(
-            onRefresh: () => _search(''),
-            child: ListView(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              children: [
-                for (final u in _users)
-                  ListTile(
-                    leading: Avatar(u.name, size: 40),
-                    title: Text(u.name),
-                    subtitle: Text('@${u.nick}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
-                    onTap: () => openChat(context, u.nick),
-                  ),
-              ],
-            ),
+          child: ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            children: [
+              if (_found?.isEmpty ?? false)
+                Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Text('Никого не нашли. Нужен никнейм целиком.', style: TextStyle(color: c.ink.withValues(alpha: 0.6))),
+                ),
+              for (final u in users)
+                ListTile(
+                  leading: Avatar(u.name, size: 40),
+                  title: Text(u.name),
+                  subtitle: Text('@${u.nick}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+                  onTap: () => openChat(context, u.nick),
+                ),
+            ],
           ),
         ),
       ],
