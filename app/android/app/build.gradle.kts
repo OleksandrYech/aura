@@ -29,11 +29,23 @@ android {
         versionName = flutter.versionName
     }
 
+    // Постоянный ключ из CI (секреты GitHub), чтобы новая сборка ставилась поверх старой.
+    // Без него, например в PR и локально, подпись debug-ключом.
+    val keystore = System.getenv("AURA_KEYSTORE")
+    signingConfigs {
+        if (keystore != null) {
+            create("aura") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("AURA_KEYSTORE_PASSWORD")
+                keyAlias = "aura"
+                keyPassword = System.getenv("AURA_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (keystore != null) "aura" else "debug")
         }
     }
 }
