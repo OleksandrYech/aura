@@ -9,17 +9,31 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'signal.dart';
 
+/// Статус сообщения. Свои: в очереди → отправлено → доставлено → прочитано.
+/// Входящие: получено → прочитано (собеседнику ушло подтверждение о прочтении).
+enum Status { pending, sent, delivered, read }
+
 class Message {
-  Message({required this.id, required this.mine, required this.text, required this.time, this.pending = false});
+  Message({required this.id, required this.mine, required this.text, required this.time, required this.status});
 
   final String id, text;
   final bool mine;
   final int time; // мс с эпохи
-  bool pending;
+  Status status;
 
-  Map<String, dynamic> toJson() => {'id': id, 'mine': mine, 'text': text, 'time': time, 'pending': pending};
-  factory Message.fromJson(Map<String, dynamic> j) =>
-      Message(id: j['id'], mine: j['mine'], text: j['text'], time: j['time'], pending: j['pending'] ?? false);
+  Map<String, dynamic> toJson() => {'id': id, 'mine': mine, 'text': text, 'time': time, 'status': status.name};
+  factory Message.fromJson(Map<String, dynamic> j) => Message(
+    id: j['id'],
+    mine: j['mine'],
+    text: j['text'],
+    time: j['time'],
+    // До статусов было поле pending.
+    status: j['status'] != null
+        ? Status.values.byName(j['status'])
+        : j['pending'] == true
+        ? Status.pending
+        : (j['mine'] ? Status.sent : Status.read),
+  );
 }
 
 class ApiException implements Exception {
@@ -197,7 +211,7 @@ class AuraClient extends ChangeNotifier {
   // --- Сообщения ---
 
   void send(String to, String text) {
-    final m = Message(id: _newId(), mine: true, text: text, time: DateTime.now().millisecondsSinceEpoch, pending: true);
+    final m = Message(id: _newId(), mine: true, text: text, time: DateTime.now().millisecondsSinceEpoch, status: Status.pending);
     chats.putIfAbsent(to, () => []).add(m);
     _save();
     _deliver(to, m);
@@ -205,8 +219,19 @@ class AuraClient extends ChangeNotifier {
 
   void markRead(String peer) {
     lastRead[peer] = DateTime.now().millisecondsSinceEpoch;
+    final unread = [
+      for (final m in chats[peer] ?? <Message>[])
+        if (!m.mine && m.status != Status.read) m..status = Status.read,
+    ];
+    if (unread.isNotEmpty) _sendReceipt(peer, Status.read, [for (final m in unread) m.id]);
     _save();
   }
+
+  /// Подтверждения «доставлено» и «прочитано» идут собеседнику тем же зашифрованным путём, что и сообщения.
+  // ponytail: прочтение на одном своём устройстве не отмечается на других, синхронизировать при необходимости.
+  void _sendReceipt(String peer, Status status, List<String> ids) => _serial(() async {
+    await _sendCopy(peer, _newId(), {'receipt': status.name, 'ids': ids});
+  });
 
   bool hasUnread(String peer) {
     final last = chats[peer]?.lastOrNull;
@@ -219,11 +244,11 @@ class AuraClient extends ChangeNotifier {
 
   /// Собеседнику, а затем копия на свои другие устройства, чтобы переписка была видна везде.
   Future<void> _deliver(String to, Message m) => _serial(() async {
-    if (await _sendCopy(to, m, {'text': m.text})) await _sendCopy(nick!, m, {'text': m.text, 'peer': to});
+    if (await _sendCopy(to, m.id, {'text': m.text})) await _sendCopy(nick!, m.id, {'text': m.text, 'peer': to});
   });
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
-  Future<bool> _sendCopy(String target, Message m, Map<String, dynamic> content) async {
+  Future<bool> _sendCopy(String target, String id, Map<String, dynamic> content) async {
     if (!connected || _keys == null) return false;
     final keys = _keys!;
     final devices = _devices[target] ??= [
@@ -239,7 +264,7 @@ class AuraClient extends ChangeNotifier {
       payloads.add(await keys.encrypt(target, d, jsonEncode(content)));
     }
     await _saveKeys();
-    _wsSend({'type': 'send', 'id': m.id, 'to': target, 'payloads': payloads});
+    _wsSend({'type': 'send', 'id': id, 'to': target, 'payloads': payloads});
     return true;
   }
 
@@ -249,16 +274,25 @@ class AuraClient extends ChangeNotifier {
     if (!chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
       String text;
+      Map<String, dynamic>? content;
       try {
-        final content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
-        text = content['text'];
+        content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
+        text = content!['text'] ?? '';
         if (from == nick) peer = content['peer']; // копия своего сообщения с другого устройства
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
         text = '⚠ Не удалось расшифровать сообщение';
       }
       await _saveKeys();
-      chats.putIfAbsent(peer, () => []).add(Message(id: id, mine: from == nick, text: text, time: msg['sentAt']));
+      if (content?['receipt'] case final String receipt) {
+        _onReceipt(from, Status.values.byName(receipt), (content!['ids'] as List).cast());
+      } else {
+        final mine = from == nick;
+        chats
+            .putIfAbsent(peer, () => [])
+            .add(Message(id: id, mine: mine, text: text, time: msg['sentAt'], status: mine ? Status.sent : Status.delivered));
+        if (!mine) _sendReceipt(from, Status.delivered, [id]);
+      }
       _save();
     }
     _wsSend({'type': 'ack', 'id': id});
@@ -270,6 +304,13 @@ class AuraClient extends ChangeNotifier {
     _ws = ws;
     ws.sink.add(jsonEncode({'type': 'auth', 'token': token}));
     ws.stream.listen((raw) => _onMessage(jsonDecode(raw as String)), onDone: () => _onClosed(ws), onError: (_) {});
+  }
+
+  /// Статус только растёт: позднее «доставлено» не отменяет «прочитано».
+  void _onReceipt(String peer, Status status, List<String> ids) {
+    for (final m in chats[peer] ?? <Message>[]) {
+      if (m.mine && ids.contains(m.id) && m.status.index < status.index) m.status = status;
+    }
   }
 
   void _onClosed(WebSocketChannel ws) {
@@ -292,14 +333,14 @@ class AuraClient extends ChangeNotifier {
         if ((msg['preKeys'] as int) < SignalKeys.preKeyBatch ~/ 2) _refillPreKeys();
         // Переотправляем то, что не дошло до сервера; сервер отбрасывает дубли по id.
         for (final MapEntry(key: to, value: list) in chats.entries) {
-          for (final m in list.where((m) => m.pending)) {
+          for (final m in list.where((m) => m.status == Status.pending)) {
             _deliver(to, m);
           }
         }
       case 'sent' when msg['to'] != nick:
         for (final list in chats.values) {
-          for (final m in list.where((m) => m.id == msg['id'])) {
-            m.pending = false;
+          for (final m in list.where((m) => m.id == msg['id'] && m.status == Status.pending)) {
+            m.status = Status.sent;
           }
         }
         _save();
@@ -310,7 +351,7 @@ class AuraClient extends ChangeNotifier {
         for (final MapEntry(key: peer, value: list) in chats.entries) {
           for (final m in list.where((m) => m.id == msg['id'])) {
             if (to == nick) {
-              _serial(() async => await _sendCopy(nick!, m, {'text': m.text, 'peer': peer}));
+              _serial(() async => await _sendCopy(nick!, m.id, {'text': m.text, 'peer': peer}));
             } else {
               _deliver(peer, m);
             }
