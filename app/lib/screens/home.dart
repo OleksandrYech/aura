@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../client.dart';
+import '../lock.dart';
 import '../media.dart';
 import '../theme.dart';
 import 'settings.dart';
@@ -276,12 +277,24 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _attach() async {
-    for (final f in await FilePicker.pickFiles()) {
+    final messenger = ScaffoldMessenger.of(context);
+    void fail(String what, Object e) {
+      debugPrint('AURA: вложение $what: $e');
+      messenger.showSnackBar(SnackBar(content: Text('$what: ${e is ApiException ? e : 'не удалось отправить'}')));
+    }
+
+    final List<PlatformFile> files;
+    try {
+      files = await AppLock.whilePicking(() => FilePicker.pickFiles());
+    } catch (e) {
+      return fail('Выбор файла', e);
+    }
+    for (final f in files) {
       setState(() => _uploading++);
       try {
         await client.sendFile(widget.peer, f.name, await f.readAsBytes());
-      } on ApiException catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${f.name}: $e')));
+      } catch (e) {
+        fail(f.name, e);
       } finally {
         if (mounted) setState(() => _uploading--);
       }
