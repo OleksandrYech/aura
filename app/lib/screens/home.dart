@@ -331,10 +331,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
                             if (m.mine) ...[
                               const SizedBox(width: 4),
-                              Icon(m.pending ? Icons.schedule : Icons.done,
-                                  size: 12,
-                                  color: c.ink.withValues(alpha: 0.55),
-                                  semanticLabel: m.pending ? 'не отправлено' : 'отправлено'),
+                              StatusIcon(m.status),
                             ],
                           ]),
                         ]),
@@ -421,5 +418,25 @@ class SafetyNumberDialog extends StatelessWidget {
       ),
       actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Закрыть'))],
     );
+  }
+}
+
+/// Одна галочка — отправлено, две — доставлено, две цветные — прочитано.
+class StatusIcon extends StatelessWidget {
+  const StatusIcon(this.status, {super.key});
+  final Status status;
+
+  @override
+  Widget build(BuildContext context) {
+    final dim = AuraColors.of(context).ink.withValues(alpha: 0.55);
+    // В палитре нет цвета, заметного на лавандовом пузыре, поэтому для «прочитано» свой акцент.
+    final read = Theme.of(context).brightness == Brightness.dark ? const Color(0xFFB8AEFF) : const Color(0xFF6A5ACD);
+    final (icon, color, label) = switch (status) {
+      Status.pending => (Icons.schedule, dim, 'не отправлено'),
+      Status.sent => (Icons.done, dim, 'отправлено'),
+      Status.delivered => (Icons.done_all, dim, 'доставлено'),
+      Status.read => (Icons.done_all, read, 'прочитано'),
+    };
+    return Icon(icon, size: 16, color: color, semanticLabel: label);
   }
 }
