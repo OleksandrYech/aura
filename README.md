@@ -40,6 +40,20 @@ docker compose cp aura:/data/aura.db ./aura-backup.db
 
 Cloudflare сам выдаёт HTTPS-сертификат, открывать порты на роутере не нужно. После этого строку `ports` в `docker-compose.yml` можно убрать, чтобы сервер был доступен только через туннель.
 
+## Android: обновления без переустановки
+
+CI подписывает APK постоянным ключом и после каждого мёржа в `main` выкладывает его в [Releases](../../releases). Приложение [Obtainium](https://github.com/ImranR98/Obtainium) на телефоне следит за релизами и ставит обновление поверх, ключи шифрования и переписка сохраняются.
+
+Ключ создаётся один раз (на любой машине с Docker), пароль придумайте свой:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/k -w /k eclipse-temurin:21-jre keytool -genkeypair -keystore aura.jks -alias aura \
+  -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AURA" -storepass 'ПАРОЛЬ' -keypass 'ПАРОЛЬ'
+base64 -w0 aura.jks > aura.jks.b64
+```
+
+В репозитории Settings → Secrets and variables → Actions добавьте секреты `ANDROID_KEYSTORE_BASE64` (содержимое `aura.jks.b64`) и `ANDROID_KEYSTORE_PASSWORD`. Файл `aura.jks` сохраните в надёжном месте: без него обновления перестанут ставиться поверх.
+
 ## Разработка
 
 Нужен [Flutter](https://docs.flutter.dev/get-started/install) 3.47.
