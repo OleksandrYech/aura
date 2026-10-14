@@ -54,12 +54,17 @@ void main() {
     expect((await post('/api/login', {'nick': 'anna', 'password': 'wrong1'})).$1, 401);
     final (_, den) = await post('/api/register', {'nick': 'den_k', 'password': 'secret2'});
 
-    final req = await HttpClient().getUrl(base.resolve('/api/users?q=den'));
-    req.headers.set('authorization', 'Bearer ${anna['token']}');
-    final found = jsonDecode(await (await req.close()).transform(utf8.decoder).join());
-    expect(found, [
+    Future<Object?> search(String q) async {
+      final req = await HttpClient().getUrl(base.resolve('/api/users?q=$q'));
+      req.headers.set('authorization', 'Bearer ${anna['token']}');
+      return jsonDecode(await (await req.close()).transform(utf8.decoder).join());
+    }
+
+    expect(await search('Den_K'), [
       {'nick': 'den_k', 'name': 'den_k'},
     ]);
+    expect(await search('den'), isEmpty); // только точный никнейм
+    expect(await search(''), isEmpty);
 
     // Анна пишет, пока Денис офлайн.
     final (annaWs, annaIn) = await connect(anna['token']);

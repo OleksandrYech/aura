@@ -92,14 +92,10 @@ class AuraServer {
     return _session(nick);
   }
 
+  /// Найти можно только по точному никнейму: список всех пользователей не раскрывается.
   Response _searchUsers(Request req, String me) {
     final q = (req.url.queryParameters['q'] ?? '').trim().toLowerCase();
-    // Экранируем % и _ — в никнеймах _ обычный символ.
-    final pattern = '%${q.replaceAllMapped(RegExp(r'[%_\\]'), (m) => '\\${m[0]}')}%';
-    final rows = db.select(
-      r"SELECT nick, name FROM users WHERE nick != ? AND (nick LIKE ? ESCAPE '\' OR name LIKE ? ESCAPE '\') ORDER BY nick LIMIT 50",
-      [me, pattern, pattern],
-    );
+    final rows = db.select('SELECT nick, name FROM users WHERE nick = ? AND nick != ?', [q, me]);
     return _ok([
       for (final r in rows) {'nick': r['nick'], 'name': r['name']},
     ]);
