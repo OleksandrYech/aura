@@ -290,6 +290,13 @@ class _ChatScreenState extends State<ChatScreen> {
             ]),
           ),
         ]),
+        actions: [
+          IconButton(
+            tooltip: 'Код безопасности',
+            icon: const Icon(Icons.verified_user_outlined),
+            onPressed: () => showDialog(context: context, builder: (_) => SafetyNumberDialog(peer: widget.peer)),
+          ),
+        ],
       ),
       body: SafeArea(
         child: Column(children: [
@@ -368,6 +375,51 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ]),
       ),
+    );
+  }
+}
+
+/// Код безопасности: если у вас и собеседника он одинаковый, переписку никто не подменил.
+class SafetyNumberDialog extends StatelessWidget {
+  const SafetyNumberDialog({super.key, required this.peer});
+  final String peer;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    return AlertDialog(
+      backgroundColor: c.cream,
+      title: const Text('Код безопасности'),
+      content: FutureBuilder(
+        future: client.safetyNumber(peer),
+        builder: (context, snap) => Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (snap.hasData)
+              SelectableText(
+                // 12 групп по 5 цифр, по 4 в строке.
+                [
+                  for (var i = 0; i < 60; i += 20)
+                    [for (var j = i; j < i + 20; j += 5) snap.data!.substring(j, j + 5)].join('  '),
+                ].join('\n'),
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 17, height: 1.6, letterSpacing: 1),
+              )
+            else if (snap.hasError)
+              Text('⚠ ${snap.error}')
+            else
+              const Center(child: CircularProgressIndicator()),
+            const SizedBox(height: 16),
+            Text(
+              'Сравните этот код с кодом у @$peer при встрече или по звонку. Если цифры совпадают, '
+              'сообщения между вами никто не может прочитать или подменить. Код меняется, когда кто-то из вас '
+              'входит на новом устройстве.',
+              style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.7)),
+            ),
+          ],
+        ),
+      ),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Закрыть'))],
     );
   }
 }
