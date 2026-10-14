@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../client.dart';
+import '../lock.dart';
 import '../theme.dart';
 import 'home.dart';
 
@@ -38,7 +39,21 @@ class _SettingsTabState extends State<SettingsTab> {
           ),
         ),
         section('ПРИВАТНОСТЬ И БЕЗОПАСНОСТЬ'),
-        // Код безопасности, биометрия и E2E появятся на этапе 3.
+        FutureBuilder(
+          future: AppLock.available(),
+          builder: (context, snap) => snap.data != true
+              ? const SizedBox.shrink()
+              : ValueListenableBuilder(
+                  valueListenable: AppLock.enabled,
+                  builder: (context, on, _) => SwitchListTile(
+                    secondary: const Icon(Icons.fingerprint),
+                    title: const Text('Блокировка по биометрии'),
+                    subtitle: const Text('Отпечаток, лицо или PIN-код телефона при входе в приложение'),
+                    value: on,
+                    onChanged: AppLock.setEnabled,
+                  ),
+                ),
+        ),
         SwitchListTile(
           secondary: const Icon(Icons.screenshot_outlined),
           title: const Text('Уведомления о скриншотах'),
