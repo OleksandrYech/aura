@@ -52,7 +52,7 @@ class AuraClient extends ChangeNotifier {
   static final instance = AuraClient._();
 
   late SharedPreferences _prefs;
-  String? server, token, nick, name;
+  String? token, nick, name;
 
   /// Переписка по никнейму собеседника.
   final chats = <String, List<Message>>{};
@@ -82,12 +82,11 @@ class AuraClient extends ChangeNotifier {
 
   bool get signedIn => token != null;
 
-  /// Адрес сервера по умолчанию: в Web это сайт, с которого открыто приложение.
-  static String get defaultServer => kIsWeb ? Uri.base.origin : '';
+  /// Адрес сервера: в Web это сайт, с которого открыто приложение, в мобильных — постоянный домен.
+  static final server = kIsWeb ? Uri.base.origin : 'https://web.aura-msg.space';
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
-    server = _prefs.getString('server');
     token = _prefs.getString('token');
     nick = _prefs.getString('nick');
     name = _prefs.getString('name');
@@ -112,17 +111,14 @@ class AuraClient extends ChangeNotifier {
 
   // --- Аккаунт ---
 
-  Future<void> register(String server, String nick, String password) =>
-      _auth(server, '/api/register', {'nick': nick, 'password': password});
+  Future<void> register(String nick, String password) =>
+      _auth('/api/register', {'nick': nick, 'password': password});
 
-  Future<void> login(String server, String nick, String password) =>
-      _auth(server, '/api/login', {'nick': nick, 'password': password});
+  Future<void> login(String nick, String password) =>
+      _auth('/api/login', {'nick': nick, 'password': password});
 
-  Future<void> _auth(String server, String path, Map body) async {
-    server = server.trim().replaceAll(RegExp(r'/+$'), '');
-    if (!server.startsWith('http')) server = 'https://$server';
-    final res = await _request('POST', Uri.parse('$server$path'), body);
-    this.server = server;
+  Future<void> _auth(String path, Map body) async {
+    final res = await _request('POST', _api(path), body);
     token = res['token'];
     // Каждый вход — новое устройство со своими ключами. Публикуем их до того, как считать вход выполненным.
     final keys = SignalKeys.generate();
@@ -136,7 +132,6 @@ class AuraClient extends ChangeNotifier {
     nick = res['nick'];
     name = res['name'];
     device = res['device'];
-    await _prefs.setString('server', server);
     await _prefs.setString('token', token!);
     await _prefs.setString('nick', nick!);
     await _prefs.setString('name', name!);
@@ -176,7 +171,7 @@ class AuraClient extends ChangeNotifier {
     _ws = null;
     await ws?.sink.close();
     // Сервер удаляет устройство и его ключи; если связи нет, просто забываем их здесь.
-    if (token != null && server != null) _request('POST', _api('/api/logout'), {}).ignore();
+    if (token != null) _request('POST', _api('/api/logout'), {}).ignore();
     token = nick = name = device = _keys = null;
     connected = false;
     chats.clear();
@@ -300,7 +295,7 @@ class AuraClient extends ChangeNotifier {
 
   void _connect() {
     _retry?.cancel();
-    final ws = WebSocketChannel.connect(Uri.parse(server!.replaceFirst('http', 'ws')).replace(path: '/ws'));
+    final ws = WebSocketChannel.connect(Uri.parse(server.replaceFirst('http', 'ws')).replace(path: '/ws'));
     _ws = ws;
     ws.sink.add(jsonEncode({'type': 'auth', 'token': token}));
     ws.stream.listen((raw) => _onMessage(jsonDecode(raw as String)), onDone: () => _onClosed(ws), onError: (_) {});

@@ -4,4 +4,6 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- HTTP только в отладочной сборке: локальный сервер с эмулятора. -->
+    <application android:usesCleartextTraffic="true"/>
 </manifest>

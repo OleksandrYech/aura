@@ -13,7 +13,7 @@ git clone https://github.com/OleksandrYech/aura && cd aura
 docker compose up -d --build
 ```
 
-Откройте `http://<IP сервера>:8080`. В Android-приложении на экране входа укажите этот же адрес в поле «Сервер».
+Откройте `http://<IP сервера>:8080` в браузере. Мобильные приложения всегда подключаются к `https://web.aura-msg.space` через туннель (ниже); адрес задан в `AuraClient.server` (`app/lib/client.dart`).
 
 Обновление: `git pull && docker compose up -d --build`.
 
@@ -64,8 +64,8 @@ base64 -w0 aura.jks > aura.jks.b64
 (cd server && AURA_WEB=../app/build/web dart run bin/main.dart)
 ```
 
-Мобильные приложения подключаются к серверу по адресу из поля «Сервер» на экране входа
-(с эмулятора Android локальный компьютер доступен как `http://10.0.2.2:8080`).
+Мобильные приложения подключаются к адресу из `AuraClient.server` в `app/lib/client.dart`;
+для отладки с локальным сервером замените его (с эмулятора Android компьютер доступен как `http://10.0.2.2:8080`).
 
 ```sh
 cd app
