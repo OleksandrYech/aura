@@ -13,7 +13,7 @@ git clone https://github.com/OleksandrYech/aura && cd aura
 docker compose up -d --build
 ```
 
-Откройте `http://<IP сервера>:8080`. В Android-приложении на экране входа укажите этот же адрес в поле «Сервер».
+Откройте `http://<IP сервера>:8080` в браузере. Android-приложение ходит только по HTTPS, поэтому ему нужен туннель (ниже); адрес `https://aura.cir-matrix.space` подставлен на экране входа по умолчанию.
 
 Обновление: `git pull && docker compose up -d --build`.
 

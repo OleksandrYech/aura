@@ -83,7 +83,7 @@ class AuraClient extends ChangeNotifier {
   bool get signedIn => token != null;
 
   /// Адрес сервера по умолчанию: в Web это сайт, с которого открыто приложение.
-  static String get defaultServer => kIsWeb ? Uri.base.origin : '';
+  static String get defaultServer => kIsWeb ? Uri.base.origin : 'https://aura.cir-matrix.space';
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
