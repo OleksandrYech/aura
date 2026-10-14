@@ -252,8 +252,13 @@ class AuraClient extends ChangeNotifier {
     } catch (_) {
       throw ApiException('Нет связи с сервером');
     }
-    final data = jsonDecode(utf8.decode(res.bodyBytes));
-    if (res.statusCode != 200) throw ApiException(data['error'] ?? 'Ошибка сервера');
+    final Object? data;
+    try {
+      data = jsonDecode(utf8.decode(res.bodyBytes));
+    } catch (_) {
+      throw ApiException('Сервер не принял файл (${res.statusCode})'); // например, страница ошибки прокси
+    }
+    if (data is! Map || res.statusCode != 200) throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера');
     _files[data['id']] = Future.value(bytes);
     send(to, '', file: {'id': data['id'], 'key': base64.encode(key), 'name': name, 'size': bytes.length});
   }

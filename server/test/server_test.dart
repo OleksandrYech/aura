@@ -236,9 +236,11 @@ void main() {
     Future<HttpClientResponse> send(String method, String path, {List<int>? body, String? auth}) async {
       final req = await HttpClient().openUrl(method, base.resolve(path));
       if (auth != null) req.headers.set('authorization', 'Bearer $auth');
-      if (body != null) req
-        ..contentLength = body.length
-        ..add(body);
+      if (body != null) {
+        req
+          ..contentLength = body.length
+          ..add(body);
+      }
       return req.close();
     }
 

@@ -13,6 +13,18 @@ class AppLock {
   /// Включена ли блокировка (настройка этого устройства).
   static final enabled = ValueNotifier(false);
 
+  /// Системный экран выбора файла уводит приложение в фон; на это время не блокируем.
+  static int _picking = 0;
+
+  static Future<T> whilePicking<T>(Future<T> Function() pick) async {
+    _picking++;
+    try {
+      return await pick();
+    } finally {
+      _picking--;
+    }
+  }
+
   static Future<void> load() async => enabled.value = (await SharedPreferences.getInstance()).getBool('lock') ?? false;
 
   /// В браузере блокировки нет; на телефоне нужна настроенная блокировка экрана.
@@ -65,7 +77,7 @@ class _LockGateState extends State<LockGate> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Только уход в фон: системный диалог биометрии делает приложение лишь inactive.
-    if (state == AppLifecycleState.hidden && AppLock.enabled.value && !_unlocking) {
+    if (state == AppLifecycleState.hidden && AppLock.enabled.value && !_unlocking && AppLock._picking == 0) {
       setState(() => _locked = true);
     } else if (state == AppLifecycleState.resumed && _locked) {
       _unlock();

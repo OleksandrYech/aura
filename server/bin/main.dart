@@ -14,7 +14,12 @@ Future<void> main() async {
 
   var handler = aura.handler;
   if (webDir != null && Directory(webDir).existsSync()) {
-    final web = createStaticHandler(webDir, defaultDocument: 'index.html');
+    // no-cache: браузер и Cloudflare сверяются с сервером, поэтому после обновления сразу видна новая версия.
+    final web = const Pipeline()
+        .addMiddleware(
+          (inner) => (req) async => (await inner(req)).change(headers: {'cache-control': 'no-cache'}),
+        )
+        .addHandler(createStaticHandler(webDir, defaultDocument: 'index.html'));
     handler = Cascade().add(aura.handler).add(web).handler;
   }
 
