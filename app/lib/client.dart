@@ -33,6 +33,8 @@ class Message {
       ? text
       : file == null
       ? ''
+      : file!['voice'] == true
+      ? 'Голосовое сообщение'
       : isImage(file!['name'])
       ? 'Фото'
       : '📎 ${file!['name']}';
@@ -240,7 +242,7 @@ class AuraClient extends ChangeNotifier {
   static const maxFile = 25 << 20;
 
   /// Шифрует файл новым ключом, загружает на сервер и отправляет сообщение с id и ключом.
-  Future<void> sendFile(String to, String name, Uint8List bytes) async {
+  Future<void> sendFile(String to, String name, Uint8List bytes, {Map<String, dynamic> extra = const {}}) async {
     if (bytes.length > maxFile - 28) throw ApiException('Файл больше ${maxFile >> 20} МБ');
     final key = FileCrypto.newKey();
     final http.Response res;
@@ -260,7 +262,7 @@ class AuraClient extends ChangeNotifier {
     }
     if (data is! Map || res.statusCode != 200) throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера');
     _files[data['id']] = Future.value(bytes);
-    send(to, '', file: {'id': data['id'], 'key': base64.encode(key), 'name': name, 'size': bytes.length});
+    send(to, '', file: {'id': data['id'], 'key': base64.encode(key), 'name': name, 'size': bytes.length, ...extra});
   }
 
   /// Расшифрованные вложения этого запуска приложения.

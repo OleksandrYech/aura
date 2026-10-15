@@ -8,6 +8,7 @@ import '../client.dart';
 import '../lock.dart';
 import '../media.dart';
 import '../theme.dart';
+import '../voice.dart';
 import 'settings.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -262,6 +263,8 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     client.removeListener(_markRead);
+    _ticker?.cancel();
+    _recorder?.cancel().whenComplete(_recorder!.dispose);
     super.dispose();
   }
 
@@ -274,6 +277,52 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     client.send(widget.peer, text);
     _draft.clear();
+  }
+
+  VoiceRecorder? _recorder;
+  Timer? _ticker;
+
+  Future<void> _record() async {
+    final r = VoiceRecorder();
+    var ok = false;
+    try {
+      ok = await AppLock.whilePicking(r.start); // запрос разрешения может свернуть приложение
+    } catch (e) {
+      debugPrint('AURA: запись: $e');
+    }
+    if (!mounted) return r.dispose();
+    if (!ok) {
+      r.dispose();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Нет доступа к микрофону')));
+      return;
+    }
+    setState(() => _recorder = r);
+    _ticker = Timer.periodic(const Duration(milliseconds: 250), (_) => setState(() {}));
+  }
+
+  Future<void> _stopRecording({required bool send}) async {
+    final r = _recorder!;
+    _ticker?.cancel();
+    setState(() => _recorder = null);
+    try {
+      if (!send) return await r.cancel();
+      final rec = await r.stop();
+      if (rec == null || rec.$2 < const Duration(milliseconds: 500)) return;
+      setState(() => _uploading++);
+      try {
+        await client.sendFile(widget.peer, 'voice.wav', rec.$1, extra: {'voice': true, 'duration': rec.$2.inMilliseconds});
+      } finally {
+        if (mounted) setState(() => _uploading--);
+      }
+    } catch (e) {
+      debugPrint('AURA: голосовое: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Голосовое: ${e is ApiException ? e : 'не удалось отправить'}')));
+      }
+    } finally {
+      r.dispose();
+    }
   }
 
   Future<void> _attach() async {
@@ -377,7 +426,25 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_uploading > 0) const LinearProgressIndicator(minHeight: 2),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-            child: Row(children: [
+            child: _recorder != null
+                ? Row(children: [
+                    IconButton(
+                      tooltip: 'Отменить запись',
+                      icon: Icon(Icons.delete_outline, color: c.ink),
+                      onPressed: () => _stopRecording(send: false),
+                    ),
+                    const SizedBox(width: 8),
+                    const Icon(Icons.fiber_manual_record, color: Colors.redAccent, size: 14),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text('Запись ${formatDuration(_recorder!.elapsed)}')),
+                    IconButton(
+                      tooltip: 'Отправить голосовое',
+                      style: IconButton.styleFrom(backgroundColor: c.lavender, fixedSize: const Size.square(44)),
+                      icon: Icon(Icons.send_outlined, color: c.ink, size: 18),
+                      onPressed: () => _stopRecording(send: true),
+                    ),
+                  ])
+                : Row(children: [
               IconButton(
                 tooltip: 'Прикрепить файл',
                 icon: Icon(Icons.attach_file, color: c.ink),
@@ -400,7 +467,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              IconButton(
+                tooltip: 'Записать голосовое',
+                icon: Icon(Icons.mic_none, color: c.ink),
+                onPressed: _record,
+              ),
+              const SizedBox(width: 4),
               IconButton(
                 tooltip: 'Отправить',
                 style: IconButton.styleFrom(backgroundColor: c.lavender, fixedSize: const Size.square(44)),
@@ -427,6 +499,7 @@ class Attachment extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
     final String name = file['name'];
+    if (file['voice'] == true) return VoicePlayer(file);
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: FutureBuilder(
