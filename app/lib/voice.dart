@@ -55,14 +55,14 @@ class VoicePlayer extends StatefulWidget {
 }
 
 class _VoicePlayerState extends State<VoicePlayer> {
-  final _player = AudioPlayer();
+  final _player = AudioPlayer()..setReleaseMode(ReleaseMode.stop); // после конца можно слушать снова
   late final List<StreamSubscription> _subs;
   PlayerState _state = PlayerState.stopped;
   Duration _position = Duration.zero;
+  late Duration _duration = Duration(milliseconds: widget.file['duration'] ?? 0);
+  double? _dragging; // доля, пока палец двигает ползунок
   bool _loaded = false, _loading = false;
   String? _error;
-
-  Duration get _duration => Duration(milliseconds: widget.file['duration'] ?? 0);
 
   @override
   void initState() {
@@ -70,6 +70,8 @@ class _VoicePlayerState extends State<VoicePlayer> {
     _subs = [
       _player.onPlayerStateChanged.listen((s) => setState(() => _state = s)),
       _player.onPositionChanged.listen((p) => setState(() => _position = p)),
+      _player.onDurationChanged.listen((d) => setState(() => _duration = d)),
+      _player.onPlayerComplete.listen((_) => setState(() => _position = Duration.zero)),
     ];
   }
 
@@ -82,21 +84,41 @@ class _VoicePlayerState extends State<VoicePlayer> {
     super.dispose();
   }
 
+  /// Воспроизводим из файла: в браузере blob-адрес, на телефоне временный .wav.
+  /// Так звук идёт самым обычным путём плеера, без data:-адресов и потоков из памяти.
+  Future<bool> _load() async {
+    if (_loaded) return true;
+    setState(() => _loading = true);
+    try {
+      final bytes = await client.fileBytes(widget.file);
+      if (kIsWeb) {
+        await _player.setSource(UrlSource(XFile.fromData(bytes, mimeType: 'audio/wav').path, mimeType: 'audio/wav'));
+      } else {
+        final path = '${(await getTemporaryDirectory()).path}/voice-${widget.file['id']}.wav';
+        await XFile.fromData(bytes).saveTo(path);
+        await _player.setSource(DeviceFileSource(path, mimeType: 'audio/wav'));
+      }
+      return _loaded = true;
+    } catch (e) {
+      debugPrint('AURA: голосовое: $e');
+      if (mounted) setState(() => _error = e is ApiException ? '$e' : 'Не удалось воспроизвести');
+      return false;
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
   Future<void> _toggle() async {
     if (_state == PlayerState.playing) return _player.pause();
-    if (!_loaded) {
-      setState(() => _loading = true);
-      try {
-        await _player.setSourceBytes(await client.fileBytes(widget.file), mimeType: 'audio/wav');
-        _loaded = true;
-      } catch (e) {
-        setState(() => _error = e is ApiException ? '$e' : 'Не удалось воспроизвести');
-        return;
-      } finally {
-        if (mounted) setState(() => _loading = false);
-      }
-    }
-    await _player.resume();
+    if (await _load()) await _player.resume();
+  }
+
+  Future<void> _seek(double fraction) async {
+    setState(() => _dragging = null);
+    if (!await _load()) return;
+    final to = _duration * fraction;
+    setState(() => _position = to);
+    await _player.seek(to);
   }
 
   @override
@@ -104,41 +126,44 @@ class _VoicePlayerState extends State<VoicePlayer> {
     final c = AuraColors.of(context);
     final playing = _state == PlayerState.playing;
     final total = _duration.inMilliseconds;
-    final shown = playing || _state == PlayerState.paused ? _position : _duration;
+    final fraction = _dragging ?? (total == 0 ? 0.0 : (_position.inMilliseconds / total).clamp(0.0, 1.0));
+    final started = playing || _position > Duration.zero || _dragging != null;
     return SizedBox(
-      width: 200,
-      child: Row(
-        children: [
-          IconButton(
-            tooltip: playing ? 'Пауза' : 'Слушать',
-            onPressed: _loading ? null : _toggle,
-            icon: _loading
-                ? const SizedBox.square(dimension: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                : Icon(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, color: c.ink),
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                LinearProgressIndicator(
-                  value: total == 0 || _state == PlayerState.stopped || _state == PlayerState.completed
-                      ? 0
-                      : (_position.inMilliseconds / total).clamp(0, 1),
-                  minHeight: 3,
-                  borderRadius: BorderRadius.circular(2),
-                  color: c.ink.withValues(alpha: 0.7),
-                  backgroundColor: c.ink.withValues(alpha: 0.15),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  _error ?? formatDuration(shown),
-                  style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.6)),
-                ),
-              ],
+      width: 220,
+      child: Row(children: [
+        IconButton(
+          tooltip: playing ? 'Пауза' : 'Слушать',
+          onPressed: _loading ? null : _toggle,
+          icon: _loading
+              ? const SizedBox.square(dimension: 20, child: CircularProgressIndicator(strokeWidth: 2))
+              : Icon(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, color: c.ink),
+        ),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            SliderTheme(
+              data: SliderThemeData(
+                trackHeight: 3,
+                overlayShape: SliderComponentShape.noOverlay,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                activeTrackColor: c.ink.withValues(alpha: 0.7),
+                inactiveTrackColor: c.ink.withValues(alpha: 0.15),
+                thumbColor: c.ink,
+              ),
+              child: Slider(
+                semanticFormatterCallback: (v) => formatDuration(_duration * v),
+                value: fraction,
+                onChanged: total == 0 ? null : (v) => setState(() => _dragging = v),
+                onChangeEnd: total == 0 ? null : _seek,
+              ),
             ),
-          ),
-        ],
-      ),
+            const SizedBox(height: 6),
+            Text(
+              _error ?? formatDuration(started ? _duration * fraction : _duration),
+              style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.6)),
+            ),
+          ]),
+        ),
+      ]),
     );
   }
 }
