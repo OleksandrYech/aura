@@ -16,6 +16,8 @@
 	<string>6.0</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Face ID защищает вход в AURA.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Микрофон нужен для голосовых сообщений.</string>
 	<key>CFBundleName</key>
 	<string>aura</string>
 	<key>CFBundlePackageType</key>
