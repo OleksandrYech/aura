@@ -233,9 +233,10 @@ void main() {
   test('файлы: загрузка, выдача, ограничения', () async {
     final (_, reg) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final String token = reg['token'];
-    Future<HttpClientResponse> send(String method, String path, {List<int>? body, String? auth}) async {
+    Future<HttpClientResponse> send(String method, String path, {List<int>? body, String? auth, String? range}) async {
       final req = await HttpClient().openUrl(method, base.resolve(path));
       if (auth != null) req.headers.set('authorization', 'Bearer $auth');
+      if (range != null) req.headers.set('range', range);
       if (body != null) {
         req
           ..contentLength = body.length
@@ -253,7 +254,29 @@ void main() {
     expect(await down.fold<List<int>>([], (a, b) => a..addAll(b)), bytes);
     expect((await send('GET', '/api/files/../aura.db', auth: token)).statusCode, 404);
     expect((await send('GET', '/api/files/${'0' * 32}', auth: token)).statusCode, 404);
-    expect((await send('POST', '/api/files', body: List.filled(AuraServer.maxFile + 1, 0), auth: token)).statusCode, 413);
+    expect((await send('POST', '/api/files', body: List.filled(AuraServer.maxRequest + 1, 0), auth: token)).statusCode, 413);
+
+    // Большой файл: первая часть создаёт файл, следующие дописываются по offset, скачивается кусками.
+    Future<List<int>> read(HttpClientResponse r) => r.fold<List<int>>([], (a, b) => a..addAll(b));
+    final first = await send('POST', '/api/files?more=1', body: bytes, auth: token);
+    final String big = jsonDecode(await first.transform(utf8.decoder).join())['id'];
+    final (_, other) = await post('/api/register', {'nick': 'oleg', 'password': 'secret1'});
+    expect((await send('POST', '/api/files/$big?offset=1000&more=1', body: bytes, auth: other['token'])).statusCode, 404,
+        reason: 'дописывать может только тот, кто начал загрузку');
+    expect((await send('POST', '/api/files/$big?offset=5&more=1', body: bytes, auth: token)).statusCode, 409);
+    expect((await send('POST', '/api/files/$big?offset=1000&more=1', body: bytes, auth: token)).statusCode, 200);
+    expect((await send('POST', '/api/files/$big?offset=1000&more=1', body: bytes, auth: token)).statusCode, 200,
+        reason: 'повтор той же части после оборванного ответа');
+    expect((await send('POST', '/api/files/$big?offset=2000', body: bytes.take(10).toList(), auth: token)).statusCode, 200);
+    expect((await send('POST', '/api/files/$big?offset=2010', body: bytes, auth: token)).statusCode, 404,
+        reason: 'после последней части файл закрыт');
+    final whole = await read(await send('GET', '/api/files/$big', auth: token));
+    expect(whole, [...bytes, ...bytes, ...bytes.take(10)]);
+    final part = await send('GET', '/api/files/$big', auth: token, range: 'bytes=1000-1999');
+    expect(part.statusCode, 206);
+    expect(await read(part), bytes);
+    final tail = await send('GET', '/api/files/$big', auth: token, range: 'bytes=2000-9999');
+    expect(await read(tail), bytes.take(10).toList());
   });
 
   test('без токена сокет закрывается', () async {

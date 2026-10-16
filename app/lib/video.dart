@@ -1,7 +1,5 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
@@ -64,7 +62,7 @@ class VideoDialog extends StatefulWidget {
 
 class _VideoDialogState extends State<VideoDialog> {
   VideoPlayerController? _video;
-  Uint8List? _bytes;
+  double _progress = 0;
   String? _error;
 
   @override
@@ -75,8 +73,10 @@ class _VideoDialogState extends State<VideoDialog> {
 
   Future<void> _open() async {
     try {
-      final bytes = _bytes = await client.fileBytes(widget.file);
-      final video = await videoController(bytes, widget.file['id'], widget.file['name']);
+      final video = await videoController(
+        widget.file,
+        onProgress: (p) => mounted ? setState(() => _progress = p) : null,
+      );
       await video.initialize();
       if (!mounted) {
         await video.dispose();
@@ -110,11 +110,11 @@ class _VideoDialogState extends State<VideoDialog> {
             onPressed: () => Navigator.pop(context),
           ),
           const Spacer(),
-          if (_bytes != null)
+          if (_video != null)
             IconButton(
               tooltip: 'Сохранить',
               icon: const Icon(Icons.download_outlined, color: Colors.white),
-              onPressed: () => FilePicker.saveFile(fileName: widget.file['name'], bytes: _bytes!),
+              onPressed: () => saveAttachment(widget.file), // видео уже скачано, сохранится сразу
             ),
         ]),
         if (video == null)
@@ -122,7 +122,14 @@ class _VideoDialogState extends State<VideoDialog> {
             padding: const EdgeInsets.all(48),
             child: _error != null
                 ? Text(_error!, style: const TextStyle(color: Colors.white))
-                : const CircularProgressIndicator(color: Colors.white),
+                : Column(mainAxisSize: MainAxisSize.min, children: [
+                    CircularProgressIndicator(color: Colors.white, value: _progress == 0 ? null : _progress),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Скачано ${(_progress * 100).round()}% из ${formatSize(widget.file['size'])}',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ]),
           )
         else ...[
           Flexible(

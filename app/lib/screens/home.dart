@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:cross_file/cross_file.dart';
 import 'package:file_picker/file_picker.dart';
@@ -355,7 +356,7 @@ class _ChatScreenState extends State<ChatScreen> {
           await _upload('фото или видео', () async {
             final file = (await a.file)!;
             final thumb = a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(320)) : null;
-            await _sendMedia(file.path.split('/').last, path: file.path, thumb: thumb);
+            await _sendMedia(XFile(file.path), thumb: thumb);
           });
         }
         return;
@@ -376,8 +377,11 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     for (final f in files) {
       await _upload(f.name, () async {
-        if (kind == AttachKind.file) return client.sendFile(widget.peer, f.name, await f.readAsBytes());
-        await _sendMedia(f.name, path: kIsWeb ? null : f.path, bytes: kIsWeb ? await f.readAsBytes() : null);
+        final length = await f.length() ?? (await f.readAsBytes()).length;
+        if (kind == AttachKind.file) {
+          return client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _setProgress);
+        }
+        await _sendMedia(f.xFile, open: f.readAsByteStream, length: length);
       });
     }
   }
@@ -393,41 +397,47 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  void _setProgress(double p) {
+    if (mounted) setState(() => _progress = p);
+  }
+
   /// Фото и видео перед отправкой сжимаются, к видео прикладывается превью.
-  Future<void> _sendMedia(String name, {String? path, Uint8List? bytes, Uint8List? thumb}) async {
+  /// Файл читается потоком: видео до 2 ГБ не нужно держать в памяти целиком.
+  Future<void> _sendMedia(XFile file, {Stream<List<int>> Function()? open, int? length, Uint8List? thumb}) async {
+    var name = file.name;
     final extra = <String, dynamic>{};
     if (isVideo(name)) {
       extra['video'] = true;
-      if (path != null) {
+      if (!kIsWeb) {
         try {
-          setState(() => _progress = 0);
-          final small = await compressVideo(path, onProgress: (p) => mounted ? setState(() => _progress = p) : null);
-          if (small != null) (path, name) = (small, '${name.substring(0, name.lastIndexOf('.'))}.mp4');
+          if (await compressVideo(file.path, onProgress: _setProgress) case final small?) {
+            (file, name, open, length) = (XFile(small), '${name.substring(0, name.lastIndexOf('.'))}.mp4', null, null);
+          }
         } catch (e) {
           debugPrint('AURA: сжатие видео: $e'); // отправим оригинал
-        } finally {
-          if (mounted) setState(() => _progress = null);
         }
       }
-    }
-    var data = bytes ?? await XFile(path!).readAsBytes();
-    if (isVideo(name)) {
       try {
-        thumb ??= await videoThumbnail(data, name);
+        // В браузере кадр берётся из уже открытого файла, а не из копии в памяти.
+        if (!kIsWeb || file.path.startsWith('blob:')) thumb ??= await videoThumbnail(file);
       } catch (e) {
         debugPrint('AURA: превью видео: $e'); // без превью видео всё равно отправится
       }
       if (thumb != null) extra['thumb'] = base64.encode(thumb);
-    } else if (isImage(name) && !name.toLowerCase().endsWith('.gif') && data.length > 500 << 10) {
+    }
+    length ??= await file.length();
+    if (isImage(name) && !name.toLowerCase().endsWith('.gif') && length > 500 << 10 && length <= 64 << 20) {
       try {
-        if (await shrinkImage(data) case final small? when small.length < data.length) {
-          (name, data) = ('${name.substring(0, name.lastIndexOf('.'))}.jpg', small);
+        final bytes = await (open?.call() ?? file.openRead()).fold(BytesBuilder(copy: false), (b, c) => b..add(c));
+        if (await shrinkImage(bytes.takeBytes()) case final small? when small.length < length) {
+          final jpg = '${name.substring(0, name.lastIndexOf('.'))}.jpg';
+          return await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _setProgress);
         }
       } catch (e) {
         debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
       }
     }
-    await client.sendFile(widget.peer, name, data, extra: extra);
+    await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _setProgress);
   }
 
   @override
@@ -577,7 +587,6 @@ class Attachment extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = AuraColors.of(context);
     final String name = file['name'];
     if (file['voice'] == true) return VoicePlayer(file);
     if (file['video'] == true) return VideoAttachment(file);
@@ -608,38 +617,73 @@ class Attachment extends StatelessWidget {
               ),
             );
           }
-          final loading = isImage(name) && snap.connectionState != ConnectionState.done;
-          return InkWell(
-            borderRadius: BorderRadius.circular(radiusMd),
-            onTap: loading
-                ? null
-                : () async {
-                    final messenger = ScaffoldMessenger.of(context);
-                    try {
-                      final bytes = await client.fileBytes(file);
-                      if (context.mounted) await _save(bytes);
-                    } catch (e) {
-                      messenger.showSnackBar(SnackBar(content: Text('$name: $e')));
-                    }
-                  },
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              loading
-                  ? const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2))
-                  : Icon(snap.hasError ? Icons.broken_image_outlined : Icons.insert_drive_file_outlined, color: c.ink),
+          if (isImage(name) && snap.connectionState != ConnectionState.done) {
+            return Row(mainAxisSize: MainAxisSize.min, children: [
+              const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2)),
               const SizedBox(width: 10),
-              Flexible(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
-                  Text(
-                    snap.hasError ? '${snap.error}' : formatSize(file['size']),
-                    style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.6)),
-                  ),
-                ]),
-              ),
-            ]),
-          );
+              Flexible(child: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis)),
+            ]);
+          }
+          return FileAttachment(file, error: snap.error);
         },
       ),
+    );
+  }
+}
+
+/// Файл в пузыре: по нажатию скачивается, расшифровывается и сохраняется на устройство.
+class FileAttachment extends StatefulWidget {
+  const FileAttachment(this.file, {super.key, this.error});
+  final Map<String, dynamic> file;
+  final Object? error;
+
+  @override
+  State<FileAttachment> createState() => _FileAttachmentState();
+}
+
+class _FileAttachmentState extends State<FileAttachment> {
+  double? _progress;
+  late Object? _error = widget.error;
+
+  Future<void> _save() async {
+    setState(() => (_progress = 0, _error = null));
+    try {
+      await saveAttachment(widget.file, onProgress: (p) => mounted ? setState(() => _progress = p) : null);
+    } catch (e) {
+      debugPrint('AURA: сохранение файла: $e');
+      if (mounted) setState(() => _error = e is ApiException ? e : 'Не удалось сохранить');
+    } finally {
+      if (mounted) setState(() => _progress = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    final String name = widget.file['name'];
+    final busy = _progress != null;
+    return InkWell(
+      borderRadius: BorderRadius.circular(radiusMd),
+      onTap: busy ? null : _save,
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        busy
+            ? SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2, value: _progress))
+            : Icon(_error != null ? Icons.error_outline : Icons.insert_drive_file_outlined, color: c.ink),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
+            Text(
+              _error != null
+                  ? '$_error'
+                  : busy
+                  ? 'Скачано ${(_progress! * 100).round()}% из ${formatSize(widget.file['size'])}'
+                  : formatSize(widget.file['size']),
+              style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.6)),
+            ),
+          ]),
+        ),
+      ]),
     );
   }
 }

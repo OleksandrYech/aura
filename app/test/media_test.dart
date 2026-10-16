@@ -26,4 +26,23 @@ void main() {
     expect(isVideo('clip.MP4'), isTrue);
     expect(isVideo('photo.jpg'), isFalse);
   });
+
+  test('части файла: номер и признак последней проверяются', () {
+    final key = FileCrypto.newKey();
+    final plain = Uint8List.fromList(List.generate(1000, (i) => i % 251));
+    final enc = FileCrypto.encryptPart(key, 3, false, plain);
+    expect(FileCrypto.decryptPart(key, 3, false, enc), plain);
+    expect(() => FileCrypto.decryptPart(key, 4, false, enc), throwsA(anything), reason: 'переставленная часть');
+    expect(() => FileCrypto.decryptPart(key, 3, true, enc), throwsA(anything), reason: 'обрезанный файл');
+  });
+
+  test('поток режется на части нужного размера', () async {
+    Future<List<int>> sizes(List<List<int>> input, int size) async =>
+        [await for (final c in rechunk(Stream.fromIterable(input), size)) c.length];
+    expect(await sizes([List.filled(25, 1)], 10), [10, 10, 5]);
+    expect(await sizes([List.filled(3, 1), List.filled(9, 1), List.filled(8, 1)], 10), [10, 10]);
+    expect(await sizes([], 10), [0]);
+    final joined = [await for (final c in rechunk(Stream.fromIterable([List.generate(7, (i) => i), List.generate(7, (i) => 7 + i)]), 5)) ...c];
+    expect(joined, List.generate(14, (i) => i));
+  });
 }
