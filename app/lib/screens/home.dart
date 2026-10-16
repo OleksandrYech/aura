@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
@@ -7,7 +8,9 @@ import 'package:flutter/material.dart';
 import '../client.dart';
 import '../lock.dart';
 import '../media.dart';
+import '../platform_media.dart';
 import '../theme.dart';
+import '../video.dart';
 import '../voice.dart';
 import 'settings.dart';
 
@@ -341,7 +344,25 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final f in files) {
       setState(() => _uploading++);
       try {
-        await client.sendFile(widget.peer, f.name, await f.readAsBytes());
+        var (name, bytes) = (f.name, await f.readAsBytes());
+        final extra = <String, dynamic>{};
+        if (isVideo(name)) {
+          extra['video'] = true;
+          try {
+            if (await videoThumbnail(bytes, name) case final thumb?) extra['thumb'] = base64.encode(thumb);
+          } catch (e) {
+            debugPrint('AURA: превью видео: $e'); // без превью видео всё равно отправится
+          }
+        } else if (isImage(name) && !name.toLowerCase().endsWith('.gif') && bytes.length > 500 << 10) {
+          try {
+            if (await shrinkImage(bytes) case final small? when small.length < bytes.length) {
+              (name, bytes) = ('${name.substring(0, name.lastIndexOf('.'))}.jpg', small);
+            }
+          } catch (e) {
+            debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
+          }
+        }
+        await client.sendFile(widget.peer, name, bytes, extra: extra);
       } catch (e) {
         fail(f.name, e);
       } finally {
@@ -500,6 +521,7 @@ class Attachment extends StatelessWidget {
     final c = AuraColors.of(context);
     final String name = file['name'];
     if (file['voice'] == true) return VoicePlayer(file);
+    if (file['video'] == true) return VideoAttachment(file);
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: FutureBuilder(
