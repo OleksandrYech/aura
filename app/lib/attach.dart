@@ -103,6 +103,7 @@ class _GalleryState extends State<_Gallery> {
                 child: const Text('Доступ'),
               ),
             FilledButton(
+              style: FilledButton.styleFrom(minimumSize: const Size(0, 40)), // в теме кнопки на всю ширину
               onPressed: _selected.isEmpty ? null : () => Navigator.pop(context, _selected),
               child: const Text('Отправить'),
             ),

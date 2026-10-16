@@ -55,6 +55,7 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # обычно ~12 минут; зависшая сборка не должна съедать минуты Actions
     permissions:
       contents: write # публикация релиза
     env:
@@ -95,6 +96,7 @@ jobs:
 
   ios:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2

@@ -100,5 +100,10 @@ Future<void> saveAttachment(Map<String, dynamic> file, {void Function(double)? o
 Future<Uint8List> encryptPart(Uint8List key, int index, bool last, Uint8List plain) =>
     compute((_) => FileCrypto.encryptPart(key, index, last, plain), null);
 
-Future<Uint8List> decryptPart(Uint8List key, int index, bool last, Uint8List data) =>
-    compute((_) => FileCrypto.decryptPart(key, index, last, data), null);
+Future<Uint8List> decryptPart(Uint8List key, int index, bool last, Uint8List data) async {
+  try {
+    return await compute((_) => FileCrypto.decryptPart(key, index, last, data), null);
+  } catch (_) {
+    throw ApiException('Файл повреждён или подменён');
+  }
+}
