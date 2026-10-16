@@ -332,13 +332,17 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  double? _progress; // сжатие видео, null — просто идёт отправка
+  double? _progress; // null — доля пока неизвестна
+  String _stage = 'Отправка';
 
   void _fail(String what, Object e) {
     debugPrint('AURA: вложение $what: $e');
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('$what: ${e is ApiException ? e : 'не удалось отправить'}')));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('$what: ${e is ApiException ? e : 'не удалось отправить'}'),
+      duration: const Duration(seconds: 10),
+      action: SnackBarAction(label: 'OK', onPressed: () {}),
+    ));
   }
 
   Future<void> _attach() async {
@@ -393,7 +397,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       _fail(what, e);
     } finally {
-      if (mounted) setState(() => (_uploading--, _progress = null));
+      if (mounted) setState(() => (_uploading--, _progress = null, _stage = 'Отправка'));
     }
   }
 
@@ -410,12 +414,14 @@ class _ChatScreenState extends State<ChatScreen> {
       extra['video'] = true;
       if (!kIsWeb) {
         try {
+          setState(() => _stage = 'Сжатие видео');
           if (await compressVideo(file.path, onProgress: _setProgress) case final small?) {
             (file, name, open, length) = (XFile(small), '${name.substring(0, name.lastIndexOf('.'))}.mp4', null, null);
           }
         } catch (e) {
           debugPrint('AURA: сжатие видео: $e'); // отправим оригинал
         }
+        if (mounted) setState(() => (_stage = 'Отправка', _progress = 0));
       }
       try {
         // В браузере кадр берётся из уже открытого файла, а не из копии в памяти.
@@ -513,7 +519,18 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
-          if (_uploading > 0) LinearProgressIndicator(minHeight: 2, value: _progress),
+          if (_uploading > 0)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(
+                  _progress == null ? '$_stage…' : '$_stage ${(_progress! * 100).round()}%',
+                  style: TextStyle(fontSize: 13, color: c.grayPurple),
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(minHeight: 4, value: _progress, borderRadius: BorderRadius.circular(2)),
+              ]),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
             child: _recorder != null

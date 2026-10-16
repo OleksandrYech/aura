@@ -300,6 +300,10 @@ class AuraClient extends ChangeNotifier {
         await Future<void>.delayed(Duration(seconds: 2 * attempt)); // повтор безопасен: сервер сверяет offset
         continue;
       }
+      if (res.statusCode >= 500 && attempt < 3) {
+        await Future<void>.delayed(Duration(seconds: 2 * attempt)); // прокси или сервер на миг недоступны
+        continue;
+      }
       final Object? data;
       try {
         data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -342,7 +346,12 @@ class AuraClient extends ChangeNotifier {
     final key = base64.decode(file['key']);
     final int? chunk = file['chunk'];
     if (chunk == null) {
-      yield FileCrypto.decrypt(key, await _downloadPart(file['id'])); // файлы старых версий, одним куском
+      final data = await _downloadPart(file['id']); // файлы старых версий, одним куском
+      try {
+        yield FileCrypto.decrypt(key, data);
+      } catch (_) {
+        throw ApiException('Файл повреждён или подменён');
+      }
       return;
     }
     final int size = file['size'];
@@ -364,6 +373,10 @@ class AuraClient extends ChangeNotifier {
             .timeout(const Duration(minutes: 3));
       } catch (_) {
         if (attempt == 3) throw ApiException('Нет связи с сервером');
+        await Future<void>.delayed(Duration(seconds: 2 * attempt));
+        continue;
+      }
+      if (res.statusCode >= 500 && attempt < 3) {
         await Future<void>.delayed(Duration(seconds: 2 * attempt));
         continue;
       }
