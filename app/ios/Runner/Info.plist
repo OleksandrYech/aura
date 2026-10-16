@@ -18,6 +18,8 @@
 	<string>Face ID защищает вход в AURA.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Микрофон нужен для голосовых сообщений.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Доступ к галерее нужен, чтобы отправлять фото и видео.</string>
 	<key>CFBundleName</key>
 	<string>aura</string>
 	<key>CFBundlePackageType</key>
