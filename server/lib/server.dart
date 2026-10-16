@@ -88,8 +88,15 @@ class AuraServer {
   final Database db;
   final Directory files;
 
-  static const maxFile = 25 << 20;
+  /// Больше за один запрос не принимаем: через Cloudflare всё равно пролезает не больше 100 МБ.
+  /// Клиенты шлют части по 8 МБ, 25 МБ остаётся для старых версий, грузивших файл целиком.
+  static const maxRequest = 25 << 20;
+  static const maxFile = (2 << 30) + (1 << 20); // 2 ГБ плюс запас на заголовки частей
   static const fileDays = 30;
+
+  /// Файлы, которые сейчас догружаются частями, и устройство, которое их грузит.
+  // ponytail: в памяти, после перезапуска сервера незаконченную загрузку придётся начать заново.
+  final _growing = <String, Device>{};
 
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
@@ -105,6 +112,7 @@ class AuraServer {
       ..get('/api/devices/<nick>', _authed(_devices))
       ..get('/api/keys/<nick>/<device>', _authed(_bundle))
       ..post('/api/files', _authed(_upload))
+      ..post('/api/files/<id>', _authed(_append))
       ..get('/api/files/<id>', _authed(_download))
       ..get('/ws', webSocketHandler(_onSocket, pingInterval: const Duration(seconds: 30)));
     return api.call;
@@ -283,24 +291,60 @@ class AuraServer {
   // --- Файлы ---
 
   Future<Response> _upload(Request req, Device me) async {
-    final tooBig = _error(413, 'Файл больше ${maxFile >> 20} МБ');
-    if ((req.contentLength ?? 0) > maxFile) return tooBig;
-    final bytes = BytesBuilder(copy: false);
-    await for (final chunk in req.read()) {
-      bytes.add(chunk);
-      if (bytes.length > maxFile) return tooBig;
-    }
-    if (bytes.isEmpty) return _error(400, 'Пустой файл');
+    final body = await _body(req);
+    if (body == null) return _error(413, 'Часть файла больше ${maxRequest >> 20} МБ');
+    if (body.isEmpty) return _error(400, 'Пустой файл');
     final id = List.generate(16, (_) => _random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
-    await File(p.join(files.path, id)).writeAsBytes(bytes.takeBytes());
+    await File(p.join(files.path, id)).writeAsBytes(body);
+    if (req.url.queryParameters['more'] == '1') _growing[id] = me;
     _pruneFiles();
     return _ok({'id': id});
   }
 
+  /// Дописывает следующую часть. offset — сколько байт клиент уже загрузил: так повтор
+  /// после оборванного ответа не задвоит часть, а пропуск части не останется незамеченным.
+  Future<Response> _append(Request req, Device me, String id) async {
+    if (_growing[id] != me) return _error(404, 'Загрузка не найдена, начните заново');
+    final f = File(p.join(files.path, id));
+    final offset = int.tryParse(req.url.queryParameters['offset'] ?? '');
+    final body = await _body(req);
+    if (body == null) return _error(413, 'Часть файла больше ${maxRequest >> 20} МБ');
+    final length = f.lengthSync();
+    if (offset == null || (offset != length && offset + body.length != length)) {
+      return _error(409, 'Части файла пришли не по порядку');
+    }
+    if (offset + body.length > maxFile) return _error(413, 'Файл больше 2 ГБ');
+    if (offset == length) await f.writeAsBytes(body, mode: FileMode.append, flush: true);
+    if (req.url.queryParameters['more'] != '1') _growing.remove(id);
+    return _ok({'id': id});
+  }
+
+  Future<Uint8List?> _body(Request req) async {
+    if ((req.contentLength ?? 0) > maxRequest) return null;
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in req.read()) {
+      bytes.add(chunk);
+      if (bytes.length > maxRequest) return null;
+    }
+    return bytes.takeBytes();
+  }
+
+  /// Отдаёт файл целиком или кусок из заголовка Range: клиент качает большие файлы частями.
   Response _download(Request req, Device me, String id) {
     final f = File(p.join(files.path, id));
     if (!RegExp(r'^[0-9a-f]{32}$').hasMatch(id) || !f.existsSync()) return _error(404, 'Файл не найден или уже удалён');
-    return Response.ok(f.openRead(), headers: {'content-type': 'application/octet-stream', 'content-length': '${f.lengthSync()}'});
+    final size = f.lengthSync();
+    final range = RegExp(r'^bytes=(\d+)-(\d+)$').firstMatch(req.headers['range'] ?? '');
+    if (range == null) {
+      return Response.ok(f.openRead(), headers: {'content-type': 'application/octet-stream', 'content-length': '$size'});
+    }
+    final start = int.parse(range[1]!), end = min(int.parse(range[2]!), size - 1);
+    if (start > end) return Response(416, headers: {'content-range': 'bytes */$size'});
+    return Response(206, body: f.openRead(start, end + 1), headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': '${end - start + 1}',
+      'content-range': 'bytes $start-$end/$size',
+    });
   }
 
   void _pruneFiles() {

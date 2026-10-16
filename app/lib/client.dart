@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -8,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'media.dart';
+import 'platform_media.dart';
 import 'signal.dart';
 
 /// Статус сообщения. Свои: в очереди → отправлено → доставлено → прочитано.
@@ -241,51 +243,135 @@ class AuraClient extends ChangeNotifier {
     _deliver(to, m);
   }
 
-  static const maxFile = 25 << 20;
+  static const maxFile = 2 << 30;
 
-  /// Шифрует файл новым ключом, загружает на сервер и отправляет сообщение с id и ключом.
-  Future<void> sendFile(String to, String name, Uint8List bytes, {Map<String, dynamic> extra = const {}}) async {
-    if (bytes.length > maxFile - 28) throw ApiException('Файл больше ${maxFile >> 20} МБ');
+  /// Файл шифруется и грузится частями по 8 МБ: так не нужно держать его целиком в памяти,
+  /// а каждый запрос проходит через Cloudflare, который режет тела больше 100 МБ.
+  static const part = 8 << 20;
+
+  /// Небольшие вложения держим в памяти до выхода, чтобы не качать их повторно.
+  static const _cacheLimit = 32 << 20;
+
+  Future<void> sendFile(String to, String name, Uint8List bytes, {Map<String, dynamic> extra = const {}}) =>
+      sendStream(to, name, Stream.value(bytes), bytes.length, extra: extra);
+
+  /// Шифрует файл новым ключом, загружает частями и отправляет сообщение с id и ключом.
+  Future<void> sendStream(
+    String to,
+    String name,
+    Stream<List<int>> data,
+    int length, {
+    Map<String, dynamic> extra = const {},
+    void Function(double progress)? onProgress,
+  }) async {
+    if (length > maxFile) throw ApiException('Файл больше 2 ГБ');
     final key = FileCrypto.newKey();
-    final http.Response res;
-    try {
-      final req = http.Request('POST', _api('/api/files'))
-        ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'})
-        ..bodyBytes = FileCrypto.encrypt(key, bytes);
-      res = await http.Response.fromStream(await req.send()).timeout(const Duration(minutes: 3));
-    } catch (_) {
-      throw ApiException('Нет связи с сервером');
+    final parts = max(1, (length + part - 1) ~/ part);
+    final keep = length <= _cacheLimit ? BytesBuilder(copy: false) : null;
+    String? id;
+    var offset = 0, i = 0;
+    await for (final chunk in rechunk(data, part)) {
+      if (i == parts) throw ApiException('Файл изменился во время отправки');
+      keep?.add(chunk);
+      final body = await encryptPart(key, i, i == parts - 1, chunk);
+      id = await _uploadPart(id, offset, body, more: i < parts - 1);
+      offset += body.length;
+      onProgress?.call(++i / parts);
     }
-    final Object? data;
-    try {
-      data = jsonDecode(utf8.decode(res.bodyBytes));
-    } catch (_) {
-      throw ApiException('Сервер не принял файл (${res.statusCode})'); // например, страница ошибки прокси
+    if (i != parts) throw ApiException('Файл изменился во время отправки');
+    if (keep != null) _files[id!] = Future.value(keep.takeBytes());
+    send(to, '', file: {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra});
+  }
+
+  Future<String> _uploadPart(String? id, int offset, Uint8List body, {required bool more}) async {
+    final url = _api(id == null ? '/api/files' : '/api/files/$id', {
+      if (id != null) 'offset': '$offset',
+      if (more) 'more': '1',
+    });
+    for (var attempt = 1;; attempt++) {
+      final http.Response res;
+      try {
+        final req = http.Request('POST', url)
+          ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'})
+          ..bodyBytes = body;
+        res = await http.Response.fromStream(await req.send()).timeout(const Duration(minutes: 3));
+      } catch (_) {
+        if (attempt == 3) throw ApiException('Нет связи с сервером');
+        await Future<void>.delayed(Duration(seconds: 2 * attempt)); // повтор безопасен: сервер сверяет offset
+        continue;
+      }
+      final Object? data;
+      try {
+        data = jsonDecode(utf8.decode(res.bodyBytes));
+      } catch (_) {
+        throw ApiException('Сервер не принял файл (${res.statusCode})'); // например, страница ошибки прокси
+      }
+      if (data is! Map || res.statusCode != 200) {
+        throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера');
+      }
+      return data['id'];
     }
-    if (data is! Map || res.statusCode != 200) throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера');
-    _files[data['id']] = Future.value(bytes);
-    send(to, '', file: {'id': data['id'], 'key': base64.encode(key), 'name': name, 'size': bytes.length, ...extra});
   }
 
   /// Расшифрованные вложения этого запуска приложения.
   // ponytail: только в памяти, сохранять на устройство, когда понадобится просмотр без сети.
   final _files = <String, Future<Uint8List>>{};
 
-  /// Скачивает и расшифровывает вложение.
-  Future<Uint8List> fileBytes(Map<String, dynamic> file) => _files[file['id']] ??= () async {
-    final http.Response res;
-    try {
-      res = await http.get(_api('/api/files/${file['id']}'), headers: {'authorization': 'Bearer $token'});
-    } catch (_) {
-      _files.remove(file['id']);
-      throw ApiException('Нет связи с сервером');
+  /// Скачивает и расшифровывает вложение целиком. Для больших файлов есть [fileParts].
+  Future<Uint8List> fileBytes(Map<String, dynamic> file) {
+    final String id = file['id'];
+    if (_files[id] case final cached?) return cached;
+    final bytes = () async {
+      final all = BytesBuilder(copy: false);
+      await for (final p in fileParts(file)) {
+        all.add(p);
+      }
+      return all.takeBytes();
+    }();
+    if ((file['size'] ?? 0) <= _cacheLimit) {
+      _files[id] = bytes;
+      bytes.then((_) {}, onError: (_) {
+        _files.remove(id); // после ошибки попробуем скачать заново
+      });
     }
-    if (res.statusCode != 200) {
-      _files.remove(file['id']);
-      throw ApiException(res.statusCode == 404 ? 'Файл удалён с сервера' : 'Ошибка сервера');
+    return bytes;
+  }
+
+  /// Расшифрованное вложение по частям, по мере скачивания.
+  Stream<Uint8List> fileParts(Map<String, dynamic> file) async* {
+    final key = base64.decode(file['key']);
+    final int? chunk = file['chunk'];
+    if (chunk == null) {
+      yield FileCrypto.decrypt(key, await _downloadPart(file['id'])); // файлы старых версий, одним куском
+      return;
     }
-    return FileCrypto.decrypt(base64.decode(file['key']), res.bodyBytes);
-  }();
+    final int size = file['size'];
+    final parts = max(1, (size + chunk - 1) ~/ chunk);
+    for (var i = 0; i < parts; i++) {
+      final start = i * (chunk + 28), length = min(chunk, size - i * chunk) + 28;
+      final data = await _downloadPart(file['id'], 'bytes=$start-${start + length - 1}');
+      if (data.length != length) throw ApiException('Файл на сервере повреждён');
+      yield await decryptPart(key, i, i == parts - 1, data);
+    }
+  }
+
+  Future<Uint8List> _downloadPart(String id, [String? range]) async {
+    for (var attempt = 1;; attempt++) {
+      final http.Response res;
+      try {
+        res = await http
+            .get(_api('/api/files/$id'), headers: {'authorization': 'Bearer $token', 'range': ?range})
+            .timeout(const Duration(minutes: 3));
+      } catch (_) {
+        if (attempt == 3) throw ApiException('Нет связи с сервером');
+        await Future<void>.delayed(Duration(seconds: 2 * attempt));
+        continue;
+      }
+      if (res.statusCode == 404) throw ApiException('Файл удалён с сервера');
+      if (res.statusCode != (range == null ? 200 : 206)) throw ApiException('Ошибка сервера');
+      return res.bodyBytes;
+    }
+  }
 
   void markRead(String peer) {
     lastRead[peer] = DateTime.now().millisecondsSinceEpoch;
