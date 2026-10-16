@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:fc_native_video_thumbnail/fc_native_video_thumbnail.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -106,4 +107,40 @@ Future<Uint8List> decryptPart(Uint8List key, int index, bool last, Uint8List dat
   } catch (_) {
     throw ApiException('Файл повреждён или подменён');
   }
+}
+
+var _jobs = 0;
+var _shown = DateTime(0);
+
+/// На Android отправка идёт под службой переднего плана с уведомлением: система не останавливает
+/// приложение, пока файл грузится, даже если свернуть его или выключить экран.
+// ponytail: на iOS фоновой загрузки нет, нужна фоновая URLSession; добавить, если понадобится.
+Future<T> inBackground<T>(Future<T> Function() job) async {
+  if (Platform.isAndroid && _jobs++ == 0) {
+    try {
+      if (await FlutterForegroundTask.checkNotificationPermission() != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission(); // без разрешения служба работает, но без уведомления
+      }
+      FlutterForegroundTask.init(
+        androidNotificationOptions: AndroidNotificationOptions(channelId: 'upload', channelName: 'Отправка файлов'),
+        iosNotificationOptions: const IOSNotificationOptions(showNotification: false),
+        foregroundTaskOptions: ForegroundTaskOptions(eventAction: ForegroundTaskEventAction.nothing(), allowWifiLock: true),
+      );
+      await FlutterForegroundTask.startService(notificationTitle: 'AURA', notificationText: 'Отправка файла');
+    } catch (e) {
+      debugPrint('AURA: фоновая служба: $e'); // отправка всё равно пойдёт, пока приложение открыто
+    }
+  }
+  try {
+    return await job();
+  } finally {
+    if (Platform.isAndroid && --_jobs == 0) await FlutterForegroundTask.stopService();
+  }
+}
+
+/// Текст уведомления фоновой отправки, не чаще раза в секунду.
+void backgroundStatus(String text) {
+  if (_jobs == 0 || DateTime.now().difference(_shown).inSeconds < 1) return;
+  _shown = DateTime.now();
+  FlutterForegroundTask.updateService(notificationText: text);
 }

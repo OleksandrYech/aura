@@ -129,3 +129,8 @@ Future<Uint8List> _gcm(bool encrypt, Uint8List key, Uint8List nonce, Uint8List a
   final out = await (encrypt ? subtle.encrypt(params, k, data.toJS) : subtle.decrypt(params, k, data.toJS)).toDart;
   return (out as JSArrayBuffer).toDart.asUint8List();
 }
+
+/// Вкладка браузера грузит и в фоне, пока открыта.
+Future<T> inBackground<T>(Future<T> Function() job) => job();
+
+void backgroundStatus(String text) {}

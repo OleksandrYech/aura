@@ -247,7 +247,9 @@ class AuraClient extends ChangeNotifier {
 
   /// Файл шифруется и грузится частями по 8 МБ: так не нужно держать его целиком в памяти,
   /// а каждый запрос проходит через Cloudflare, который режет тела больше 100 МБ.
-  static const part = 8 << 20;
+  /// Размер части при отправке. Небольшие части быстрее повторить на мобильной сети;
+  /// получатель берёт размер из сообщения, поэтому файлы с частями по 8 МБ тоже читаются.
+  static const part = 2 << 20;
 
   /// Небольшие вложения держим в памяти до выхода, чтобы не качать их повторно.
   static const _cacheLimit = 32 << 20;
@@ -262,7 +264,7 @@ class AuraClient extends ChangeNotifier {
     Stream<List<int>> data,
     int length, {
     Map<String, dynamic> extra = const {},
-    void Function(double progress)? onProgress,
+    void Function(int sent, int total)? onProgress,
   }) async {
     if (length > maxFile) throw ApiException('Файл больше 2 ГБ');
     final key = FileCrypto.newKey();
@@ -274,16 +276,19 @@ class AuraClient extends ChangeNotifier {
       if (i == parts) throw ApiException('Файл изменился во время отправки');
       keep?.add(chunk);
       final body = await encryptPart(key, i, i == parts - 1, chunk);
-      id = await _uploadPart(id, offset, body, more: i < parts - 1);
+      final before = i * part;
+      id = await _uploadPart(id, offset, body, more: i < parts - 1,
+          onSent: (n) => onProgress?.call(min(before + n, before + chunk.length), length));
       offset += body.length;
-      onProgress?.call(++i / parts);
+      i++;
     }
     if (i != parts) throw ApiException('Файл изменился во время отправки');
     if (keep != null) _files[id!] = Future.value(keep.takeBytes());
     send(to, '', file: {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra});
   }
 
-  Future<String> _uploadPart(String? id, int offset, Uint8List body, {required bool more}) async {
+  Future<String> _uploadPart(String? id, int offset, Uint8List body,
+      {required bool more, void Function(int sent)? onSent}) async {
     final url = _api(id == null ? '/api/files' : '/api/files/$id', {
       if (id != null) 'offset': '$offset',
       if (more) 'more': '1',
@@ -291,17 +296,17 @@ class AuraClient extends ChangeNotifier {
     for (var attempt = 1;; attempt++) {
       final http.Response res;
       try {
-        final req = http.Request('POST', url)
-          ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'})
-          ..bodyBytes = body;
+        final req = _Upload(url, body, onSent)
+          ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'});
         res = await http.Response.fromStream(await req.send()).timeout(const Duration(minutes: 3));
-      } catch (_) {
-        if (attempt == 3) throw ApiException('Нет связи с сервером');
-        await Future<void>.delayed(Duration(seconds: 2 * attempt)); // повтор безопасен: сервер сверяет offset
+      } catch (e) {
+        debugPrint('AURA: загрузка части, попытка $attempt: $e');
+        if (attempt == _attempts) throw ApiException('Нет связи с сервером');
+        await Future<void>.delayed(Duration(seconds: 2 << attempt)); // повтор безопасен: сервер сверяет offset
         continue;
       }
-      if (res.statusCode >= 500 && attempt < 3) {
-        await Future<void>.delayed(Duration(seconds: 2 * attempt)); // прокси или сервер на миг недоступны
+      if (res.statusCode >= 500 && attempt < _attempts) {
+        await Future<void>.delayed(Duration(seconds: 2 << attempt)); // прокси или сервер на миг недоступны
         continue;
       }
       final Object? data;
@@ -316,6 +321,9 @@ class AuraClient extends ChangeNotifier {
       return data['id'];
     }
   }
+
+  /// Сколько раз пробовать часть файла: при смене Wi-Fi на мобильную сеть связь пропадает на десятки секунд.
+  static const _attempts = 6;
 
   /// Расшифрованные вложения этого запуска приложения.
   // ponytail: только в памяти, сохранять на устройство, когда понадобится просмотр без сети.
@@ -371,13 +379,14 @@ class AuraClient extends ChangeNotifier {
         res = await http
             .get(_api('/api/files/$id'), headers: {'authorization': 'Bearer $token', 'range': ?range})
             .timeout(const Duration(minutes: 3));
-      } catch (_) {
-        if (attempt == 3) throw ApiException('Нет связи с сервером');
-        await Future<void>.delayed(Duration(seconds: 2 * attempt));
+      } catch (e) {
+        debugPrint('AURA: скачивание части, попытка $attempt: $e');
+        if (attempt == _attempts) throw ApiException('Нет связи с сервером');
+        await Future<void>.delayed(Duration(seconds: 2 << attempt));
         continue;
       }
-      if (res.statusCode >= 500 && attempt < 3) {
-        await Future<void>.delayed(Duration(seconds: 2 * attempt));
+      if (res.statusCode >= 500 && attempt < _attempts) {
+        await Future<void>.delayed(Duration(seconds: 2 << attempt));
         continue;
       }
       if (res.statusCode == 404) throw ApiException('Файл удалён с сервера');
@@ -570,3 +579,26 @@ class AuraClient extends ChangeNotifier {
 }
 
 final client = AuraClient.instance;
+
+/// Тело запроса кусками по 64 КБ: сокет забирает их по мере отправки, так виден прогресс внутри части.
+/// В браузере тело всё равно собирается целиком, там прогресс идёт по частям.
+class _Upload extends http.BaseRequest {
+  _Upload(Uri url, this.body, this.onSent) : super('POST', url) {
+    contentLength = body.length;
+  }
+
+  final Uint8List body;
+  final void Function(int sent)? onSent;
+
+  @override
+  http.ByteStream finalize() {
+    super.finalize();
+    return http.ByteStream(() async* {
+      for (var i = 0; i < body.length; i += 64 << 10) {
+        final end = min(i + (64 << 10), body.length);
+        yield Uint8List.sublistView(body, i, end);
+        onSent?.call(end);
+      }
+    }());
+  }
+}

@@ -334,6 +334,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   double? _progress; // null — доля пока неизвестна
   String _stage = 'Отправка';
+  (int, int)? _bytes; // отправлено и всего, байт
+
+  String get _status => switch ((_bytes, _progress)) {
+    ((final sent, final total), _) => '$_stage ${formatSize(sent)} / ${formatSize(total)}',
+    (_, final p?) => '$_stage ${(p * 100).round()}%',
+    _ => '$_stage…',
+  };
 
   void _fail(String what, Object e) {
     debugPrint('AURA: вложение $what: $e');
@@ -383,7 +390,7 @@ class _ChatScreenState extends State<ChatScreen> {
       await _upload(f.name, () async {
         final length = await f.length() ?? (await f.readAsBytes()).length;
         if (kind == AttachKind.file) {
-          return client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _setProgress);
+          return client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _sendProgress);
         }
         await _sendMedia(f.xFile, open: f.readAsByteStream, length: length);
       });
@@ -393,16 +400,22 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _upload(String what, Future<void> Function() send) async {
     setState(() => _uploading++);
     try {
-      await send();
+      await inBackground(send);
     } catch (e) {
       _fail(what, e);
     } finally {
-      if (mounted) setState(() => (_uploading--, _progress = null, _stage = 'Отправка'));
+      if (mounted) setState(() => (_uploading--, _progress = null, _bytes = null, _stage = 'Отправка'));
     }
   }
 
   void _setProgress(double p) {
     if (mounted) setState(() => _progress = p);
+    backgroundStatus(_status);
+  }
+
+  void _sendProgress(int sent, int total) {
+    if (mounted) setState(() => (_bytes = (sent, total), _progress = total == 0 ? null : sent / total));
+    backgroundStatus(_status);
   }
 
   /// Фото и видео перед отправкой сжимаются, к видео прикладывается превью.
@@ -437,13 +450,13 @@ class _ChatScreenState extends State<ChatScreen> {
         final bytes = await (open?.call() ?? file.openRead()).fold(BytesBuilder(copy: false), (b, c) => b..add(c));
         if (await shrinkImage(bytes.takeBytes()) case final small? when small.length < length) {
           final jpg = '${name.substring(0, name.lastIndexOf('.'))}.jpg';
-          return await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _setProgress);
+          return await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _sendProgress);
         }
       } catch (e) {
         debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
       }
     }
-    await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _setProgress);
+    await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _sendProgress);
   }
 
   @override
@@ -524,7 +537,7 @@ class _ChatScreenState extends State<ChatScreen> {
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(
-                  _progress == null ? '$_stage…' : '$_stage ${(_progress! * 100).round()}%',
+                  _status,
                   style: TextStyle(fontSize: 13, color: c.grayPurple),
                 ),
                 const SizedBox(height: 4),
