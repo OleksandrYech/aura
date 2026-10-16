@@ -295,15 +295,17 @@ class AuraClient extends ChangeNotifier {
     });
     for (var attempt = 1;; attempt++) {
       final http.Response res;
+      final req = _Upload(url, body, onSent)
+        ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'});
       try {
-        final req = _Upload(url, body, onSent)
-          ..headers.addAll({'content-type': 'application/octet-stream', 'authorization': 'Bearer $token'});
-        res = await http.Response.fromStream(await req.send()).timeout(const Duration(minutes: 3));
+        res = await http.Response.fromStream(await req.send());
       } catch (e) {
         debugPrint('AURA: загрузка части, попытка $attempt: $e');
         if (attempt == _attempts) throw ApiException('Нет связи с сервером');
         await Future<void>.delayed(Duration(seconds: 2 << attempt)); // повтор безопасен: сервер сверяет offset
         continue;
+      } finally {
+        req.timer.cancel(); // иначе запрос с телом жил бы в памяти до срабатывания таймера
       }
       if (res.statusCode >= 500 && attempt < _attempts) {
         await Future<void>.delayed(Duration(seconds: 2 << attempt)); // прокси или сервер на миг недоступны
@@ -582,13 +584,22 @@ final client = AuraClient.instance;
 
 /// Тело запроса кусками по 64 КБ: сокет забирает их по мере отправки, так виден прогресс внутри части.
 /// В браузере тело всё равно собирается целиком, там прогресс идёт по частям.
-class _Upload extends http.BaseRequest {
+/// Запрос целиком, с отправкой тела, обрывается через 3 минуты: на зависшей сети повтор начнётся,
+/// а оборванный запрос не дойдёт до сервера позже повтора.
+class _Upload extends http.BaseRequest with http.Abortable {
   _Upload(Uri url, this.body, this.onSent) : super('POST', url) {
     contentLength = body.length;
+    timer = Timer(const Duration(minutes: 3), _abort.complete);
   }
 
   final Uint8List body;
   final void Function(int sent)? onSent;
+
+  final _abort = Completer<void>();
+  late final Timer timer;
+
+  @override
+  Future<void> get abortTrigger => _abort.future;
 
   @override
   http.ByteStream finalize() {

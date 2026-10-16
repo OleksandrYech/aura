@@ -268,6 +268,10 @@ void main() {
     expect((await send('POST', '/api/files/$big?offset=1000&more=1', body: bytes, auth: token)).statusCode, 200,
         reason: 'повтор той же части после оборванного ответа');
     expect((await send('POST', '/api/files/$big?offset=2000', body: bytes.take(10).toList(), auth: token)).statusCode, 200);
+    final second = jsonDecode(await (await send('POST', '/api/files?more=1', body: bytes, auth: token)).transform(utf8.decoder).join())['id'];
+    expect((await send('POST', '/api/files/$second?offset=1000', body: bytes, auth: token)).statusCode, 200);
+    expect((await send('POST', '/api/files/$big?offset=2000', body: bytes.take(10).toList(), auth: token)).statusCode, 200,
+        reason: 'повтор последней части после оборванного ответа, даже если между ними закончилась другая загрузка');
     expect((await send('POST', '/api/files/$big?offset=2010', body: bytes, auth: token)).statusCode, 404,
         reason: 'после последней части файл закрыт');
     final whole = await read(await send('GET', '/api/files/$big', auth: token));
