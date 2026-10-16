@@ -35,6 +35,8 @@ class Message {
       ? ''
       : file!['voice'] == true
       ? 'Голосовое сообщение'
+      : file!['video'] == true
+      ? 'Видео'
       : isImage(file!['name'])
       ? 'Фото'
       : '📎 ${file!['name']}';

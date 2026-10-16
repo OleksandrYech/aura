@@ -32,7 +32,16 @@ class FileCrypto {
 
 const imageExtensions = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'};
 
-bool isImage(String name) => imageExtensions.contains(name.split('.').last.toLowerCase());
+String _ext(String name) => name.split('.').last.toLowerCase();
+
+bool isImage(String name) => imageExtensions.contains(_ext(name));
+
+const _videoMimes = {'mp4': 'video/mp4', 'm4v': 'video/mp4', 'mov': 'video/quicktime', 'webm': 'video/webm'};
+
+/// Видео, которые умеют играть браузер, Android и iOS.
+bool isVideo(String name) => _videoMimes.containsKey(_ext(name));
+
+String videoMime(String name) => _videoMimes[_ext(name)] ?? 'video/mp4';
 
 String formatSize(int bytes) => bytes < 1024
     ? '$bytes Б'
