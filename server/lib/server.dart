@@ -98,6 +98,11 @@ class AuraServer {
   // ponytail: в памяти, после перезапуска сервера незаконченную загрузку придётся начать заново.
   final _growing = <String, Device>{};
 
+  /// Недавно законченные загрузки и их устройства: повтор последней части, ответ на которую
+  /// не дошёл, должен получить id, а не 404.
+  // ponytail: последние 1000 на весь сервер, держать по устройству, если повторы начнут теряться.
+  final _finished = <String, Device>{};
+
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
 
@@ -304,7 +309,8 @@ class AuraServer {
   /// Дописывает следующую часть. offset — сколько байт клиент уже загрузил: так повтор
   /// после оборванного ответа не задвоит часть, а пропуск части не останется незамеченным.
   Future<Response> _append(Request req, Device me, String id) async {
-    if (_growing[id] != me) return _error(404, 'Загрузка не найдена, начните заново');
+    final done = _finished[id] == me;
+    if (_growing[id] != me && !done) return _error(404, 'Загрузка не найдена, начните заново');
     final f = File(p.join(files.path, id));
     final offset = int.tryParse(req.url.queryParameters['offset'] ?? '');
     final body = await _body(req);
@@ -313,9 +319,17 @@ class AuraServer {
     if (offset == null || (offset != length && offset + body.length != length)) {
       return _error(409, 'Части файла пришли не по порядку');
     }
+    if (done) {
+      // Закрытый файл не дописываем, только подтверждаем повтор последней части.
+      return offset == length ? _error(404, 'Загрузка не найдена, начните заново') : _ok({'id': id});
+    }
     if (offset + body.length > maxFile) return _error(413, 'Файл больше 2 ГБ');
     if (offset == length) await f.writeAsBytes(body, mode: FileMode.append, flush: true);
-    if (req.url.queryParameters['more'] != '1') _growing.remove(id);
+    if (req.url.queryParameters['more'] != '1') {
+      _growing.remove(id);
+      _finished[id] = me;
+      if (_finished.length > 1000) _finished.remove(_finished.keys.first);
+    }
     return _ok({'id': id});
   }
 
