@@ -57,3 +57,7 @@ Future<VideoPlayerController> videoController(Uint8List bytes, String id, String
   final url = web.URL.createObjectURL(web.Blob([bytes.toJS].toJS, web.BlobPropertyBag(type: videoMime(name))));
   return VideoPlayerController.networkUrl(Uri.parse(url));
 }
+
+/// В браузере перекодировать видео нечем, оно уходит как есть.
+// ponytail: сжатие в браузере через WebCodecs, если будут слать много видео с компьютера.
+Future<String?> compressVideo(String path, {void Function(double progress)? onProgress}) async => null;

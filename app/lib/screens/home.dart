@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:cross_file/cross_file.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:photo_manager/photo_manager.dart';
 
+import '../attach.dart';
 import '../client.dart';
 import '../lock.dart';
 import '../media.dart';
@@ -328,47 +331,103 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _attach() async {
-    final messenger = ScaffoldMessenger.of(context);
-    void fail(String what, Object e) {
-      debugPrint('AURA: вложение $what: $e');
-      messenger.showSnackBar(SnackBar(content: Text('$what: ${e is ApiException ? e : 'не удалось отправить'}')));
-    }
+  double? _progress; // сжатие видео, null — просто идёт отправка
 
+  void _fail(String what, Object e) {
+    debugPrint('AURA: вложение $what: $e');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('$what: ${e is ApiException ? e : 'не удалось отправить'}')));
+  }
+
+  Future<void> _attach() async {
+    final kind = await showAttachMenu(context);
+    if (kind == null || !mounted) return;
+    if (kind == AttachKind.media && !kIsWeb) {
+      final List<AssetEntity>? assets;
+      try {
+        assets = await AppLock.whilePicking(() => pickFromGallery(context));
+      } catch (e) {
+        return _fail('Галерея', e);
+      }
+      if (assets != null) {
+        for (final a in assets) {
+          await _upload('фото или видео', () async {
+            final file = (await a.file)!;
+            final thumb = a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(320)) : null;
+            await _sendMedia(file.path.split('/').last, path: file.path, thumb: thumb);
+          });
+        }
+        return;
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: const Text('Нет доступа к галерее, открываю системный выбор'),
+        action: SnackBarAction(label: 'Настройки', onPressed: PhotoManager.openSetting),
+      ));
+    }
     final List<PlatformFile> files;
     try {
-      files = await AppLock.whilePicking(() => FilePicker.pickFiles());
+      files = await AppLock.whilePicking(() => FilePicker.pickFiles(
+        type: kind == AttachKind.media ? FileType.media : FileType.any,
+      ));
     } catch (e) {
-      return fail('Выбор файла', e);
+      return _fail('Выбор файла', e);
     }
     for (final f in files) {
-      setState(() => _uploading++);
-      try {
-        var (name, bytes) = (f.name, await f.readAsBytes());
-        final extra = <String, dynamic>{};
-        if (isVideo(name)) {
-          extra['video'] = true;
-          try {
-            if (await videoThumbnail(bytes, name) case final thumb?) extra['thumb'] = base64.encode(thumb);
-          } catch (e) {
-            debugPrint('AURA: превью видео: $e'); // без превью видео всё равно отправится
-          }
-        } else if (isImage(name) && !name.toLowerCase().endsWith('.gif') && bytes.length > 500 << 10) {
-          try {
-            if (await shrinkImage(bytes) case final small? when small.length < bytes.length) {
-              (name, bytes) = ('${name.substring(0, name.lastIndexOf('.'))}.jpg', small);
-            }
-          } catch (e) {
-            debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
-          }
+      await _upload(f.name, () async {
+        if (kind == AttachKind.file) return client.sendFile(widget.peer, f.name, await f.readAsBytes());
+        await _sendMedia(f.name, path: kIsWeb ? null : f.path, bytes: kIsWeb ? await f.readAsBytes() : null);
+      });
+    }
+  }
+
+  Future<void> _upload(String what, Future<void> Function() send) async {
+    setState(() => _uploading++);
+    try {
+      await send();
+    } catch (e) {
+      _fail(what, e);
+    } finally {
+      if (mounted) setState(() => (_uploading--, _progress = null));
+    }
+  }
+
+  /// Фото и видео перед отправкой сжимаются, к видео прикладывается превью.
+  Future<void> _sendMedia(String name, {String? path, Uint8List? bytes, Uint8List? thumb}) async {
+    final extra = <String, dynamic>{};
+    if (isVideo(name)) {
+      extra['video'] = true;
+      if (path != null) {
+        try {
+          setState(() => _progress = 0);
+          final small = await compressVideo(path, onProgress: (p) => mounted ? setState(() => _progress = p) : null);
+          if (small != null) (path, name) = (small, '${name.substring(0, name.lastIndexOf('.'))}.mp4');
+        } catch (e) {
+          debugPrint('AURA: сжатие видео: $e'); // отправим оригинал
+        } finally {
+          if (mounted) setState(() => _progress = null);
         }
-        await client.sendFile(widget.peer, name, bytes, extra: extra);
-      } catch (e) {
-        fail(f.name, e);
-      } finally {
-        if (mounted) setState(() => _uploading--);
       }
     }
+    var data = bytes ?? await XFile(path!).readAsBytes();
+    if (isVideo(name)) {
+      try {
+        thumb ??= await videoThumbnail(data, name);
+      } catch (e) {
+        debugPrint('AURA: превью видео: $e'); // без превью видео всё равно отправится
+      }
+      if (thumb != null) extra['thumb'] = base64.encode(thumb);
+    } else if (isImage(name) && !name.toLowerCase().endsWith('.gif') && data.length > 500 << 10) {
+      try {
+        if (await shrinkImage(data) case final small? when small.length < data.length) {
+          (name, data) = ('${name.substring(0, name.lastIndexOf('.'))}.jpg', small);
+        }
+      } catch (e) {
+        debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
+      }
+    }
+    await client.sendFile(widget.peer, name, data, extra: extra);
   }
 
   @override
@@ -444,7 +503,7 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
-          if (_uploading > 0) const LinearProgressIndicator(minHeight: 2),
+          if (_uploading > 0) LinearProgressIndicator(minHeight: 2, value: _progress),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
             child: _recorder != null
