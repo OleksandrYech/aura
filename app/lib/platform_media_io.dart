@@ -11,6 +11,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:v_video_compressor/v_video_compressor.dart';
 import 'package:video_player/video_player.dart';
+import 'package:webcrypto/webcrypto.dart';
 
 import 'client.dart';
 import 'media.dart';
@@ -154,13 +155,26 @@ Future<void> saveAttachment(Map<String, dynamic> file, {void Function(double)? o
   }
 }
 
-/// Шифрование частей в отдельном изоляте, чтобы интерфейс не замирал на больших файлах.
-Future<Uint8List> encryptPart(Uint8List key, int index, bool last, Uint8List plain) =>
-    compute((_) => FileCrypto.encryptPart(key, index, last, plain), null);
+/// Части файла шифрует BoringSSL через FFI (пакет webcrypto) с аппаратным AES процессора:
+/// AES на чистом Dart на телефоне выдаёт меньше 1 МБ/с и был главным тормозом отправки и скачивания.
+/// Формат тот же, что у [FileCrypto.encryptPart] и WebCrypto в браузере.
+/// Часть в 2 МБ шифруется за миллисекунды, поэтому прямо в главном изоляте, без копирования в compute.
+Future<Uint8List> encryptPart(Uint8List key, int index, bool last, Uint8List plain) async {
+  final nonce = FileCrypto.nonce();
+  final out = await (await AesGcmSecretKey.importRawKey(key))
+      .encryptBytes(plain, nonce, additionalData: FileCrypto.partTag(index, last));
+  return Uint8List(12 + out.length)
+    ..setAll(0, nonce)
+    ..setAll(12, out);
+}
 
 Future<Uint8List> decryptPart(Uint8List key, int index, bool last, Uint8List data) async {
   try {
-    return await compute((_) => FileCrypto.decryptPart(key, index, last, data), null);
+    return await (await AesGcmSecretKey.importRawKey(key)).decryptBytes(
+      Uint8List.sublistView(data, 12),
+      Uint8List.sublistView(data, 0, 12),
+      additionalData: FileCrypto.partTag(index, last),
+    );
   } catch (_) {
     throw ApiException('Файл повреждён или подменён');
   }
