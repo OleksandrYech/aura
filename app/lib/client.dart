@@ -14,7 +14,9 @@ import 'signal.dart';
 
 /// Статус сообщения. Свои: в очереди → отправлено → доставлено → прочитано.
 /// Входящие: получено → прочитано (собеседнику ушло подтверждение о прочтении).
-enum Status { pending, sent, delivered, read }
+/// failed — сервер отклонил сообщение, оно уходит заново только по нажатию. Стоит последним:
+/// статусы хранятся по имени, а квитанции сравнивают номер, и failed от них не меняется.
+enum Status { pending, sent, delivered, read, failed }
 
 class Message {
   Message({required this.id, required this.mine, required this.text, required this.time, required this.status, this.file});
@@ -203,9 +205,10 @@ class AuraClient extends ChangeNotifier {
     lastRead.clear();
     _devices.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
-    for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats']) {
+    for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
       await _prefs.remove(k);
     }
+    await clearLocalFiles();
     notifyListeners();
   }
 
@@ -257,8 +260,13 @@ class AuraClient extends ChangeNotifier {
   Future<void> sendFile(String to, String name, Uint8List bytes, {Map<String, dynamic> extra = const {}}) =>
       sendStream(to, name, Stream.value(bytes), bytes.length, extra: extra);
 
+  /// Сколько частей файла грузится и скачивается одновременно, как в Telegram.
+  static const _parallel = 4;
+
   /// Шифрует файл новым ключом, загружает частями и отправляет сообщение с id и ключом.
-  Future<void> sendStream(
+  /// Первая часть создаёт загрузку, остальные идут до [_parallel] одновременно, сообщение уходит
+  /// после всех частей. Возвращает вложение из сообщения, чтобы сохранить файл на устройстве.
+  Future<Map<String, dynamic>> sendStream(
     String to,
     String name,
     Stream<List<int>> data,
@@ -270,29 +278,48 @@ class AuraClient extends ChangeNotifier {
     final key = FileCrypto.newKey();
     final parts = max(1, (length + part - 1) ~/ part);
     final keep = length <= _cacheLimit ? BytesBuilder(copy: false) : null;
+    final size = length + parts * 28; // у каждой части nonce и тег GCM
     String? id;
-    var offset = 0, i = 0;
+    var i = 0, sent = 0;
+    // Части в пути, вместе с шифрованием: оно тоже идёт в нескольких изолятах сразу.
+    // Упавшая часть остаётся в наборе, и следующее ожидание бросит её ошибку.
+    // ponytail: после ошибки остальные части догружаются впустую, отменять их, если это станет заметно.
+    final running = <Future<void>>{};
     await for (final chunk in rechunk(data, part)) {
       if (i == parts) throw ApiException('Файл изменился во время отправки');
       keep?.add(chunk);
-      final body = await encryptPart(key, i, i == parts - 1, chunk);
-      final before = i * part;
-      id = await _uploadPart(id, offset, body, more: i < parts - 1,
-          onSent: (n) => onProgress?.call(min(before + n, before + chunk.length), length));
-      offset += body.length;
-      i++;
+      final index = i++;
+      var last = 0; // байт этой части в прогрессе: при повторе часть идёт сначала
+      void progress(int n) {
+        final m = min(n, chunk.length);
+        sent += m - last;
+        last = m;
+        onProgress?.call(sent, length);
+      }
+      final body = encryptPart(key, index, index == parts - 1, chunk);
+      if (id == null) {
+        id = await _uploadPart(null, size, await body, onSent: progress);
+      } else {
+        final f = body.then((b) => _uploadPart(id, index * (part + 28), b, onSent: progress));
+        running.add(f);
+        f.then((_) => running.remove(f), onError: (_) {});
+        while (running.length >= _parallel) {
+          await Future.any(running);
+        }
+      }
     }
+    await Future.wait(running.toList());
     if (i != parts) throw ApiException('Файл изменился во время отправки');
     if (keep != null) _files[id!] = Future.value(keep.takeBytes());
-    send(to, '', file: {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra});
+    final file = {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra};
+    send(to, '', file: file);
+    return file;
   }
 
-  Future<String> _uploadPart(String? id, int offset, Uint8List body,
-      {required bool more, void Function(int sent)? onSent}) async {
-    final url = _api(id == null ? '/api/files' : '/api/files/$id', {
-      if (id != null) 'offset': '$offset',
-      if (more) 'more': '1',
-    });
+  /// Без [id] создаёт загрузку размером [at] байт (итог всех зашифрованных частей),
+  /// с [id] — пишет часть на место [at].
+  Future<String> _uploadPart(String? id, int at, Uint8List body, {void Function(int sent)? onSent}) async {
+    final url = _api(id == null ? '/api/files' : '/api/files/$id', {(id == null ? 'size' : 'offset'): '$at'});
     for (var attempt = 1;; attempt++) {
       final http.Response res;
       final req = _Upload(url, body, onSent)
@@ -366,11 +393,22 @@ class AuraClient extends ChangeNotifier {
     }
     final int size = file['size'];
     final parts = max(1, (size + chunk - 1) ~/ chunk);
-    for (var i = 0; i < parts; i++) {
+    Future<Uint8List> fetch(int i) async {
       final start = i * (chunk + 28), length = min(chunk, size - i * chunk) + 28;
       final data = await _downloadPart(file['id'], 'bytes=$start-${start + length - 1}');
       if (data.length != length) throw ApiException('Файл на сервере повреждён');
-      yield await decryptPart(key, i, i == parts - 1, data);
+      return decryptPart(key, i, i == parts - 1, data);
+    }
+
+    // До [_parallel] частей качаются одновременно, отдаются по порядку.
+    final ahead = <Future<Uint8List>>[];
+    for (var next = 0; next < parts || ahead.isNotEmpty;) {
+      while (next < parts && ahead.length < _parallel) {
+        final f = fetch(next++);
+        f.ignore(); // ошибку получит await ниже, а не необработанной в зоне
+        ahead.add(f);
+      }
+      yield await ahead.removeAt(0);
     }
   }
 
@@ -422,8 +460,23 @@ class AuraClient extends ChangeNotifier {
     debugPrint('AURA: $e');
   });
 
+  /// Повторная отправка сообщения, которое сервер не принял.
+  void retry(String to, Message m) {
+    m.status = Status.pending;
+    _save();
+    _deliver(to, m);
+  }
+
+  /// Превью видео больше этого (символов base64) не влезает в сообщение: сервер принимает до 100000.
+  static const maxThumb = 40 << 10;
+
   /// Собеседнику, а затем копия на свои другие устройства, чтобы переписка была видна везде.
   Future<void> _deliver(String to, Message m) => _serial(() async {
+    // Старые версии клали крупное превью, и такие сообщения застревали в очереди: шлём без него.
+    if (m.file?['thumb'] case final String t when t.length > maxThumb) {
+      m.file!.remove('thumb');
+      _save();
+    }
     if (await _sendCopy(to, m.id, m.content)) await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
   });
 
@@ -547,6 +600,14 @@ class AuraClient extends ChangeNotifier {
             }
           }
         }
+      case 'error' when msg['id'] != null && msg['to'] != nick:
+        // Сервер отклонил сообщение: «не отправлено», заново по нажатию. Копии на свои устройства не в счёт.
+        for (final list in chats.values) {
+          for (final m in list.where((m) => m.id == msg['id'] && m.status == Status.pending)) {
+            m.status = Status.failed;
+          }
+        }
+        _save();
       case 'message':
         _serial(() => _receive(msg));
     }

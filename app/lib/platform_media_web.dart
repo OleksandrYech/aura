@@ -130,6 +130,11 @@ Future<Uint8List> _gcm(bool encrypt, Uint8List key, Uint8List nonce, Uint8List a
   return (out as JSArrayBuffer).toDart.asUint8List();
 }
 
+/// В браузере вложения живут в blob-ах до закрытия вкладки, на диск их не сохраняем.
+Future<void> keepSent(Map<String, dynamic> file, {String? path, Uint8List? bytes, bool temporary = false}) async {}
+
+Future<void> clearLocalFiles() async {}
+
 /// Вкладка браузера грузит и в фоне, пока открыта.
 Future<T> inBackground<T>(Future<T> Function() job) => job();
 

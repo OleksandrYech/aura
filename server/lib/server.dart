@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -102,6 +103,10 @@ class AuraServer {
   /// не дошёл, должен получить id, а не 404.
   // ponytail: последние 1000 на весь сервер, держать по устройству, если повторы начнут теряться.
   final _finished = <String, Device>{};
+
+  /// Загрузки, для которых клиент сразу назвал итоговый размер: части идут параллельно и каждая
+  /// пишется на своё место. Запись держится и после конца загрузки, пока id есть в [_finished].
+  final _sized = <String, _Sized>{};
 
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
@@ -299,15 +304,32 @@ class AuraServer {
     final body = await _body(req);
     if (body == null) return _error(413, 'Часть файла больше ${maxRequest >> 20} МБ');
     if (body.isEmpty) return _error(400, 'Пустой файл');
+    final size = req.url.queryParameters['size'];
+    final total = size == null ? null : int.tryParse(size);
+    if (size != null && (total == null || total < body.length || total > maxFile)) {
+      return _error(400, 'Неверный размер файла');
+    }
     final id = List.generate(16, (_) => _random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
     await File(p.join(files.path, id)).writeAsBytes(body);
-    if (req.url.queryParameters['more'] == '1') _growing[id] = me;
+    if (total != null) {
+      _sized[id] = _Sized(total)
+        ..parts[0] = (length: body.length, written: Future.value())
+        ..written = body.length;
+      if (total == body.length) {
+        _finish(id, me);
+      } else {
+        _growing[id] = me;
+      }
+    } else if (req.url.queryParameters['more'] == '1') {
+      _growing[id] = me;
+    }
     _pruneFiles();
     return _ok({'id': id});
   }
 
   /// Дописывает следующую часть. offset — сколько байт клиент уже загрузил: так повтор
   /// после оборванного ответа не задвоит часть, а пропуск части не останется незамеченным.
+  /// Если размер назван при создании загрузки, части принимаются в любом порядке (см. [_place]).
   Future<Response> _append(Request req, Device me, String id) async {
     final done = _finished[id] == me;
     if (_growing[id] != me && !done) return _error(404, 'Загрузка не найдена, начните заново');
@@ -315,6 +337,7 @@ class AuraServer {
     final offset = int.tryParse(req.url.queryParameters['offset'] ?? '');
     final body = await _body(req);
     if (body == null) return _error(413, 'Часть файла больше ${maxRequest >> 20} МБ');
+    if (_sized[id] case final up?) return _place(id, me, f, up, offset, body, done);
     final length = f.lengthSync();
     if (offset == null || (offset != length && offset + body.length != length)) {
       return _error(409, 'Части файла пришли не по порядку');
@@ -325,12 +348,59 @@ class AuraServer {
     }
     if (offset + body.length > maxFile) return _error(413, 'Файл больше 2 ГБ');
     if (offset == length) await f.writeAsBytes(body, mode: FileMode.append, flush: true);
-    if (req.url.queryParameters['more'] != '1') {
-      _growing.remove(id);
-      _finished[id] = me;
-      if (_finished.length > 1000) _finished.remove(_finished.keys.first);
-    }
+    if (req.url.queryParameters['more'] != '1') _finish(id, me);
     return _ok({'id': id});
+  }
+
+  /// Часть загрузки с известным размером: пишется на своё место. Повтор той же части безопасен,
+  /// перекрытие с другой частью или выход за размер отклоняются. Загрузка закрывается,
+  /// когда части покрыли весь размер.
+  Future<Response> _place(String id, Device me, File f, _Sized up, int? offset, Uint8List body, bool done) async {
+    if (offset == null || offset < 0 || body.isEmpty || offset + body.length > up.size) {
+      return _error(409, 'Часть файла не на своём месте');
+    }
+    if (up.parts[offset] case final same?) {
+      if (same.length != body.length) return _error(409, 'Части файла перекрываются');
+      await same.written; // повтор пришёл, пока первая копия ещё пишется
+      return _ok({'id': id});
+    }
+    if (done) return _error(404, 'Загрузка не найдена, начните заново');
+    final before = up.parts.lastKeyBefore(offset), after = up.parts.firstKeyAfter(offset);
+    if ((before != null && before + up.parts[before]!.length > offset) ||
+        (after != null && offset + body.length > after)) {
+      return _error(409, 'Части файла перекрываются');
+    }
+    // Место занимаем до записи: параллельный запрос с той же частью дождётся её, а не запишет второй раз.
+    final written = () async {
+      final raf = await f.open(mode: FileMode.append); // append не обрезает файл, позицию задаём сами
+      try {
+        await raf.setPosition(offset);
+        await raf.writeFrom(body);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+    }();
+    up.parts[offset] = (length: body.length, written: written);
+    try {
+      await written;
+    } catch (_) {
+      up.parts.remove(offset); // повтор запишет часть заново
+      rethrow;
+    }
+    up.written += body.length;
+    if (up.written == up.size) _finish(id, me);
+    return _ok({'id': id});
+  }
+
+  void _finish(String id, Device me) {
+    _growing.remove(id);
+    _finished[id] = me;
+    if (_finished.length > 1000) {
+      final old = _finished.keys.first;
+      _finished.remove(old);
+      _sized.remove(old);
+    }
   }
 
   Future<Uint8List?> _body(Request req) async {
@@ -536,6 +606,14 @@ Future<Map<String, dynamic>> _json(Request req) async {
   } catch (_) {
     return {};
   }
+}
+
+/// Загрузка с известным размером: какие части (по offset) уже пришли и сколько байт записано.
+class _Sized {
+  _Sized(this.size);
+  final int size;
+  final parts = SplayTreeMap<int, ({int length, Future<void> written})>();
+  var written = 0;
 }
 
 Response _ok(Object body) => Response.ok(jsonEncode(body), headers: {'content-type': 'application/json'});

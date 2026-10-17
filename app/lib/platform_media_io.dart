@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:fc_native_video_thumbnail/fc_native_video_thumbnail.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:v_video_compressor/v_video_compressor.dart';
 import 'package:video_player/video_player.dart';
 
@@ -26,7 +28,7 @@ Future<Uint8List?> shrinkImage(Uint8List bytes, {int max = 2048, int quality = 8
     }, bytes);
 
 /// Кадр из начала видео в JPEG не больше [size] пикселей.
-Future<Uint8List?> videoThumbnail(XFile video, {int size = 320}) => FcNativeVideoThumbnail().saveThumbnailToBytes(
+Future<Uint8List?> videoThumbnail(XFile video, {int size = 240}) => FcNativeVideoThumbnail().saveThumbnailToBytes(
   srcFile: video.path,
   width: size,
   height: size,
@@ -59,11 +61,66 @@ Future<String?> compressVideo(String path, {void Function(double progress)? onPr
   return result?.compressedFilePath;
 }
 
-/// Расшифрованное вложение во временном файле: большие видео и файлы не помещаются в память.
+/// Папка расшифрованных вложений: свои отправленные и уже скачанные. Удаляется при выходе.
+Future<Directory> _localDir() async =>
+    Directory('${(await getApplicationSupportDirectory()).path}/files').create(recursive: true);
+
+/// Имя локальной копии: id и расширение (по нему iOS узнаёт видео), без лишних символов из сообщения.
+String _localName(Map<String, dynamic> file) {
+  final ext = RegExp(r'\.[A-Za-z0-9]{1,8}$').firstMatch(file['name'] as String)?[0] ?? '';
+  return '${(file['id'] as String).replaceAll(RegExp(r'[^0-9a-f]'), '')}$ext';
+}
+
+Future<bool> _complete(File f, Map<String, dynamic> file) async => await f.exists() && await f.length() == file['size'];
+
+/// Пути к отправленным оригиналам по id вложения: их не копируем, а читаем на месте.
+/// Собеседнику путь не уходит, он только в настройках этого устройства.
+// ponytail: записи не чистятся до выхода из аккаунта, удалять по сроку файлов на сервере, если их станет много.
+Future<Map<String, dynamic>> _originals(SharedPreferences prefs) async =>
+    jsonDecode(prefs.getString('localFiles') ?? '{}') as Map<String, dynamic>;
+
+/// Отправленный файл остаётся на устройстве, чтобы своё видео не качать заново.
+/// [bytes] — фото, сжатое в памяти; [path] и [temporary] — временный файл сжатия, его переносим;
+/// просто [path] — оригинал, запоминаем путь к нему.
+Future<void> keepSent(Map<String, dynamic> file, {String? path, Uint8List? bytes, bool temporary = false}) async {
+  try {
+    final out = File('${(await _localDir()).path}/${_localName(file)}');
+    if (bytes != null) {
+      await out.writeAsBytes(bytes, flush: true);
+    } else if (path != null && temporary) {
+      try {
+        await File(path).rename(out.path);
+      } on FileSystemException {
+        await File(path).copy(out.path); // другой раздел диска
+        await File(path).delete();
+      }
+    } else if (path != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('localFiles', jsonEncode({...await _originals(prefs), file['id']: path}));
+    }
+  } catch (e) {
+    debugPrint('AURA: копия отправленного файла: $e'); // не страшно, файл скачается с сервера
+  }
+}
+
+/// Удаляет локальные копии вложений при выходе из аккаунта. Оригиналы в галерее не трогаем.
+Future<void> clearLocalFiles() async {
+  try {
+    await (await _localDir()).delete(recursive: true);
+  } catch (e) {
+    debugPrint('AURA: удаление вложений: $e');
+  }
+}
+
+/// Расшифрованное вложение в файле: большие видео и файлы не помещаются в память.
+/// Сначала ищем свою копию или отправленный оригинал, иначе скачиваем в ту же папку.
 Future<File> _download(Map<String, dynamic> file, void Function(double)? onProgress) async {
-  final dir = await getTemporaryDirectory();
-  final out = File('${dir.path}/aura-${file['id']}-${file['name']}');
-  if (await out.exists()) return out;
+  final out = File('${(await _localDir()).path}/${_localName(file)}');
+  if (await _complete(out, file)) return out;
+  if ((await _originals(await SharedPreferences.getInstance()))[file['id']] case final String path
+      when await _complete(File(path), file)) {
+    return File(path);
+  }
   final tmp = File('${out.path}.part');
   final sink = tmp.openWrite();
   var done = 0;
