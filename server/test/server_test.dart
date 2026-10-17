@@ -281,6 +281,33 @@ void main() {
     expect(await read(part), bytes);
     final tail = await send('GET', '/api/files/$big', auth: token, range: 'bytes=2000-9999');
     expect(await read(tail), bytes.take(10).toList());
+
+    // Размер известен заранее: части идут в любом порядке и одновременно.
+    expect((await send('POST', '/api/files?size=999', body: bytes, auth: token)).statusCode, 400);
+    expect((await send('POST', '/api/files?size=${AuraServer.maxFile + 1}', body: bytes, auth: token)).statusCode, 400);
+    final par = jsonDecode(await (await send('POST', '/api/files?size=3010', body: bytes, auth: token)).transform(utf8.decoder).join())['id'];
+    final codes = await Future.wait([
+      send('POST', '/api/files/$par?offset=2000', body: bytes.take(10).toList(), auth: token),
+      send('POST', '/api/files/$par?offset=1000', body: bytes, auth: token),
+      send('POST', '/api/files/$par?offset=2000', body: bytes.take(10).toList(), auth: token), // повтор одновременно
+    ].map((r) async => (await r).statusCode));
+    expect(codes, [200, 200, 200]);
+    expect((await send('POST', '/api/files/$par?offset=1500', body: bytes, auth: token)).statusCode, 409,
+        reason: 'части не перекрываются');
+    expect((await send('GET', '/api/files/$par', auth: token, range: 'bytes=2000-2009')).statusCode, 206);
+    expect((await send('POST', '/api/files/$par?offset=1010', body: bytes, auth: token)).statusCode, 409,
+        reason: 'не за пределы размера и не поверх другой части');
+    expect((await send('POST', '/api/files/$par?offset=2500', body: bytes, auth: token)).statusCode, 409);
+    expect((await send('POST', '/api/files/$par?offset=2010', body: bytes, auth: token)).statusCode, 200);
+    expect((await send('POST', '/api/files/$par?offset=1000', body: bytes, auth: token)).statusCode, 200,
+        reason: 'повтор любой части после конца загрузки');
+    expect((await send('POST', '/api/files/$par?offset=500', body: bytes.take(10).toList(), auth: token)).statusCode, 404,
+        reason: 'файл закрыт');
+    expect(await read(await send('GET', '/api/files/$par', auth: token)), [...bytes, ...bytes, ...bytes.take(10), ...bytes]);
+    final small = jsonDecode(await (await send('POST', '/api/files?size=1000', body: bytes, auth: token)).transform(utf8.decoder).join())['id'];
+    expect((await send('POST', '/api/files/$small?offset=0', body: bytes, auth: token)).statusCode, 200,
+        reason: 'файл из одной части закрыт сразу, повтор подтверждается');
+    expect(await read(await send('GET', '/api/files/$small', auth: token)), bytes);
   });
 
   test('без токена сокет закрывается', () async {

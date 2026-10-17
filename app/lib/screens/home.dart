@@ -366,7 +366,7 @@ class _ChatScreenState extends State<ChatScreen> {
         for (final a in assets) {
           await _upload('фото или видео', () async {
             final file = (await a.file)!;
-            final thumb = a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(320)) : null;
+            final thumb = a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(240), quality: 70) : null;
             await _sendMedia(XFile(file.path), thumb: thumb);
           });
         }
@@ -390,7 +390,8 @@ class _ChatScreenState extends State<ChatScreen> {
       await _upload(f.name, () async {
         final length = await f.length() ?? (await f.readAsBytes()).length;
         if (kind == AttachKind.file) {
-          return client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _sendProgress);
+          final sent = await client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _sendProgress);
+          return keepSent(sent, path: f.path);
         }
         await _sendMedia(f.xFile, open: f.readAsByteStream, length: length);
       });
@@ -422,6 +423,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Файл читается потоком: видео до 2 ГБ не нужно держать в памяти целиком.
   Future<void> _sendMedia(XFile file, {Stream<List<int>> Function()? open, int? length, Uint8List? thumb}) async {
     var name = file.name;
+    var compressed = false; // file — временный файл сжатия, его можно перенести к себе
     final extra = <String, dynamic>{};
     if (isVideo(name)) {
       extra['video'] = true;
@@ -430,6 +432,7 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() => _stage = 'Сжатие видео');
           if (await compressVideo(file.path, onProgress: _setProgress) case final small?) {
             (file, name, open, length) = (XFile(small), '${name.substring(0, name.lastIndexOf('.'))}.mp4', null, null);
+            compressed = true;
           }
         } catch (e) {
           debugPrint('AURA: сжатие видео: $e'); // отправим оригинал
@@ -450,13 +453,16 @@ class _ChatScreenState extends State<ChatScreen> {
         final bytes = await (open?.call() ?? file.openRead()).fold(BytesBuilder(copy: false), (b, c) => b..add(c));
         if (await shrinkImage(bytes.takeBytes()) case final small? when small.length < length) {
           final jpg = '${name.substring(0, name.lastIndexOf('.'))}.jpg';
-          return await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _sendProgress);
+          final sent = await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _sendProgress);
+          return await keepSent(sent, bytes: small);
         }
       } catch (e) {
         debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
       }
     }
-    await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _sendProgress);
+    final sent =
+        await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _sendProgress);
+    await keepSent(sent, path: file.path, temporary: compressed);
   }
 
   @override
@@ -502,29 +508,36 @@ class _ChatScreenState extends State<ChatScreen> {
                     final m = messages[messages.length - 1 - i];
                     return Align(
                       alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
-                      child: Container(
-                        constraints: const BoxConstraints(maxWidth: 260),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        decoration: BoxDecoration(
-                          color: m.mine ? c.lavender : c.thistle,
-                          borderRadius: BorderRadius.circular(radiusLg),
-                        ),
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                          if (m.file != null) Attachment(m.file!),
-                          if (m.text.isNotEmpty)
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: SelectableText(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
-                            ),
-                          const SizedBox(height: 4),
-                          Row(mainAxisSize: MainAxisSize.min, children: [
-                            Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
-                            if (m.mine) ...[
-                              const SizedBox(width: 4),
-                              StatusIcon(m.status),
-                            ],
+                      // Не отправленное сообщение уходит заново по нажатию.
+                      child: GestureDetector(
+                        onTap: m.status == Status.failed ? () => client.retry(widget.peer, m) : null,
+                        child: Container(
+                          constraints: const BoxConstraints(maxWidth: 260),
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          decoration: BoxDecoration(
+                            color: m.mine ? c.lavender : c.thistle,
+                            borderRadius: BorderRadius.circular(radiusLg),
+                          ),
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                            if (m.file != null) Attachment(m.file!),
+                            if (m.text.isNotEmpty)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                // Выделение текста перехватило бы нажатие «отправить заново».
+                                child: m.status == Status.failed
+                                    ? Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5))
+                                    : SelectableText(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
+                              ),
+                            const SizedBox(height: 4),
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
+                              if (m.mine) ...[
+                                const SizedBox(width: 4),
+                                StatusIcon(m.status),
+                              ],
+                            ]),
                           ]),
-                        ]),
+                        ),
                       ),
                     );
                   },
@@ -763,7 +776,7 @@ class SafetyNumberDialog extends StatelessWidget {
   }
 }
 
-/// Одна галочка — отправлено, две — доставлено, две цветные — прочитано.
+/// Одна галочка — отправлено, две — доставлено, две цветные — прочитано, красный значок — не отправлено.
 class StatusIcon extends StatelessWidget {
   const StatusIcon(this.status, {super.key});
   final Status status;
@@ -774,7 +787,8 @@ class StatusIcon extends StatelessWidget {
     // В палитре нет цвета, заметного на лавандовом пузыре, поэтому для «прочитано» свой акцент.
     final read = Theme.of(context).brightness == Brightness.dark ? const Color(0xFFB8AEFF) : const Color(0xFF6A5ACD);
     final (icon, color, label) = switch (status) {
-      Status.pending => (Icons.schedule, dim, 'не отправлено'),
+      Status.pending => (Icons.schedule, dim, 'в очереди'),
+      Status.failed => (Icons.error_outline, Colors.redAccent, 'не отправлено, нажмите, чтобы повторить'),
       Status.sent => (Icons.done, dim, 'отправлено'),
       Status.delivered => (Icons.done_all, dim, 'доставлено'),
       Status.read => (Icons.done_all, read, 'прочитано'),
