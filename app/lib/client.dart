@@ -797,7 +797,7 @@ class AuraClient extends ChangeNotifier {
   /// он сначала уходит попарной сессией.
   Future<void> _sendGroup(String chat, Message m, [List<String>? only]) async {
     if (!connected || _keys == null) return;
-    final keys = _keys!, gid = chat.substring(1), sent = _skSent.putIfAbsent(chat, () => {});
+    final keys = _keys!, gid = chat.substring(1);
     final key = await keys.senderKey(gid, nick!, device!);
     final body = '$gid:${await keys.groupEncrypt(gid, nick!, device!, jsonEncode(_contentFor(chat, m.content, '')))}';
     await _saveKeys();
@@ -805,11 +805,7 @@ class AuraClient extends ChangeNotifier {
       try {
         final devices = await _devicesOf(r);
         if (devices.isEmpty) continue;
-        if (devices.any((d) => !sent.contains('$r:$d'))) {
-          // С ключом уходит и описание группы: новое устройство участника иначе не узнает её состав.
-          await _sendCopy(r, _newId(), {'group': gid, 'senderKey': key, 'state': groups[chat]});
-          sent.addAll(devices.map((d) => '$r:$d'));
-        }
+        await _sendKey(chat, r, key, devices);
         _wsSend({
           'type': 'send',
           'id': m.id,
@@ -820,6 +816,15 @@ class AuraClient extends ChangeNotifier {
         debugPrint('AURA: в группу для $r: $e');
       }
     }
+  }
+
+  /// Свой ключ отправителя тем устройствам [r], которым он ещё не уходил.
+  /// С ключом уходит и описание группы: новое устройство участника иначе не узнает её состав.
+  Future<void> _sendKey(String chat, String r, String key, List<int> devices) async {
+    final sent = _skSent.putIfAbsent(chat, () => {});
+    if (devices.every((d) => sent.contains('$r:$d'))) return;
+    await _sendCopy(r, _newId(), {'group': chat.substring(1), 'senderKey': key, 'state': groups[chat]});
+    sent.addAll(devices.map((d) => '$r:$d'));
   }
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
@@ -871,6 +876,18 @@ class AuraClient extends ChangeNotifier {
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
         text = '⚠ Не удалось расшифровать сообщение';
+        // Нет ключа отправителя (устройство новое или пропустило раздачу): просим его заново,
+        // а сбой показываем в группе, а не в личном чате.
+        final String body = msg['body'];
+        if (msg['ctype'] == SignalKeys.groupType && body.contains(':')) {
+          final gid = body.substring(0, body.indexOf(':'));
+          peer = '#$gid';
+          try {
+            await _sendCopy(from, _newId(), {'group': gid, 'needKey': true});
+          } catch (err) {
+            debugPrint('AURA: запрос ключа у $from: $err');
+          }
+        }
       }
       await _saveKeys();
       final group = isGroup(peer);
@@ -886,6 +903,15 @@ class AuraClient extends ChangeNotifier {
           }
         } catch (e) {
           debugPrint('AURA: ключ отправителя от $from: $e');
+        }
+      } else if (content?['needKey'] == true) {
+        if (group && members(peer).contains(from) && members(peer).contains(nick)) {
+          _skSent[peer]?.removeWhere((s) => s.startsWith('$from:'));
+          _serial(() async {
+            final gid = peer.substring(1);
+            await _sendKey(peer, from, await _keys!.senderKey(gid, nick!, device!), await _devicesOf(from));
+            await _saveKeys();
+          });
         }
       } else if (content?['receipt'] case final String receipt) {
         _onReceipt(Status.values.byName(receipt), (content!['ids'] as List).cast());
