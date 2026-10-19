@@ -141,7 +141,10 @@ class AuraClient extends ChangeNotifier {
   bool get signedIn => token != null;
 
   /// Адрес сервера: в Web это сайт, с которого открыто приложение, в мобильных — постоянный домен.
-  static final server = kIsWeb ? Uri.base.origin : 'https://web.aura-msg.space';
+  /// AURA_SERVER — другой адрес для проверки с локальным сервером (--dart-define).
+  static final server = kIsWeb
+      ? Uri.base.origin
+      : const String.fromEnvironment('AURA_SERVER', defaultValue: 'https://web.aura-msg.space');
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
