@@ -811,6 +811,7 @@ class AuraClient extends ChangeNotifier {
           'id': m.id,
           'to': r,
           'payloads': [for (final d in devices) {'device': d, 'type': SignalKeys.groupType, 'body': body}],
+          'push': ?(r == nick ? null : 'message'),
         });
       } catch (e) {
         debugPrint('AURA: в группу для $r: $e');
@@ -841,9 +842,32 @@ class AuraClient extends ChangeNotifier {
       payloads.add(await keys.encrypt(target, d, jsonEncode(content)));
     }
     await _saveKeys();
-    _wsSend({'type': 'send', 'id': id, 'to': target, 'payloads': payloads});
+    _wsSend({'type': 'send', 'id': id, 'to': target, 'payloads': payloads, 'push': ?_pushKind(target, content)});
     return true;
   }
+
+  /// Новое входящее сообщение в переписке: приложение в фоне показывает уведомление.
+  void Function()? onIncoming;
+
+  /// Токен Firebase этого устройства: по нему сервер будит приложение, когда соединения нет.
+  String? _pushToken;
+
+  void setPushToken(String token) {
+    _pushToken = token;
+    if (connected) _sendPushToken();
+  }
+
+  void _sendPushToken() =>
+      _request('PUT', _api('/api/push'), {'token': _pushToken}).catchError((Object e) => debugPrint('AURA: push-токен: $e'));
+
+  /// Будить ли получателя push: только ради сообщений переписки и входящего звонка, не своих устройств.
+  String? _pushKind(String target, Map<String, dynamic> content) => target == nick
+      ? null
+      : (content['call'] as Map?)?['type'] == 'offer'
+      ? 'call'
+      : content.containsKey('text')
+      ? 'message'
+      : null;
 
   /// Сигналы звонка (предложение, ответ, сброс) идут зашифрованными сообщениями, но в переписку не попадают.
   void Function(String from, int device, int sentAt, Map<String, dynamic> signal)? onCall;
@@ -958,7 +982,10 @@ class AuraClient extends ChangeNotifier {
                 update: update,
               ),
             );
-        if (!mine) _sendReceipt(from, Status.delivered, [id]);
+        if (!mine) {
+          _sendReceipt(from, Status.delivered, [id]);
+          onIncoming?.call();
+        }
       }
       _save();
     }
@@ -1002,6 +1029,7 @@ class AuraClient extends ChangeNotifier {
         connected = true;
         _backoff = 1;
         if ((msg['preKeys'] as int) < SignalKeys.preKeyBatch ~/ 2) _refillPreKeys();
+        if (_pushToken != null) _sendPushToken();
         // Переотправляем то, что не дошло до сервера; сервер отбрасывает дубли по id.
         for (final MapEntry(key: to, value: list) in chats.entries) {
           for (final m in list.where((m) => m.status == Status.pending)) {
