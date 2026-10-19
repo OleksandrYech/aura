@@ -6,10 +6,16 @@ import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_static/shelf_static.dart';
 
 /// AURA_DB — файл базы (по умолчанию aura.db), AURA_FILES — папка зашифрованных файлов
-/// (по умолчанию files рядом с базой), AURA_WEB — папка Web-сборки, PORT — порт (8080).
+/// (по умолчанию files рядом с базой), AURA_WEB — папка Web-сборки, PORT — порт (8080),
+/// AURA_TURN_URL и AURA_TURN_SECRET — TURN-сервер для звонков (необязательно).
 Future<void> main() async {
   final env = Platform.environment;
-  final aura = AuraServer(env['AURA_DB'] ?? 'aura.db', files: env['AURA_FILES']);
+  final turnUrl = env['AURA_TURN_URL'], turnSecret = env['AURA_TURN_SECRET'];
+  final aura = AuraServer(
+    env['AURA_DB'] ?? 'aura.db',
+    files: env['AURA_FILES'],
+    turn: (turnUrl ?? '').isNotEmpty && (turnSecret ?? '').isNotEmpty ? (url: turnUrl!, secret: turnSecret!) : null,
+  );
   final webDir = env['AURA_WEB'];
 
   var handler = aura.handler;

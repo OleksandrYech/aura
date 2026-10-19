@@ -75,8 +75,8 @@ server/   Dart-сервер
 
 ## Этап 6. Звонки
 
-- [ ] WebRTC 1-на-1, сигнализация через WebSocket сервера, шифрование DTLS-SRTP
-- [ ] TURN-сервер (coturn) для обхода NAT
+- [x] WebRTC 1-на-1, сигнализация через WebSocket сервера, шифрование DTLS-SRTP
+- [x] TURN-сервер (coturn) для обхода NAT
 
 ## Этап 7. Видеозвонки
 

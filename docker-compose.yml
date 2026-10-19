@@ -4,6 +4,10 @@ services:
     restart: unless-stopped
     volumes:
       - aura-data:/data
+    # TURN для звонков (см. README), без него звонки идут напрямую или через STUN.
+    environment:
+      - AURA_TURN_URL=${TURN_URL:-}
+      - AURA_TURN_SECRET=${TURN_SECRET:-}
     # Для проверки в локальной сети: http://<IP сервера>:8080
     ports:
       - "8080:8080"
@@ -20,6 +24,20 @@ services:
     depends_on:
       - aura
     profiles: [tunnel]
+
+  # TURN-сервер для звонков, когда прямое соединение не получается (мобильная сеть, строгий NAT).
+  # В .env: TURN_URL=turn:turn.example.com:3478 и TURN_SECRET=<длинная случайная строка>.
+  coturn:
+    image: coturn/coturn:4.6.3
+    restart: unless-stopped
+    # UDP-порты пересылки нужны снаружи как есть, поэтому сеть хоста.
+    network_mode: host
+    command: >
+      -n --log-file=stdout --no-cli --no-tls --no-dtls --fingerprint
+      --listening-port=3478 --min-port=49160 --max-port=49200
+      --use-auth-secret --static-auth-secret=${TURN_SECRET} --realm=aura
+      --external-ip=$$(detect-external-ip)
+    profiles: [turn]
 
 volumes:
   aura-data:

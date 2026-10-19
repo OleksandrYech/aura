@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import '../attach.dart';
+import '../call.dart';
 import '../client.dart';
 import '../lock.dart';
 import '../media.dart';
@@ -583,12 +584,18 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.group_outlined),
               onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => GroupScreen(chat: widget.peer))),
             )
-          else
+          else ...[
+            IconButton(
+              tooltip: 'Позвонить',
+              icon: const Icon(Icons.call_outlined),
+              onPressed: () => calls.start(widget.peer),
+            ),
             IconButton(
               tooltip: 'Код безопасности',
               icon: const Icon(Icons.verified_user_outlined),
               onPressed: () => showDialog(context: context, builder: (_) => SafetyNumberDialog(peer: widget.peer)),
             ),
+          ],
         ],
       ),
       body: SafeArea(

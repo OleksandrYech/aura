@@ -1,14 +1,17 @@
 import 'package:flutter/material.dart';
 
+import 'call.dart';
 import 'client.dart';
 import 'lock.dart';
 import 'screens/auth.dart';
+import 'screens/call.dart';
 import 'screens/home.dart';
 import 'theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Future.wait([client.load(), AppLock.load()]);
+  calls.init();
   runApp(const AuraApp());
 }
 
@@ -25,7 +28,7 @@ class AuraApp extends StatelessWidget {
         theme: buildTheme(Brightness.light),
         darkTheme: buildTheme(Brightness.dark),
         themeMode: mode,
-        builder: (context, child) => LockGate(child: child!),
+        builder: (context, child) => LockGate(child: CallLayer(child: child!)),
         // Корневой экран следует за состоянием входа: вход и выход переключают его сами.
         home: ListenableBuilder(
           listenable: client,

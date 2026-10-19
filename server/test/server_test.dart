@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:server/server.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:sqlite3/sqlite3.dart';
@@ -78,6 +79,26 @@ void main() {
     ]);
     expect(await get('/api/users?q=den', anna['token']), isEmpty); // только точный никнейм
     expect(await get('/api/users?q=', anna['token']), isEmpty);
+  });
+
+  test('серверы для звонка: STUN, а TURN с временным паролем, если задан', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    expect(await get('/api/ice', anna['token']), [
+      {'urls': 'stun:stun.l.google.com:19302'},
+    ]);
+    await http.close(force: true);
+    aura.close();
+    final files = Directory.systemTemp.createTempSync('aura').path;
+    aura = AuraServer(':memory:', files: files, turn: (url: 'turn:t:3478', secret: 's'));
+    http = await io.serve(aura.handler, 'localhost', 0);
+    base = Uri.parse('http://localhost:${http.port}');
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret1'});
+    final turn = (await get('/api/ice', den['token']) as List).last;
+    expect(turn['urls'], 'turn:t:3478');
+    expect(turn['username'], endsWith(':den'));
+    // Так же пароль считает coturn с use-auth-secret.
+    final hmac = Hmac(sha1, utf8.encode('s')).convert(utf8.encode(turn['username']));
+    expect(turn['credential'], base64.encode(hmac.bytes));
   });
 
   test('ключи: публикация, выдача и одноразовые prekey', () async {
