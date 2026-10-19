@@ -261,7 +261,8 @@ class AuraClient extends ChangeNotifier {
         ..headers['content-type'] = 'application/json'
         ..headers.addAll({if (token != null) 'authorization': 'Bearer $token'});
       if (body != null) req.body = jsonEncode(body);
-      res = await http.Response.fromStream(await req.send()).timeout(const Duration(seconds: 15));
+      // Тайм-аут на весь запрос, вместе с соединением: зависший запрос держал бы очередь отправки ([_serial]).
+      res = await req.send().then(http.Response.fromStream).timeout(const Duration(seconds: 15));
     } catch (_) {
       throw ApiException('Нет связи с сервером');
     }
