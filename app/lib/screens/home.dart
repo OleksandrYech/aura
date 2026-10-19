@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:cross_file/cross_file.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import '../attach.dart';
@@ -334,12 +336,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   double? _progress; // null — доля пока неизвестна
   String _stage = 'Отправка';
+  String _count = ''; // какой по счёту файл альбома
   (int, int)? _bytes; // отправлено и всего, байт
 
   String get _status => switch ((_bytes, _progress)) {
-    ((final sent, final total), _) => '$_stage ${formatSize(sent)} / ${formatSize(total)}',
-    (_, final p?) => '$_stage ${(p * 100).round()}%',
-    _ => '$_stage…',
+    ((final sent, final total), _) => '$_stage$_count ${formatSize(sent)} / ${formatSize(total)}',
+    (_, final p?) => '$_stage$_count ${(p * 100).round()}%',
+    _ => '$_stage$_count…',
   };
 
   void _fail(String what, Object e) {
@@ -363,14 +366,15 @@ class _ChatScreenState extends State<ChatScreen> {
         return _fail('Галерея', e);
       }
       if (assets != null) {
-        for (final a in assets) {
-          await _upload('фото или видео', () async {
-            final file = (await a.file)!;
-            final thumb = a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(240), quality: 70) : null;
-            await _sendMedia(XFile(file.path), thumb: thumb);
-          });
-        }
-        return;
+        return _sendAlbum([
+          for (final a in assets)
+            () async {
+              final file = (await a.file)!;
+              final thumb =
+                  a.type == AssetType.video ? await a.thumbnailDataWithSize(const ThumbnailSize.square(240), quality: 70) : null;
+              return _uploadMedia(XFile(file.path), thumb: thumb);
+            },
+        ]);
       }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -386,14 +390,37 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       return _fail('Выбор файла', e);
     }
+    Future<int> length(PlatformFile f) async => await f.length() ?? (await f.readAsBytes()).length;
+    if (kind == AttachKind.media) {
+      return _sendAlbum([
+        for (final f in files) () async => _uploadMedia(f.xFile, open: f.readAsByteStream, length: await length(f)),
+      ]);
+    }
     for (final f in files) {
       await _upload(f.name, () async {
-        final length = await f.length() ?? (await f.readAsBytes()).length;
-        if (kind == AttachKind.file) {
-          final sent = await client.sendStream(widget.peer, f.name, f.readAsByteStream(), length, onProgress: _sendProgress);
-          return keepSent(sent, path: f.path);
+        final sent = await client.sendStream(widget.peer, f.name, f.readAsByteStream(), await length(f), onProgress: _sendProgress);
+        await keepSent(sent, path: f.path);
+      });
+    }
+  }
+
+  /// Фото и видео уходят альбомами до 10 штук, как в Telegram; одно — обычным сообщением.
+  /// Альбом отправляется, когда загружены все его файлы; если один не загрузился, остальные стираются с сервера.
+  Future<void> _sendAlbum(List<Future<Map<String, dynamic>> Function()> jobs) async {
+    for (var i = 0; i < jobs.length; i += 10) {
+      final batch = jobs.sublist(i, min(i + 10, jobs.length));
+      await _upload(batch.length == 1 ? 'фото или видео' : 'альбом', () async {
+        final files = <Map<String, dynamic>>[];
+        try {
+          for (final (n, job) in batch.indexed) {
+            if (mounted && batch.length > 1) setState(() => _count = ' ${n + 1} из ${batch.length}');
+            files.add(await job());
+          }
+        } catch (_) {
+          client.discard(files);
+          rethrow;
         }
-        await _sendMedia(f.xFile, open: f.readAsByteStream, length: length);
+        files.length == 1 ? client.send(widget.peer, '', file: files.single) : client.send(widget.peer, '', files: files);
       });
     }
   }
@@ -405,7 +432,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       _fail(what, e);
     } finally {
-      if (mounted) setState(() => (_uploading--, _progress = null, _bytes = null, _stage = 'Отправка'));
+      if (mounted) setState(() => (_uploading--, _progress = null, _bytes = null, _stage = 'Отправка', _count = ''));
     }
   }
 
@@ -419,9 +446,9 @@ class _ChatScreenState extends State<ChatScreen> {
     backgroundStatus(_status);
   }
 
-  /// Фото и видео перед отправкой сжимаются, к видео прикладывается превью.
+  /// Фото и видео перед загрузкой сжимаются, к видео прикладывается превью. Возвращает вложение для сообщения.
   /// Файл читается потоком: видео до 2 ГБ не нужно держать в памяти целиком.
-  Future<void> _sendMedia(XFile file, {Stream<List<int>> Function()? open, int? length, Uint8List? thumb}) async {
+  Future<Map<String, dynamic>> _uploadMedia(XFile file, {Stream<List<int>> Function()? open, int? length, Uint8List? thumb}) async {
     var name = file.name;
     var compressed = false; // file — временный файл сжатия, его можно перенести к себе
     final extra = <String, dynamic>{};
@@ -453,16 +480,53 @@ class _ChatScreenState extends State<ChatScreen> {
         final bytes = await (open?.call() ?? file.openRead()).fold(BytesBuilder(copy: false), (b, c) => b..add(c));
         if (await shrinkImage(bytes.takeBytes()) case final small? when small.length < length) {
           final jpg = '${name.substring(0, name.lastIndexOf('.'))}.jpg';
-          final sent = await client.sendStream(widget.peer, jpg, Stream.value(small), small.length, onProgress: _sendProgress);
-          return await keepSent(sent, bytes: small);
+          final sent = await client.upload(jpg, Stream.value(small), small.length, onProgress: _sendProgress);
+          await keepSent(sent, bytes: small);
+          return sent;
         }
       } catch (e) {
         debugPrint('AURA: сжатие фото: $e'); // отправим оригинал
       }
     }
-    final sent =
-        await client.sendStream(widget.peer, name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _sendProgress);
+    final sent = await client.upload(name, open?.call() ?? file.openRead(), length, extra: extra, onProgress: _sendProgress);
     await keepSent(sent, path: file.path, temporary: compressed);
+    return sent;
+  }
+
+  /// Меню сообщения по долгому нажатию: копировать текст и удалить.
+  Future<void> _menu(Message m) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (m.text.isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.copy_outlined),
+              title: const Text('Копировать'),
+              onTap: () => Navigator.pop(context, 'copy'),
+            ),
+          if (m.mine)
+            ListTile(
+              leading: const Icon(Icons.delete_forever_outlined),
+              title: const Text('Удалить у всех'),
+              subtitle: const Text('Пропадёт и у собеседника, файлы удалятся с сервера'),
+              onTap: () => Navigator.pop(context, 'all'),
+            ),
+          ListTile(
+            leading: const Icon(Icons.delete_outline),
+            title: const Text('Удалить у меня'),
+            subtitle: const Text('На всех ваших устройствах, вместе с файлами'),
+            onTap: () => Navigator.pop(context, 'me'),
+          ),
+        ]),
+      ),
+    );
+    switch (choice) {
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: m.text));
+      case 'all' || 'me':
+        client.delete(widget.peer, [m], everyone: choice == 'all');
+    }
   }
 
   @override
@@ -508,9 +572,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     final m = messages[messages.length - 1 - i];
                     return Align(
                       alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
-                      // Не отправленное сообщение уходит заново по нажатию.
+                      // Не отправленное сообщение уходит заново по нажатию, долгое нажатие открывает меню.
                       child: GestureDetector(
                         onTap: m.status == Status.failed ? () => client.retry(widget.peer, m) : null,
+                        onLongPress: () => _menu(m),
                         child: Container(
                           constraints: const BoxConstraints(maxWidth: 260),
                           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -520,13 +585,12 @@ class _ChatScreenState extends State<ChatScreen> {
                           ),
                           child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                             if (m.file != null) Attachment(m.file!),
+                            if (m.files != null) Album(m.files!),
                             if (m.text.isNotEmpty)
                               Align(
                                 alignment: Alignment.centerLeft,
-                                // Выделение текста перехватило бы нажатие «отправить заново».
-                                child: m.status == Status.failed
-                                    ? Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5))
-                                    : SelectableText(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
+                                // Не SelectableText: выделение перехватило бы нажатия, текст копируется из меню.
+                                child: Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
                               ),
                             const SizedBox(height: 4),
                             Row(mainAxisSize: MainAxisSize.min, children: [
@@ -626,8 +690,6 @@ class Attachment extends StatelessWidget {
   const Attachment(this.file, {super.key});
   final Map<String, dynamic> file;
 
-  Future<void> _save(Uint8List bytes) => FilePicker.saveFile(fileName: file['name'], bytes: bytes);
-
   @override
   Widget build(BuildContext context) {
     final String name = file['name'];
@@ -640,20 +702,7 @@ class Attachment extends StatelessWidget {
         builder: (context, snap) {
           if (snap.data case final bytes?) {
             return GestureDetector(
-              onTap: () => showDialog(
-                context: context,
-                builder: (_) => Dialog(
-                  insetPadding: const EdgeInsets.all(12),
-                  child: Stack(alignment: Alignment.topRight, children: [
-                    InteractiveViewer(child: Image.memory(bytes)),
-                    IconButton(
-                      tooltip: 'Сохранить',
-                      icon: const Icon(Icons.download_outlined),
-                      onPressed: () => _save(bytes),
-                    ),
-                  ]),
-                ),
-              ),
+              onTap: () => showImage(context, file, bytes),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(radiusMd),
                 child: Image.memory(bytes, fit: BoxFit.cover, semanticLabel: name),
@@ -670,6 +719,88 @@ class Attachment extends StatelessWidget {
           return FileAttachment(file, error: snap.error);
         },
       ),
+    );
+  }
+}
+
+/// Фото на весь экран с увеличением и сохранением.
+void showImage(BuildContext context, Map<String, dynamic> file, Uint8List bytes) => showDialog(
+  context: context,
+  builder: (_) => Dialog(
+    insetPadding: const EdgeInsets.all(12),
+    child: Stack(alignment: Alignment.topRight, children: [
+      InteractiveViewer(child: Image.memory(bytes)),
+      IconButton(
+        tooltip: 'Сохранить',
+        icon: const Icon(Icons.download_outlined),
+        onPressed: () => FilePicker.saveFile(fileName: file['name'], bytes: bytes),
+      ),
+    ]),
+  ),
+);
+
+/// Альбом в пузыре: плитки по две в ряд, при нечётном числе первая на всю ширину.
+class Album extends StatelessWidget {
+  const Album(this.files, {super.key});
+  final List<Map<String, dynamic>> files;
+
+  static const _side = 112.0, _gap = 4.0; // две плитки с зазором — ширина пузыря без отступов
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 6),
+    child: Wrap(spacing: _gap, runSpacing: _gap, children: [
+      for (final (i, f) in files.indexed)
+        SizedBox(
+          width: i == 0 && files.length.isOdd ? _side * 2 + _gap : _side,
+          height: _side,
+          child: ClipRRect(borderRadius: BorderRadius.circular(radiusMd), child: _Tile(f)),
+        ),
+    ]),
+  );
+}
+
+/// Плитка альбома: у видео превью из сообщения, фото скачивается и показывается сразу.
+class _Tile extends StatelessWidget {
+  const _Tile(this.file);
+  final Map<String, dynamic> file;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    if (file['video'] == true) {
+      final thumb = file['thumb'] is String ? base64.decode(file['thumb']) : null;
+      return Semantics(
+        button: true,
+        label: 'Видео ${file['name']}, ${formatSize(file['size'])}',
+        child: GestureDetector(
+          onTap: () => showDialog(context: context, builder: (_) => VideoDialog(file)),
+          child: Stack(fit: StackFit.expand, children: [
+            thumb != null
+                ? Image.memory(thumb, fit: BoxFit.cover, gaplessPlayback: true)
+                : ColoredBox(color: c.ink.withValues(alpha: 0.85)),
+            const Center(child: Icon(Icons.play_circle_outline, color: Colors.white, size: 36)),
+          ]),
+        ),
+      );
+    }
+    if (!isImage(file['name'])) return ColoredBox(color: c.lightGray, child: Center(child: FileAttachment(file)));
+    return FutureBuilder(
+      future: client.fileBytes(file),
+      builder: (context, snap) => switch (snap.data) {
+        final bytes? => GestureDetector(
+          onTap: () => showImage(context, file, bytes),
+          child: Image.memory(bytes, fit: BoxFit.cover, semanticLabel: file['name']),
+        ),
+        _ => ColoredBox(
+          color: c.lightGray,
+          child: Center(
+            child: snap.hasError
+                ? Icon(Icons.error_outline, color: c.ink)
+                : const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2)),
+          ),
+        ),
+      },
     );
   }
 }

@@ -130,6 +130,15 @@ Future<Uint8List> _gcm(bool encrypt, Uint8List key, Uint8List nonce, Uint8List a
   return (out as JSArrayBuffer).toDart.asUint8List();
 }
 
+/// Освобождает blob вложения: браузер стирает его из памяти и с диска.
+Future<void> forgetFile(Map<String, dynamic> file) async {
+  if (_blobs.remove(file['id']) case final url?) {
+    try {
+      web.URL.revokeObjectURL(await url);
+    } catch (_) {} // не скачалось — освобождать нечего
+  }
+}
+
 /// В браузере вложения живут в blob-ах до закрытия вкладки, на диск их не сохраняем.
 Future<void> keepSent(Map<String, dynamic> file, {String? path, Uint8List? bytes, bool temporary = false}) async {}
 

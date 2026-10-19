@@ -83,6 +83,10 @@ class AuraServer {
         FOREIGN KEY (recipient, recipient_device) REFERENCES devices(nick, device) ON DELETE CASCADE
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, recipient_device, sent_at);
+      CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        nick TEXT NOT NULL
+      ) STRICT;
     ''');
   }
 
@@ -94,6 +98,9 @@ class AuraServer {
   static const maxRequest = 25 << 20;
   static const maxFile = (2 << 30) + (1 << 20); // 2 ГБ плюс запас на заголовки частей
   static const fileDays = 30;
+
+  /// Шифротекст одного сообщения для одного устройства, символов base64: хватает на альбом из 10 видео с превью.
+  static const maxMessage = 500000;
 
   /// Файлы, которые сейчас догружаются частями, и устройство, которое их грузит.
   // ponytail: в памяти, после перезапуска сервера незаконченную загрузку придётся начать заново.
@@ -124,6 +131,7 @@ class AuraServer {
       ..post('/api/files', _authed(_upload))
       ..post('/api/files/<id>', _authed(_append))
       ..get('/api/files/<id>', _authed(_download))
+      ..post('/api/unsend', _authed(_unsend))
       ..get('/ws', webSocketHandler(_onSocket, pingInterval: const Duration(seconds: 30)));
     return api.call;
   }
@@ -311,6 +319,7 @@ class AuraServer {
     }
     final id = List.generate(16, (_) => _random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
     await File(p.join(files.path, id)).writeAsBytes(body);
+    db.execute('INSERT INTO files VALUES (?, ?)', [id, me.nick]);
     if (total != null) {
       _sized[id] = _Sized(total)
         ..parts[0] = (length: body.length, written: Future.value())
@@ -434,8 +443,41 @@ class AuraServer {
   void _pruneFiles() {
     final old = DateTime.now().subtract(const Duration(days: fileDays));
     for (final f in files.listSync().whereType<File>()) {
-      if (f.statSync().modified.isBefore(old)) f.deleteSync();
+      if (f.statSync().modified.isBefore(old)) _deleteFile(p.basename(f.path));
     }
+  }
+
+  void _deleteFile(String id) {
+    final f = File(p.join(files.path, id));
+    if (f.existsSync()) f.deleteSync();
+    db.execute('DELETE FROM files WHERE id = ?', [id]);
+    _growing.remove(id);
+    _finished.remove(id);
+    _sized.remove(id);
+  }
+
+  /// Удаление у всех: {ids, files}. Убирает ещё не доставленные копии своих сообщений из очереди
+  /// и свои файлы с диска. Уведомление собеседнику клиент шлёт отдельно, обычным сообщением.
+  /// Повтор безопасен: уже удалённое просто пропускается.
+  Future<Response> _unsend(Request req, Device me) async {
+    final body = await _json(req);
+    final ids = body['ids'] ?? [], fileIds = body['files'] ?? [];
+    if (ids is! List ||
+        fileIds is! List ||
+        ids.length > 100 ||
+        fileIds.length > 100 ||
+        ids.any((i) => i is! String) ||
+        fileIds.any((i) => i is! String)) {
+      return _error(400, 'Некорректный запрос');
+    }
+    for (final id in ids) {
+      db.execute('DELETE FROM messages WHERE id = ? AND sender = ?', [id, me.nick]);
+    }
+    for (final id in fileIds) {
+      // Чужой файл или файл, загруженный до учёта владельцев, не трогаем: он удалится по сроку.
+      if (db.select('SELECT 1 FROM files WHERE id = ? AND nick = ?', [id, me.nick]).isNotEmpty) _deleteFile(id);
+    }
+    return _ok({});
   }
 
   // --- WebSocket ---
@@ -500,7 +542,7 @@ class AuraServer {
               p['device'] is! int ||
               (p['type'] != 2 && p['type'] != 3) ||
               p['body'] is! String ||
-              (p['body'] as String).length > 100000,
+              (p['body'] as String).length > maxMessage,
         )) {
       return error('Некорректное сообщение');
     }

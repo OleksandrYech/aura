@@ -82,10 +82,17 @@ Future<Map<String, dynamic>> _originals(SharedPreferences prefs) async =>
 
 /// Отправленный файл остаётся на устройстве, чтобы своё видео не качать заново.
 /// [bytes] — фото, сжатое в памяти; [path] и [temporary] — временный файл сжатия, его переносим;
-/// просто [path] — оригинал, запоминаем путь к нему.
+/// просто [path] — оригинал, запоминаем путь к нему. Файл во временной папке приложения тоже копия
+/// (её сделали выбор файла, галерея iOS или сжатие): переносим к себе, чтобы при удалении сообщения
+/// не осталось лишней копии.
 Future<void> keepSent(Map<String, dynamic> file, {String? path, Uint8List? bytes, bool temporary = false}) async {
   try {
     final out = File('${(await _localDir()).path}/${_localName(file)}');
+    if (path != null && !temporary) {
+      final real = File(path).resolveSymbolicLinksSync(); // на iOS /var — ссылка на /private/var
+      temporary = [await getTemporaryDirectory(), Directory.systemTemp]
+          .any((d) => d.existsSync() && real.startsWith('${d.resolveSymbolicLinksSync()}/'));
+    }
     if (bytes != null) {
       await out.writeAsBytes(bytes, flush: true);
     } else if (path != null && temporary) {
@@ -101,6 +108,22 @@ Future<void> keepSent(Map<String, dynamic> file, {String? path, Uint8List? bytes
     }
   } catch (e) {
     debugPrint('AURA: копия отправленного файла: $e'); // не страшно, файл скачается с сервера
+  }
+}
+
+/// Стирает с устройства расшифрованную копию вложения и забывает путь к отправленному оригиналу.
+/// Сам оригинал в галерее не трогаем: это файл пользователя, а не мессенджера.
+Future<void> forgetFile(Map<String, dynamic> file) async {
+  try {
+    final out = File('${(await _localDir()).path}/${_localName(file)}');
+    for (final f in [out, File('${out.path}.part')]) {
+      if (await f.exists()) await f.delete();
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final originals = await _originals(prefs);
+    if (originals.remove(file['id']) != null) await prefs.setString('localFiles', jsonEncode(originals));
+  } catch (e) {
+    debugPrint('AURA: удаление вложения: $e');
   }
 }
 

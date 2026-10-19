@@ -310,6 +310,43 @@ void main() {
     expect(await read(await send('GET', '/api/files/$small', auth: token)), bytes);
   });
 
+  test('удаление у всех: очередь и файлы отправителя', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    Future<String> upload(String token) async {
+      final req = await HttpClient().postUrl(base.resolve('/api/files'));
+      req.headers.set('authorization', 'Bearer $token');
+      req.add([1, 2, 3]);
+      return jsonDecode(await (await req.close()).transform(utf8.decoder).join())['id'];
+    }
+
+    final mine = await upload(anna['token']), theirs = await upload(den['token']);
+    final (annaWs, annaIn) = await connect(anna['token']);
+    for (final id in ['m1', 'm2']) {
+      annaWs.sink.add(jsonEncode({
+        'type': 'send',
+        'id': id,
+        'to': 'den',
+        'payloads': [
+          {'device': 1, 'type': 3, 'body': id},
+        ],
+      }));
+      expect(await annaIn.moveNext(), isTrue);
+    }
+    expect((await post('/api/unsend', {'ids': 'x'}, token: anna['token'])).$1, 400);
+    expect((await post('/api/unsend', {'ids': ['m1'], 'files': [mine]}, token: den['token'])).$1, 200);
+    expect(aura.db.select('SELECT id FROM messages'), hasLength(2), reason: 'чужие сообщения не удаляются');
+    expect(File('${aura.files.path}/$mine').existsSync(), isTrue, reason: 'и чужие файлы тоже');
+
+    expect((await post('/api/unsend', {'ids': ['m1'], 'files': [mine, theirs]}, token: anna['token'])).$1, 200);
+    expect(aura.db.select('SELECT id FROM messages').map((r) => r['id']), ['m2']);
+    expect(File('${aura.files.path}/$mine').existsSync(), isFalse);
+    expect(File('${aura.files.path}/$theirs').existsSync(), isTrue);
+    expect((await post('/api/unsend', {'ids': ['m1'], 'files': [mine]}, token: anna['token'])).$1, 200, reason: 'повтор');
+    await annaWs.sink.close();
+  });
+
   test('без токена сокет закрывается', () async {
     final ws = WebSocketChannel.connect(base.replace(scheme: 'ws', path: '/ws'));
     ws.sink.add(jsonEncode({'type': 'auth', 'token': 'nope'}));
