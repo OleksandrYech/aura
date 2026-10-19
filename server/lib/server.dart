@@ -26,7 +26,9 @@ typedef Device = ({String nick, int device});
 /// Файлы клиент шифрует сам случайным ключом и отправляет ключ внутри сообщения: сервер хранит
 /// только зашифрованные байты в [files] и удаляет их через [fileDays] дней.
 class AuraServer {
-  AuraServer(String dbPath, {String? files})
+  /// [turn] — адрес TURN-сервера (например turn:aura-msg.space:3478) и общий с coturn секрет
+  /// (static-auth-secret): звонки, которым не хватило прямого соединения, идут через него.
+  AuraServer(String dbPath, {String? files, this.turn})
     : db = sqlite3.open(dbPath),
       files = Directory(files ?? p.join(p.dirname(dbPath), 'files'))..createSync(recursive: true) {
     db.execute('''
@@ -127,6 +129,7 @@ class AuraServer {
       ..put('/api/me', _authed(_updateMe))
       ..put('/api/keys', _authed(_putKeys))
       ..get('/api/devices/<nick>', _authed(_devices))
+      ..get('/api/ice', _authed(_ice))
       ..get('/api/keys/<nick>/<device>', _authed(_bundle))
       ..post('/api/files', _authed(_upload))
       ..post('/api/files/<id>', _authed(_append))
@@ -267,6 +270,24 @@ class AuraServer {
     'SELECT device, identity_key FROM devices WHERE nick = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL ORDER BY device',
     [nick],
   );
+
+  final ({String url, String secret})? turn;
+
+  /// Серверы для установки звонка. Пароль TURN временный (схема TURN REST API у coturn):
+  /// имя — срок действия и ник, пароль — HMAC-SHA1 имени на общем секрете.
+  Response _ice(Request req, Device me) {
+    final turn = this.turn;
+    final user = '${DateTime.now().add(const Duration(days: 1)).millisecondsSinceEpoch ~/ 1000}:${me.nick}';
+    return _ok([
+      {'urls': 'stun:stun.l.google.com:19302'},
+      if (turn != null)
+        {
+          'urls': turn.url,
+          'username': user,
+          'credential': base64.encode(Hmac(sha1, utf8.encode(turn.secret)).convert(utf8.encode(user)).bytes),
+        },
+    ]);
+  }
 
   Response _devices(Request req, Device me, String nick) => _ok([
     for (final r in _readyDevices(nick.toLowerCase())) {'device': r['device'], 'identityKey': r['identity_key']},

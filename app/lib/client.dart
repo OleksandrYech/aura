@@ -845,6 +845,17 @@ class AuraClient extends ChangeNotifier {
     return true;
   }
 
+  /// Сигналы звонка (предложение, ответ, сброс) идут зашифрованными сообщениями, но в переписку не попадают.
+  void Function(String from, int device, int sentAt, Map<String, dynamic> signal)? onCall;
+
+  void sendCall(String to, Map<String, dynamic> signal) => _serial(() async {
+    await _sendCopy(to, _newId(), {'call': signal});
+  });
+
+  /// STUN и TURN для звонка.
+  Future<List<Map<String, dynamic>>> iceServers() async =>
+      (await _request('GET', _api('/api/ice'), null) as List).cast();
+
   Future<void> _receive(Map<String, dynamic> msg) async {
     final String id = msg['id'], from = msg['from'];
     // Дубль (повторная доставка) не расшифровываем второй раз.
@@ -913,6 +924,8 @@ class AuraClient extends ChangeNotifier {
             await _saveKeys();
           });
         }
+      } else if (content?['call'] case final Map signal) {
+        onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
       } else if (content?['receipt'] case final String receipt) {
         _onReceipt(Status.values.byName(receipt), (content!['ids'] as List).cast());
       } else if (content?['delete'] case final List ids) {
