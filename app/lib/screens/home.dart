@@ -18,6 +18,7 @@ import '../platform_media.dart';
 import '../theme.dart';
 import '../video.dart';
 import '../voice.dart';
+import 'group.dart';
 import 'settings.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -118,6 +119,11 @@ class ChatsTab extends StatelessWidget {
                     child: Text('подключение…', style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.5))),
                   ),
                 IconButton(
+                  tooltip: 'Новая группа',
+                  icon: Icon(Icons.group_add_outlined, color: c.ink),
+                  onPressed: () => newGroup(context),
+                ),
+                IconButton(
                   tooltip: 'Новый чат',
                   style: IconButton.styleFrom(backgroundColor: c.lavender),
                   icon: Icon(Icons.add, color: c.ink),
@@ -140,7 +146,14 @@ class ChatsTab extends StatelessWidget {
                       itemBuilder: (context, i) {
                         final peer = peers[i];
                         final last = client.chats[peer]!.last;
-                        final name = client.names[peer] ?? peer;
+                        final name = client.title(peer);
+                        final author = last.update != null
+                            ? ''
+                            : last.mine
+                            ? 'Вы: '
+                            : last.from != null
+                            ? '${client.nameOf(last.from!)}: '
+                            : '';
                         return ListTile(
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(radiusMd)),
                           contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -149,7 +162,7 @@ class ChatsTab extends StatelessWidget {
                             Expanded(child: Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500))),
                             Text(formatTime(last.time), style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.5))),
                           ]),
-                          subtitle: Text('${last.mine ? 'Вы: ' : ''}${last.preview}',
+                          subtitle: Text('$author${last.preview}',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6))),
@@ -206,7 +219,11 @@ class _ContactsTabState extends State<ContactsTab> {
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
-    final users = _found ?? [for (final n in client.chats.keys) (nick: n, name: client.names[n] ?? n)];
+    final users = _found ??
+        [
+          for (final n in client.chats.keys)
+            if (!AuraClient.isGroup(n)) (nick: n, name: client.names[n] ?? n),
+        ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -279,6 +296,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _markRead() {
     if (client.hasUnread(widget.peer)) client.markRead(widget.peer);
+    // Название, участники и право писать в группе меняются сообщениями.
+    if (AuraClient.isGroup(widget.peer) && mounted) setState(() {});
   }
 
   void _send() {
@@ -532,28 +551,44 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
-    final name = client.names[widget.peer] ?? widget.peer;
+    final group = AuraClient.isGroup(widget.peer);
+    final name = client.title(widget.peer);
+    // В группе, из которой исключили или откуда вышли, писать нельзя.
+    final member = !group || client.members(widget.peer).contains(client.nick);
     return Scaffold(
       appBar: AppBar(
         backgroundColor: c.cream,
         titleSpacing: 0,
         shape: Border(bottom: BorderSide(color: c.lightGray)),
-        title: Row(children: [
-          Avatar(name, size: 40),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500)),
-              Text('@${widget.peer}', style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.55))),
-            ]),
-          ),
-        ]),
+        title: GestureDetector(
+          onTap: group
+              ? () => Navigator.push(context, MaterialPageRoute(builder: (_) => GroupScreen(chat: widget.peer)))
+              : null,
+          child: Row(children: [
+            Avatar(name, size: 40),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500)),
+                Text(group ? 'Участники: ${client.members(widget.peer).length}' : '@${widget.peer}',
+                    style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.55))),
+              ]),
+            ),
+          ]),
+        ),
         actions: [
-          IconButton(
-            tooltip: 'Код безопасности',
-            icon: const Icon(Icons.verified_user_outlined),
-            onPressed: () => showDialog(context: context, builder: (_) => SafetyNumberDialog(peer: widget.peer)),
-          ),
+          if (group)
+            IconButton(
+              tooltip: 'Участники',
+              icon: const Icon(Icons.group_outlined),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => GroupScreen(chat: widget.peer))),
+            )
+          else
+            IconButton(
+              tooltip: 'Код безопасности',
+              icon: const Icon(Icons.verified_user_outlined),
+              onPressed: () => showDialog(context: context, builder: (_) => SafetyNumberDialog(peer: widget.peer)),
+            ),
         ],
       ),
       body: SafeArea(
@@ -570,6 +605,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   separatorBuilder: (_, _) => const SizedBox(height: 12),
                   itemBuilder: (context, i) {
                     final m = messages[messages.length - 1 - i];
+                    if (m.update != null) {
+                      return Center(
+                        child: Text(m.text,
+                            textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.55))),
+                      );
+                    }
                     return Align(
                       alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
                       // Не отправленное сообщение уходит заново по нажатию, долгое нажатие открывает меню.
@@ -584,6 +625,12 @@ class _ChatScreenState extends State<ChatScreen> {
                             borderRadius: BorderRadius.circular(radiusLg),
                           ),
                           child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                            if (m.from != null)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(client.nameOf(m.from!),
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: c.grayPurple)),
+                              ),
                             if (m.file != null) Attachment(m.file!),
                             if (m.files != null) Album(m.files!),
                             if (m.text.isNotEmpty)
@@ -623,7 +670,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-            child: _recorder != null
+            child: !member
+                ? Text('Вы не участник этой группы', textAlign: TextAlign.center, style: TextStyle(color: c.ink.withValues(alpha: 0.6)))
+                : _recorder != null
                 ? Row(children: [
                     IconButton(
                       tooltip: 'Отменить запись',

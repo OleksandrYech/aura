@@ -540,7 +540,7 @@ class AuraServer {
           (p) =>
               p is! Map ||
               p['device'] is! int ||
-              (p['type'] != 2 && p['type'] != 3) ||
+              (!const [2, 3, 4].contains(p['type'])) ||
               p['body'] is! String ||
               (p['body'] as String).length > maxMessage,
         )) {

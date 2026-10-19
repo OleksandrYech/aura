@@ -100,6 +100,46 @@ class SignalKeys extends InMemorySignalProtocolStore {
         .getDisplayText();
   }
 
+  // --- Группы: ключи отправителя (sender keys) ---
+  // У каждого устройства в каждой группе свой ключ отправителя. Он раздаётся участникам попарными
+  // сессиями, а сообщение в группу шифруется им один раз для всех.
+
+  /// Тип зашифрованного ключом отправителя сообщения в группу (у попарных — 2 и 3).
+  static const groupType = CiphertextMessage.senderKeyType;
+
+  /// Записи ключей отправителей по SenderKeyName.serialize().
+  final senderKeys = <String, Uint8List>{};
+  late final _senderKeyStore = _SenderKeyStore(senderKeys);
+
+  static SenderKeyName _senderKeyName(String group, String nick, int device) =>
+      SenderKeyName(group, SignalProtocolAddress(nick, device));
+
+  /// Свой ключ отправителя в группе для раздачи участникам; создаётся при первом вызове.
+  Future<String> senderKey(String group, String me, int device) async =>
+      _b64((await GroupSessionBuilder(_senderKeyStore).create(_senderKeyName(group, me, device))).serialize());
+
+  /// Ключ, который уже есть, не принимаем повторно: иначе он перекроет текущую цепочку,
+  /// и сообщения, отправленные до повтора, не расшифруются.
+  Future<void> processSenderKey(String group, String nick, int device, String key) async {
+    final name = _senderKeyName(group, nick, device);
+    final skdm = SenderKeyDistributionMessageWrapper.fromSerialized(_bytes(key));
+    try {
+      (await _senderKeyStore.loadSenderKey(name)).getSenderKeyStateById(skdm.id);
+      return;
+    } on InvalidKeyIdException catch (_) {}
+    await GroupSessionBuilder(_senderKeyStore).process(name, skdm);
+  }
+
+  /// Новый ключ отправителя при следующей отправке: исключённый участник не прочтёт новые сообщения.
+  void dropSenderKey(String group, String me, int device) =>
+      senderKeys.remove(_senderKeyName(group, me, device).serialize());
+
+  Future<String> groupEncrypt(String group, String me, int device, String plaintext) async =>
+      _b64(await GroupCipher(_senderKeyStore, _senderKeyName(group, me, device)).encrypt(utf8.encode(plaintext)));
+
+  Future<String> groupDecrypt(String group, String nick, int device, String body) async =>
+      utf8.decode(await GroupCipher(_senderKeyStore, _senderKeyName(group, nick, device)).decrypt(_bytes(body)));
+
   // --- Доверие к ключам собеседников ---
 
   @override
@@ -134,6 +174,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
     'signedPreKeys': {for (final e in signedPreKeyStore.store.entries) '${e.key}': _b64(e.value)},
     'sessions': {for (final e in sessionStore.sessions.entries) _addr(e.key): _b64(e.value)},
     'trusted': {for (final e in _trusted.entries) _addr(e.key): _b64(e.value.serialize())},
+    'senderKeys': {for (final e in senderKeys.entries) e.key: _b64(e.value)},
   });
 
   factory SignalKeys.fromJson(String raw) {
@@ -155,9 +196,27 @@ class SignalKeys extends InMemorySignalProtocolStore {
     for (final MapEntry(:key, :value) in (j['trusted'] as Map<String, dynamic>).entries) {
       keys._trusted[_parseAddr(key)] = IdentityKey.fromBytes(_bytes(value), 0);
     }
+    for (final MapEntry(:key, :value) in (j['senderKeys'] as Map<String, dynamic>? ?? {}).entries) {
+      keys.senderKeys[key] = _bytes(value);
+    }
     return keys;
   }
 }
 
 String _b64(List<int> b) => base64.encode(b);
 Uint8List _bytes(Object? s) => base64.decode(s as String);
+
+class _SenderKeyStore extends SenderKeyStore {
+  _SenderKeyStore(this._records);
+  final Map<String, Uint8List> _records;
+
+  @override
+  Future<SenderKeyRecord> loadSenderKey(SenderKeyName name) async {
+    final r = _records[name.serialize()];
+    return r == null ? SenderKeyRecord() : SenderKeyRecord.fromSerialized(r);
+  }
+
+  @override
+  Future<void> storeSenderKey(SenderKeyName name, SenderKeyRecord record) async =>
+      _records[name.serialize()] = record.serialize();
+}
