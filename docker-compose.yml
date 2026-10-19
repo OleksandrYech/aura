@@ -13,7 +13,8 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:2025.9.1
     restart: unless-stopped
-    command: tunnel --no-autoupdate run
+    # QUIC (UDP) times out on this host, see logs "failed to dial to edge with quic"
+    command: tunnel --no-autoupdate --protocol http2 run
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     depends_on:
