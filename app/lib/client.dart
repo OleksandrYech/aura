@@ -27,9 +27,17 @@ class Message {
     required this.status,
     this.file,
     this.files,
+    this.from,
+    this.update,
   });
 
   final String id, text;
+
+  /// Автор входящего сообщения в группе.
+  final String? from;
+
+  /// Изменение группы (создание, состав, админы, название). Такое сообщение показывается строкой по центру.
+  final Map<String, dynamic>? update;
   final bool mine;
   final int time; // мс с эпохи
   Status status;
@@ -44,7 +52,7 @@ class Message {
   List<Map<String, dynamic>> get attachments => [?file, ...?files];
 
   /// То, что уходит собеседнику внутри зашифрованного сообщения.
-  Map<String, dynamic> get content => {'text': text, 'file': ?file, 'files': ?files};
+  Map<String, dynamic> get content => {'text': text, 'file': ?file, 'files': ?files, 'groupUpdate': ?update};
 
   /// Строка для списка чатов.
   String get preview => text.isNotEmpty
@@ -69,6 +77,8 @@ class Message {
     'status': status.name,
     'file': ?file,
     'files': ?files,
+    'from': ?from,
+    'update': ?update,
   };
   factory Message.fromJson(Map<String, dynamic> j) => Message(
     id: j['id'],
@@ -77,6 +87,8 @@ class Message {
     time: j['time'],
     file: j['file'],
     files: (j['files'] as List?)?.cast(),
+    from: j['from'],
+    update: j['update'],
     // До статусов было поле pending.
     status: j['status'] != null
         ? Status.values.byName(j['status'])
@@ -109,6 +121,23 @@ class AuraClient extends ChangeNotifier {
 
   /// Отображаемые имена собеседников.
   final names = <String, String>{};
+
+  /// Группы по ключу чата ('#' и id): {name, members, admins, v}. Состав знают только устройства участников:
+  /// сообщение группы шифруется попарно для каждого участника, сервер видит обычные личные сообщения.
+  /// Менять группу могут админы, участник может только выйти. v растёт с каждым изменением, старое не применяется.
+  // ponytail: одновременные правки двух админов — побеждает пришедшая первой, вторая теряется; сливать, если начнёт мешать.
+  final groups = <String, Map<String, dynamic>>{};
+
+  static bool isGroup(String chat) => chat.startsWith('#');
+
+  List<String> members(String chat) => [...?(groups[chat]?['members'] as List?)?.cast<String>()];
+  List<String> admins(String chat) => [...?(groups[chat]?['admins'] as List?)?.cast<String>()];
+
+  /// Название чата: группы или собеседника.
+  String title(String chat) =>
+      isGroup(chat) ? (groups[chat]?['name'] as String?) ?? 'Группа' : names[chat] ?? chat;
+
+  String nameOf(String nick) => nick == this.nick ? 'Вы' : names[nick] ?? nick;
 
   /// Время последнего прочтения чата.
   final lastRead = <String, int>{};
@@ -161,6 +190,7 @@ class AuraClient extends ChangeNotifier {
       lastRead.addAll((j['lastRead'] as Map<String, dynamic>).cast());
       _deletes.addAll((j['deletes'] as List? ?? []).cast());
       _gone.addAll((j['gone'] as List? ?? []).cast());
+      groups.addAll((j['groups'] as Map<String, dynamic>? ?? {}).cast());
     }
     if (signedIn && _keys != null) {
       _connect();
@@ -241,6 +271,8 @@ class AuraClient extends ChangeNotifier {
     _deletes.clear();
     _gone.clear();
     _devices.clear();
+    _skSent.clear();
+    groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
       await _prefs.remove(k);
@@ -283,6 +315,124 @@ class AuraClient extends ChangeNotifier {
     _save();
     _deliver(to, m);
   }
+
+  // --- Группы ---
+
+  /// Создаёт группу, где этот пользователь — админ. Возвращает ключ чата.
+  String createGroup(String name, List<String> members) {
+    final chat = '#${_newId()}';
+    _changeGroup(chat, {'name': name, 'members': [nick!, ...members.where((m) => m != nick)], 'admins': [nick!]});
+    return chat;
+  }
+
+  void renameGroup(String chat, String name) => _changeGroup(chat, {...groups[chat]!, 'name': name});
+
+  void addMembers(String chat, List<String> add) =>
+      _changeGroup(chat, {...groups[chat]!, 'members': {...members(chat), ...add}.toList()});
+
+  void removeMember(String chat, String who) => _changeGroup(chat, {
+    ...groups[chat]!,
+    'members': members(chat)..remove(who),
+    'admins': admins(chat)..remove(who),
+  });
+
+  void setAdmin(String chat, String who, bool admin) => _changeGroup(chat, {
+    ...groups[chat]!,
+    'admins': admin ? {...admins(chat), who}.toList() : (admins(chat)..remove(who)),
+  });
+
+  /// Выход из группы. Последний админ перед выходом передаёт права следующему участнику.
+  void leaveGroup(String chat) {
+    final rest = members(chat)..remove(nick);
+    var admins = this.admins(chat)..remove(nick);
+    if (admins.isEmpty && rest.isNotEmpty) admins = [rest.first];
+    _changeGroup(chat, {...groups[chat]!, 'members': rest, 'admins': admins});
+  }
+
+  /// Изменение группы уходит как сообщение: применяется сразу, а дойдёт до участников,
+  /// в том числе удалённых, и после потери связи — как любое неотправленное сообщение.
+  void _changeGroup(String chat, Map<String, dynamic> next) {
+    final old = groups[chat];
+    final update = {
+      ...next,
+      'v': (old?['v'] as int? ?? 0) + 1,
+      'was': members(chat), // кого ещё уведомить: исключённые тоже узнают, что их убрали
+      // Имена участников, которые знает автор: у остальных вместо них были бы никнеймы.
+      'names': {for (final m in next['members'] as List) if (names[m] != null) m: names[m]},
+    };
+    final m = Message(
+      id: _newId(),
+      mine: true,
+      text: _describe(nick!, old, update),
+      time: DateTime.now().millisecondsSinceEpoch,
+      status: Status.pending,
+      update: update,
+    );
+    _applyGroup(chat, update);
+    chats.putIfAbsent(chat, () => []).add(m);
+    _save();
+    _deliver(chat, m);
+  }
+
+  /// Кто-то ушёл из группы: свой ключ отправителя меняем, чтобы ушедший не читал новые сообщения.
+  void _applyGroup(String chat, Map<String, dynamic> u) {
+    groups[chat] = {'name': u['name'], 'members': u['members'], 'admins': u['admins'], 'v': u['v']};
+    if (((u['was'] as List?) ?? []).any((m) => !(u['members'] as List).contains(m))) {
+      _keys?.dropSenderKey(chat.substring(1), nick!, device!);
+      _skSent.remove(chat);
+    }
+  }
+
+  /// Устройства ('ник:устройство'), которым уже роздан свой ключ отправителя в группе.
+  final _skSent = <String, Set<String>>{};
+
+  /// Можно ли принять изменение группы от [from]: от админа, от создателя новой группы
+  /// или когда участник только убирает себя.
+  bool _allowed(String chat, String from, Map<String, dynamic> u) {
+    final old = groups[chat];
+    final members = (u['members'] as List).cast<String>(), admins = (u['admins'] as List).cast<String>();
+    if (old == null) return admins.contains(from) && members.contains(from);
+    if (u['v'] is! int || u['v'] <= old['v']) return false;
+    if (from == nick || this.admins(chat).contains(from)) return true;
+    final rest = this.members(chat)..remove(from);
+    return u['name'] == old['name'] &&
+        members.toSet().containsAll(rest) && rest.toSet().containsAll(members) &&
+        admins.every((a) => rest.contains(a)) &&
+        // Админы те же, а если уходит единственный админ, он может назначить нового.
+        (admins.toSet().containsAll(this.admins(chat)..remove(from)) || (this.admins(chat)..remove(from)).isEmpty);
+  }
+
+  /// Строка о том, что изменилось в группе.
+  String _describe(String from, Map<String, dynamic>? old, Map<String, dynamic> u) {
+    final who = nameOf(from);
+    if (old == null) return '$who: создана группа «${u['name']}»';
+    String list(Iterable<Object?> nicks) => nicks.map((n) => n == nick ? 'вы' : nameOf(n as String)).join(', ');
+    final was = (old['members'] as List).toSet(), now = (u['members'] as List).toSet();
+    final wasAdmins = (old['admins'] as List).toSet(), nowAdmins = (u['admins'] as List).toSet();
+    return [
+      if (u['name'] != old['name']) '$who: новое название «${u['name']}»',
+      if (now.difference(was).isNotEmpty) '$who: добавлены ${list(now.difference(was))}',
+      if (was.difference(now).length == 1 && !now.contains(from) && was.contains(from)) '$who: выход из группы'
+      else if (was.difference(now).isNotEmpty) '$who: исключены ${list(was.difference(now))}',
+      if (nowAdmins.difference(wasAdmins).isNotEmpty) 'Админы: + ${list(nowAdmins.difference(wasAdmins))}',
+      if (wasAdmins.difference(nowAdmins).intersection(now).isNotEmpty)
+        'Админы: − ${list(wasAdmins.difference(nowAdmins).intersection(now))}',
+    ].join('\n');
+  }
+
+  /// Что уходит [to] из чата [chat]: в группе — с её id, своим устройствам в личном чате — с собеседником.
+  Map<String, dynamic> _contentFor(String chat, Map<String, dynamic> content, String to) => isGroup(chat)
+      ? {...content, 'group': chat.substring(1)}
+      : to == nick
+      ? {...content, 'peer': chat}
+      : content;
+
+  /// Кому уходит сообщение чата, кроме своих устройств.
+  List<String> _recipients(String chat, [Map<String, dynamic>? update]) => isGroup(chat)
+      ? {...members(chat), ...?(update?['was'] as List?)?.cast<String>(), ...?(update?['members'] as List?)?.cast<String>()}
+            .where((m) => m != nick)
+            .toList()
+      : [chat];
 
   static const maxFile = 2 << 30;
 
@@ -409,9 +559,10 @@ class AuraClient extends ChangeNotifier {
   }
 
   /// [fromPeer] — удаление пришло от собеседника: он может убрать только свои сообщения.
-  void _remove(String peer, Set<Object?> ids, {bool fromPeer = false}) {
+  /// [by] — удаление пришло от собеседника или участника группы: он может убрать только свои сообщения.
+  void _remove(String peer, Set<Object?> ids, {String? by}) {
     chats[peer]?.removeWhere((m) {
-      if (!ids.contains(m.id) || (fromPeer && m.mine)) return false;
+      if (!ids.contains(m.id) || (by != null && (m.mine || (m.from != null && m.from != by)))) return false;
       m.attachments.forEach(_forget);
       _gone.add(m.id);
       return true;
@@ -428,9 +579,11 @@ class AuraClient extends ChangeNotifier {
     // Сначала сервер стирает файлы и ещё не доставленные копии, потом уходят уведомления.
     if (everyone) await _request('POST', _api('/api/unsend'), {'ids': d['ids'], 'files': d['files']});
     // Ждём подтверждения сервера ('sent') по каждой копии; список готов до отправки, ответ может прийти сразу.
-    final wait = d['wait'] = [if (everyone) peer, nick];
-    if (everyone && !await _sendCopy(peer, id, {'delete': d['ids']})) wait.remove(peer);
-    if (!await _sendCopy(nick!, id, {'delete': d['ids'], 'peer': peer})) wait.remove(nick);
+    final to = everyone ? _recipients(peer) : <String>[];
+    final wait = d['wait'] = [...to, nick];
+    for (final t in [...to, nick!]) {
+      if (!await _sendCopy(t, id, _contentFor(peer, {'delete': d['ids']}, t))) wait.remove(t);
+    }
     _delivered(id, null);
   });
 
@@ -569,7 +722,10 @@ class AuraClient extends ChangeNotifier {
       for (final m in chats[peer] ?? <Message>[])
         if (!m.mine && m.status != Status.read) m..status = Status.read,
     ];
-    if (unread.isNotEmpty) _sendReceipt(peer, Status.read, [for (final m in unread) m.id]);
+    // В группе подтверждение уходит автору каждого сообщения.
+    for (final from in {for (final m in unread) m.from ?? peer}) {
+      _sendReceipt(from, Status.read, [for (final m in unread) if ((m.from ?? peer) == from) m.id]);
+    }
     _save();
   }
 
@@ -614,17 +770,63 @@ class AuraClient extends ChangeNotifier {
       thumbs.removeLast().remove('thumb');
       _save();
     }
-    if (await _sendCopy(to, m.id, m.content)) await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
+    if (isGroup(to) && m.update == null) {
+      await _sendGroup(to, m);
+    } else if (isGroup(to)) {
+      // Изменения группы идут попарно: их получают и исключённые, у которых нет нового ключа.
+      // Участник без устройств или с ошибкой не мешает доставке остальным.
+      for (final r in _recipients(to, m.update)) {
+        try {
+          await _sendCopy(r, m.id, _contentFor(to, m.content, r));
+        } catch (e) {
+          debugPrint('AURA: в группу для $r: $e');
+        }
+      }
+      await _sendCopy(nick!, m.id, _contentFor(to, m.content, nick!));
+    } else if (await _sendCopy(to, m.id, m.content)) {
+      await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
+    }
   });
+
+  Future<List<int>> _devicesOf(String target) async => _devices[target] ??= [
+    for (final d in await _request('GET', _api('/api/devices/$target'), null) as List)
+      if (target != nick || d['device'] != device) d['device'] as int,
+  ];
+
+  /// Сообщение в группу шифруется один раз своим ключом отправителя. Тем, у кого ключа ещё нет,
+  /// он сначала уходит попарной сессией.
+  Future<void> _sendGroup(String chat, Message m, [List<String>? only]) async {
+    if (!connected || _keys == null) return;
+    final keys = _keys!, gid = chat.substring(1), sent = _skSent.putIfAbsent(chat, () => {});
+    final key = await keys.senderKey(gid, nick!, device!);
+    final body = '$gid:${await keys.groupEncrypt(gid, nick!, device!, jsonEncode(_contentFor(chat, m.content, '')))}';
+    await _saveKeys();
+    for (final r in only ?? [..._recipients(chat), nick!]) {
+      try {
+        final devices = await _devicesOf(r);
+        if (devices.isEmpty) continue;
+        if (devices.any((d) => !sent.contains('$r:$d'))) {
+          // С ключом уходит и описание группы: новое устройство участника иначе не узнает её состав.
+          await _sendCopy(r, _newId(), {'group': gid, 'senderKey': key, 'state': groups[chat]});
+          sent.addAll(devices.map((d) => '$r:$d'));
+        }
+        _wsSend({
+          'type': 'send',
+          'id': m.id,
+          'to': r,
+          'payloads': [for (final d in devices) {'device': d, 'type': SignalKeys.groupType, 'body': body}],
+        });
+      } catch (e) {
+        debugPrint('AURA: в группу для $r: $e');
+      }
+    }
+  }
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
   Future<bool> _sendCopy(String target, String id, Map<String, dynamic> content) async {
     if (!connected || _keys == null) return false;
     final keys = _keys!;
-    final devices = _devices[target] ??= [
-      for (final d in await _request('GET', _api('/api/devices/$target'), null) as List)
-        if (target != nick || d['device'] != device) d['device'] as int,
-    ];
+    final devices = await _devicesOf(target);
     if (devices.isEmpty) return false;
     final payloads = [];
     for (final d in devices) {
@@ -644,25 +846,64 @@ class AuraClient extends ChangeNotifier {
     if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
       String text;
-      Map<String, dynamic>? content, file;
+      Map<String, dynamic>? content, file, update;
       List<Map<String, dynamic>>? files;
       try {
-        content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
+        if (msg['ctype'] == SignalKeys.groupType) {
+          final String body = msg['body'];
+          final gid = body.substring(0, body.indexOf(':'));
+          content = {
+            ...jsonDecode(await _keys!.groupDecrypt(gid, from, msg['device'], body.substring(gid.length + 1))),
+            'group': gid,
+          };
+        } else {
+          content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
+        }
         text = content!['text'] ?? '';
         file = content['file'];
         files = (content['files'] as List?)?.cast();
-        if (from == nick) peer = content['peer']; // копия своего сообщения с другого устройства
+        update = content['groupUpdate'];
+        if (content['group'] case final String g) {
+          peer = '#$g';
+        } else if (from == nick) {
+          peer = content['peer']; // копия своего сообщения с другого устройства
+        }
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
         text = '⚠ Не удалось расшифровать сообщение';
       }
       await _saveKeys();
-      if (content?['receipt'] case final String receipt) {
-        _onReceipt(from, Status.values.byName(receipt), (content!['ids'] as List).cast());
+      final group = isGroup(peer);
+      if (content?['senderKey'] case final String key) {
+        try {
+          await _keys!.processSenderKey(content!['group'], from, msg['device'], key);
+          await _saveKeys();
+          // Описание группы берём от своего устройства или, если группа незнакома, от её участника.
+          if (content['state'] case final Map s
+              when (from == nick && (s['v'] as int) > (groups[peer]?['v'] as int? ?? 0)) ||
+                  (groups[peer] == null && (s['members'] as List).contains(from) && (s['members'] as List).contains(nick))) {
+            groups[peer] = s.cast();
+          }
+        } catch (e) {
+          debugPrint('AURA: ключ отправителя от $from: $e');
+        }
+      } else if (content?['receipt'] case final String receipt) {
+        _onReceipt(Status.values.byName(receipt), (content!['ids'] as List).cast());
       } else if (content?['delete'] case final List ids) {
-        _remove(peer, ids.toSet(), fromPeer: from != nick);
+        _remove(peer, ids.toSet(), by: from == nick ? null : from);
+      } else if (update != null && (!group || !_allowed(peer, from, update))) {
+        debugPrint('AURA: изменение группы $peer от $from отклонено');
+      } else if (group && update == null && from != nick && groups[peer] != null && !members(peer).contains(from)) {
+        debugPrint('AURA: $from не участник $peer'); // неизвестную группу принимаем: её описание может прийти позже
       } else {
         final mine = from == nick;
+        if (update != null) {
+          text = _describe(from, groups[peer], update);
+          _applyGroup(peer, update);
+          for (final MapEntry(:key, :value) in (update['names'] as Map? ?? {}).entries) {
+            names.putIfAbsent(key, () => value);
+          }
+        }
         chats
             .putIfAbsent(peer, () => [])
             .add(
@@ -674,6 +915,8 @@ class AuraClient extends ChangeNotifier {
                 status: mine ? Status.sent : Status.delivered,
                 file: file,
                 files: files,
+                from: group && !mine ? from : null,
+                update: update,
               ),
             );
         if (!mine) _sendReceipt(from, Status.delivered, [id]);
@@ -692,9 +935,13 @@ class AuraClient extends ChangeNotifier {
   }
 
   /// Статус только растёт: позднее «доставлено» не отменяет «прочитано».
-  void _onReceipt(String peer, Status status, List<String> ids) {
-    for (final m in chats[peer] ?? <Message>[]) {
-      if (m.mine && ids.contains(m.id) && m.status.index < status.index) m.status = status;
+  /// В группе статус показывает первого, кто получил или прочитал.
+  // ponytail: без списка «кто прочитал»; добавить, если понадобится.
+  void _onReceipt(Status status, List<String> ids) {
+    for (final list in chats.values) {
+      for (final m in list) {
+        if (m.mine && ids.contains(m.id) && m.status.index < status.index) m.status = status;
+      }
     }
   }
 
@@ -739,11 +986,9 @@ class AuraClient extends ChangeNotifier {
         _deletes.where((d) => d['id'] == msg['id']).toList().forEach(_sendDelete);
         for (final MapEntry(key: peer, value: list) in chats.entries) {
           for (final m in list.where((m) => m.id == msg['id'])) {
-            if (to == nick) {
-              _serial(() async => await _sendCopy(nick!, m.id, {...m.content, 'peer': peer}));
-            } else {
-              _deliver(peer, m);
-            }
+            _serial(() async => isGroup(peer) && m.update == null
+                ? await _sendGroup(peer, m, [to])
+                : await _sendCopy(to, m.id, _contentFor(peer, m.content, to)));
           }
         }
       case 'error' when _deletes.any((d) => d['id'] == msg['id']):
@@ -779,7 +1024,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone]}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups}));
     notifyListeners();
   }
 

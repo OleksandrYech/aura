@@ -49,4 +49,22 @@ void main() {
     final impostor = SignalKeys.generate().publicBundle();
     await expectLater(anna.startSession('den', serverBundle(impostor, 1)), throwsA(anything));
   });
+
+  test('ключ отправителя в группе: шифрует для всех, переживает перезапуск и смену', () async {
+    final anna = SignalKeys.generate();
+    var den = SignalKeys.generate();
+    final key = await anna.senderKey('g', 'anna', 1);
+    await den.processSenderKey('g', 'anna', 1, key);
+    final first = await anna.groupEncrypt('g', 'anna', 1, 'Всем привет');
+    // Повтор того же ключа (например, после перезапуска) не ломает сообщения, отправленные до него.
+    await den.processSenderKey('g', 'anna', 1, await anna.senderKey('g', 'anna', 1));
+    den = SignalKeys.fromJson(den.toJson());
+    expect(await den.groupDecrypt('g', 'anna', 1, first), 'Всем привет');
+
+    // После исключения участника ключ новый: старый ключ его не расшифрует.
+    anna.dropSenderKey('g', 'anna', 1);
+    await anna.senderKey('g', 'anna', 1);
+    final secret = await anna.groupEncrypt('g', 'anna', 1, 'без Дениса');
+    await expectLater(den.groupDecrypt('g', 'anna', 1, secret), throwsA(anything));
+  });
 }
