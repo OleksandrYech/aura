@@ -28,7 +28,8 @@ typedef Device = ({String nick, int device});
 class AuraServer {
   /// [turn] — адрес TURN-сервера (например turn:aura-msg.space:3478) и общий с coturn секрет
   /// (static-auth-secret): звонки, которым не хватило прямого соединения, идут через него.
-  AuraServer(String dbPath, {String? files, this.turn})
+  /// [push] — отправка push на устройство без соединения (см. Fcm); false — токен устарел.
+  AuraServer(String dbPath, {String? files, this.turn, this.push})
     : db = sqlite3.open(dbPath),
       files = Directory(files ?? p.join(p.dirname(dbPath), 'files'))..createSync(recursive: true) {
     db.execute('''
@@ -90,6 +91,9 @@ class AuraServer {
         nick TEXT NOT NULL
       ) STRICT;
     ''');
+    if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'push_token')) {
+      db.execute('ALTER TABLE devices ADD COLUMN push_token TEXT');
+    }
   }
 
   final Database db;
@@ -130,6 +134,7 @@ class AuraServer {
       ..put('/api/keys', _authed(_putKeys))
       ..get('/api/devices/<nick>', _authed(_devices))
       ..get('/api/ice', _authed(_ice))
+      ..put('/api/push', _authed(_putPush))
       ..get('/api/keys/<nick>/<device>', _authed(_bundle))
       ..post('/api/files', _authed(_upload))
       ..post('/api/files/<id>', _authed(_append))
@@ -272,6 +277,30 @@ class AuraServer {
   );
 
   final ({String url, String secret})? turn;
+
+  final Future<bool> Function(String token, String kind)? push;
+
+  /// {token}: токен Firebase этого устройства, null — не будить.
+  Future<Response> _putPush(Request req, Device me) async {
+    final token = (await _json(req))['token'];
+    if (token != null && (token is! String || token.isEmpty || token.length > 4096)) {
+      return _error(400, 'Некорректный токен');
+    }
+    db.execute('UPDATE devices SET push_token = ? WHERE nick = ? AND device = ?', [token, me.nick, me.device]);
+    return _ok({});
+  }
+
+  /// Будит устройство без соединения. Ошибки сети не мешают доставке: сообщение ждёт в очереди.
+  void _wake(Device d, String kind) {
+    final push = this.push;
+    if (push == null) return;
+    final token = db.select('SELECT push_token FROM devices WHERE nick = ? AND device = ?', [d.nick, d.device])
+        .firstOrNull?['push_token'];
+    if (token is! String) return;
+    push(token, kind).then((ok) {
+      if (!ok) db.execute('UPDATE devices SET push_token = NULL WHERE push_token = ?', [token]);
+    }, onError: (Object e) => print('push ${d.nick}:${d.device}: $e'));
+  }
 
   /// Серверы для установки звонка. Пароль TURN временный (схема TURN REST API у coturn):
   /// имя — срок действия и ник, пароль — HMAC-SHA1 имени на общем секрете.
@@ -502,7 +531,8 @@ class AuraServer {
   }
 
   // --- WebSocket ---
-  // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}]}, {type: ack, id}
+  // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}], push?}, {type: ack, id}
+  // push: message или call — разбудить устройства получателя без соединения.
   // Сервер → клиент: {type: ready, device, preKeys}, {type: sent, id, to},
   //   {type: message, id, from, device, ctype, body, sentAt}, {type: error, id?, to?, error}
   // body — шифротекст Signal (base64), ctype — его тип (2 обычное, 3 с установкой сессии).
@@ -550,7 +580,7 @@ class AuraServer {
   }
 
   void _send(Device me, WebSocketChannel ws, Map<String, dynamic> msg) {
-    final id = msg['id'], to = msg['to'], payloads = msg['payloads'];
+    final id = msg['id'], to = msg['to'], payloads = msg['payloads'], wake = msg['push'];
     void error(String e) => ws.sink.add(jsonEncode({'type': 'error', 'id': id, 'to': to, 'error': e}));
     if (id is! String ||
         id.isEmpty ||
@@ -588,7 +618,9 @@ class AuraServer {
         p['body'],
         sentAt,
       ]);
-      _online[(nick: to, device: p['device'] as int)]?.sink.add(
+      final d = (nick: to, device: p['device'] as int);
+      if (_online[d] == null && (wake == 'message' || wake == 'call')) _wake(d, wake);
+      _online[d]?.sink.add(
         jsonEncode({
           'type': 'message',
           'id': id,

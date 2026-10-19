@@ -1,3 +1,4 @@
 .env
 *.jks
 *.jks.b64
+secrets/

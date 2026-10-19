@@ -4,10 +4,13 @@ services:
     restart: unless-stopped
     volumes:
       - aura-data:/data
+      - ./secrets:/secrets:ro
     # TURN для звонков (см. README), без него звонки идут напрямую или через STUN.
     environment:
       - AURA_TURN_URL=${TURN_URL:-}
       - AURA_TURN_SECRET=${TURN_SECRET:-}
+      # Push через Firebase (см. README): ключ сервисного аккаунта в secrets/firebase.json.
+      - AURA_FCM=/secrets/firebase.json
     # Для проверки в локальной сети: http://<IP сервера>:8080
     ports:
       - "8080:8080"

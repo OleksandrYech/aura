@@ -1,0 +1,38 @@
+import 'dart:convert';
+
+import 'package:googleapis_auth/auth_io.dart';
+
+/// Отправка push через Firebase Cloud Messaging (HTTP v1) от сервисного аккаунта проекта.
+/// В push только вид события, без отправителя и текста: устройство просыпается и забирает
+/// зашифрованное сообщение у сервера само.
+class Fcm {
+  Fcm._(this._client, this._project);
+  final AuthClient _client;
+  final String _project;
+
+  /// [credentials] — JSON ключа сервисного аккаунта Firebase.
+  static Future<Fcm> fromJson(String credentials) async {
+    final j = jsonDecode(credentials) as Map<String, dynamic>;
+    final client = await clientViaServiceAccount(ServiceAccountCredentials.fromJson(j), [
+      'https://www.googleapis.com/auth/firebase.messaging',
+    ]);
+    return Fcm._(client, j['project_id'] as String);
+  }
+
+  /// false — токен больше не действует (приложение удалено или переустановлено).
+  Future<bool> send(String token, String kind) async {
+    final r = await _client.post(
+      Uri.parse('https://fcm.googleapis.com/v1/projects/$_project/messages:send'),
+      headers: {'content-type': 'application/json'},
+      body: jsonEncode({
+        'message': {
+          'token': token,
+          'data': {'kind': kind},
+          // Звонок без ответа через 45 секунд уже пропущен, будить позже незачем.
+          'android': {'priority': 'HIGH', 'ttl': kind == 'call' ? '45s' : '86400s'},
+        },
+      }),
+    );
+    return !(r.statusCode == 404 || (r.statusCode == 400 && r.body.contains('UNREGISTERED')));
+  }
+}

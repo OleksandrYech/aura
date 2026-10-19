@@ -101,6 +101,55 @@ void main() {
     expect(turn['credential'], base64.encode(hmac.bytes));
   });
 
+  test('push будит только устройства без соединения, устаревший токен забывается', () async {
+    final pushed = <(String, String)>[];
+    await http.close(force: true);
+    aura.close();
+    aura = AuraServer(':memory:', files: Directory.systemTemp.createTempSync('aura').path, push: (token, kind) async {
+      pushed.add((token, kind));
+      return token != 'old';
+    });
+    http = await io.serve(aura.handler, 'localhost', 0);
+    base = Uri.parse('http://localhost:${http.port}');
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    await post('/api/keys', keys('idAnna'), method: 'PUT', token: anna['token']);
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    expect((await post('/api/push', {'token': 7}, method: 'PUT', token: den['token'])).$1, 400);
+    await post('/api/push', {'token': 'den1'}, method: 'PUT', token: den['token']);
+
+    final (annaWs, annaIn) = await connect(anna['token']);
+    Future<void> send(String id, [String? push]) async {
+      annaWs.sink.add(jsonEncode({
+        'type': 'send',
+        'id': id,
+        'to': 'den',
+        'payloads': [
+          {'device': 1, 'type': 2, 'body': 'c'},
+        ],
+        'push': ?push,
+      }));
+      expect(await annaIn.moveNext(), isTrue);
+    }
+
+    await send('m1', 'call');
+    await send('r1'); // подтверждения и служебное не будят
+    expect(pushed, [('den1', 'call')]);
+
+    final (denWs, _) = await connect(den['token']);
+    await send('m2', 'message');
+    expect(pushed, hasLength(1), reason: 'Денис на связи');
+    await denWs.sink.close();
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    await post('/api/push', {'token': 'old'}, method: 'PUT', token: den['token']);
+    await send('m3', 'message');
+    await Future.delayed(const Duration(milliseconds: 50));
+    expect(pushed.last, ('old', 'message'));
+    expect(aura.db.select('SELECT push_token FROM devices WHERE nick = ?', ['den']).first['push_token'], isNull);
+    await annaWs.sink.close();
+  });
+
   test('ключи: публикация, выдача и одноразовые prekey', () async {
     final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});

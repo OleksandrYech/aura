@@ -55,6 +55,21 @@ Cloudflare сам выдаёт HTTPS-сертификат, открывать п
 
 Пароли TURN временные: сервер AURA выдаёт их вошедшим пользователям на сутки, посторонние сервером пользоваться не смогут.
 
+### Уведомления: Firebase
+
+Когда приложение на Android закрыто, о звонках и сообщениях его будит push через Firebase Cloud Messaging (бесплатно). В push нет ни текста, ни отправителя, только «звонок» или «сообщение»: остальное приложение забирает с вашего сервера и расшифровывает само.
+
+1. В [консоли Firebase](https://console.firebase.google.com/) создайте проект (Google Analytics не нужен).
+2. Добавьте в проект Android-приложение с именем пакета `com.aura.aura` и скачайте `google-services.json`. В репозитории Settings → Secrets and variables → Actions → вкладка Variables заведите четыре переменные из этого файла:
+   - `FIREBASE_API_KEY` — `client[0].api_key[0].current_key`
+   - `FIREBASE_APP_ID` — `client[0].client_info.mobilesdk_app_id`
+   - `FIREBASE_SENDER_ID` — `project_info.project_number`
+   - `FIREBASE_PROJECT_ID` — `project_info.project_id`
+
+   Это открытые идентификаторы приложения, не секреты.
+3. В настройках проекта Firebase → Service accounts нажмите Generate new private key и сохраните файл как `secrets/firebase.json` рядом с `docker-compose.yml` на сервере. Этот ключ секретный, в git он не попадает.
+4. Перезапустите сервер (`docker compose --profile tunnel up -d --build`); в логе появится «push через Firebase включены». Следующая сборка APK из `main` уже с push: откройте её и разрешите уведомления.
+
 ## Android: обновления без переустановки
 
 CI подписывает APK постоянным ключом и после каждого мёржа в `main` выкладывает его в [Releases](../../releases). Приложение [Obtainium](https://github.com/ImranR98/Obtainium) на телефоне следит за релизами и ставит обновление поверх, ключи шифрования и переписка сохраняются.

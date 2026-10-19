@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:server/push.dart';
 import 'package:server/server.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
@@ -7,14 +8,24 @@ import 'package:shelf_static/shelf_static.dart';
 
 /// AURA_DB — файл базы (по умолчанию aura.db), AURA_FILES — папка зашифрованных файлов
 /// (по умолчанию files рядом с базой), AURA_WEB — папка Web-сборки, PORT — порт (8080),
-/// AURA_TURN_URL и AURA_TURN_SECRET — TURN-сервер для звонков (необязательно).
+/// AURA_TURN_URL и AURA_TURN_SECRET — TURN-сервер для звонков (необязательно),
+/// AURA_FCM — файл ключа сервисного аккаунта Firebase для push (необязательно).
 Future<void> main() async {
   final env = Platform.environment;
   final turnUrl = env['AURA_TURN_URL'], turnSecret = env['AURA_TURN_SECRET'];
+  final fcmFile = File(env['AURA_FCM'] ?? '');
+  Fcm? fcm;
+  try {
+    if (fcmFile.existsSync()) fcm = await Fcm.fromJson(fcmFile.readAsStringSync());
+  } catch (e) {
+    print('push: ключ Firebase не подошёл: $e'); // сервер работает и без push
+  }
+  print(fcm == null ? 'push выключены' : 'push через Firebase включены');
   final aura = AuraServer(
     env['AURA_DB'] ?? 'aura.db',
     files: env['AURA_FILES'],
     turn: (turnUrl ?? '').isNotEmpty && (turnSecret ?? '').isNotEmpty ? (url: turnUrl!, secret: turnSecret!) : null,
+    push: fcm?.send,
   );
   final webDir = env['AURA_WEB'];
 

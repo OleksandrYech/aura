@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -35,7 +36,34 @@ class Calls extends ChangeNotifier {
   /// Предложение старше этого — пропущенный звонок, а не входящий.
   static const ring = Duration(seconds: 45);
 
-  void init() => client.onCall = _onSignal;
+  void init() {
+    client.onCall = _onSignal;
+    addListener(_sound);
+  }
+
+  final _tone = AudioPlayer();
+  String? _playing;
+
+  /// Гудки, пока ждём ответа, мелодия входящего и короткие сигналы, когда звонок закончился.
+  void _sound() {
+    final want = switch (state) {
+      CallState.calling => 'ringback',
+      CallState.ringing => 'ringtone',
+      CallState.idle when ended != null => 'end',
+      _ => null,
+    };
+    if (want == _playing) return;
+    _playing = want;
+    // По очереди: иначе поздний stop может прийти раньше раннего play, и гудки не смолкнут.
+    _toneQueue = _toneQueue.then((_) async {
+      await _tone.stop();
+      if (want == null || want != _playing) return;
+      await _tone.setReleaseMode(want == 'end' ? ReleaseMode.stop : ReleaseMode.loop);
+      await _tone.play(AssetSource('sounds/$want.wav'));
+    }).catchError((Object e) => debugPrint('AURA: звук звонка: $e'));
+  }
+
+  Future<void> _toneQueue = Future.value();
 
   Future<void> start(String to) async {
     if (state != CallState.idle) return;
