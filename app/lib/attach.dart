@@ -32,7 +32,12 @@ Future<AttachKind?> showAttachMenu(BuildContext context) => showModalBottomSheet
 Future<List<AssetEntity>?> pickFromGallery(BuildContext context) async {
   final permission = await PhotoManager.requestPermissionExtend();
   if (!permission.hasAccess) return null;
-  final albums = await PhotoManager.getAssetPathList(onlyAll: true, type: RequestType.common);
+  // Без порядка Android отдаёт по id в базе медиа: сначала все фото, потом все видео.
+  final albums = await PhotoManager.getAssetPathList(
+    onlyAll: true,
+    type: RequestType.common,
+    filterOption: FilterOptionGroup(orders: [const OrderOption(type: OrderOptionType.createDate, asc: false)]),
+  );
   if (!context.mounted) return const [];
   if (albums.isEmpty) return const [];
   final picked = await showModalBottomSheet<List<AssetEntity>>(

@@ -19,7 +19,15 @@ import 'signal.dart';
 enum Status { pending, sent, delivered, read, failed }
 
 class Message {
-  Message({required this.id, required this.mine, required this.text, required this.time, required this.status, this.file});
+  Message({
+    required this.id,
+    required this.mine,
+    required this.text,
+    required this.time,
+    required this.status,
+    this.file,
+    this.files,
+  });
 
   final String id, text;
   final bool mine;
@@ -29,12 +37,20 @@ class Message {
   /// Вложение: {id, key, name, size} — id файла на сервере и ключ, которым он зашифрован.
   final Map<String, dynamic>? file;
 
+  /// Альбом: несколько фото и видео одним сообщением, каждое в том же виде, что [file].
+  final List<Map<String, dynamic>>? files;
+
+  /// Все вложения сообщения.
+  List<Map<String, dynamic>> get attachments => [?file, ...?files];
+
   /// То, что уходит собеседнику внутри зашифрованного сообщения.
-  Map<String, dynamic> get content => {'text': text, 'file': ?file};
+  Map<String, dynamic> get content => {'text': text, 'file': ?file, 'files': ?files};
 
   /// Строка для списка чатов.
   String get preview => text.isNotEmpty
       ? text
+      : files != null
+      ? 'Альбом: ${files!.length}'
       : file == null
       ? ''
       : file!['voice'] == true
@@ -45,13 +61,22 @@ class Message {
       ? 'Фото'
       : '📎 ${file!['name']}';
 
-  Map<String, dynamic> toJson() => {'id': id, 'mine': mine, 'text': text, 'time': time, 'status': status.name, 'file': ?file};
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'mine': mine,
+    'text': text,
+    'time': time,
+    'status': status.name,
+    'file': ?file,
+    'files': ?files,
+  };
   factory Message.fromJson(Map<String, dynamic> j) => Message(
     id: j['id'],
     mine: j['mine'],
     text: j['text'],
     time: j['time'],
     file: j['file'],
+    files: (j['files'] as List?)?.cast(),
     // До статусов было поле pending.
     status: j['status'] != null
         ? Status.values.byName(j['status'])
@@ -87,6 +112,9 @@ class AuraClient extends ChangeNotifier {
 
   /// Время последнего прочтения чата.
   final lastRead = <String, int>{};
+
+  /// Удаления, которые ещё не дошли до сервера: {id, peer, ids, everyone, files}.
+  final _deletes = <Map<String, dynamic>>[];
 
   /// Ключи этого устройства; есть, пока выполнен вход.
   SignalKeys? _keys;
@@ -126,6 +154,7 @@ class AuraClient extends ChangeNotifier {
       }
       names.addAll((j['names'] as Map<String, dynamic>).cast());
       lastRead.addAll((j['lastRead'] as Map<String, dynamic>).cast());
+      _deletes.addAll((j['deletes'] as List? ?? []).cast());
     }
     if (signedIn && _keys != null) {
       _connect();
@@ -203,6 +232,7 @@ class AuraClient extends ChangeNotifier {
     _files.clear();
     names.clear();
     lastRead.clear();
+    _deletes.clear();
     _devices.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
@@ -232,7 +262,7 @@ class AuraClient extends ChangeNotifier {
 
   // --- Сообщения ---
 
-  void send(String to, String text, {Map<String, dynamic>? file}) {
+  void send(String to, String text, {Map<String, dynamic>? file, List<Map<String, dynamic>>? files}) {
     final m = Message(
       id: _newId(),
       mine: true,
@@ -240,6 +270,7 @@ class AuraClient extends ChangeNotifier {
       time: DateTime.now().millisecondsSinceEpoch,
       status: Status.pending,
       file: file,
+      files: files,
     );
     chats.putIfAbsent(to, () => []).add(m);
     _save();
@@ -263,11 +294,24 @@ class AuraClient extends ChangeNotifier {
   /// Сколько частей файла грузится и скачивается одновременно, как в Telegram.
   static const _parallel = 4;
 
-  /// Шифрует файл новым ключом, загружает частями и отправляет сообщение с id и ключом.
-  /// Первая часть создаёт загрузку, остальные идут до [_parallel] одновременно, сообщение уходит
-  /// после всех частей. Возвращает вложение из сообщения, чтобы сохранить файл на устройстве.
+  /// Загружает файл ([upload]) и отправляет сообщение с ним. Возвращает вложение из сообщения,
+  /// чтобы сохранить файл на устройстве.
   Future<Map<String, dynamic>> sendStream(
     String to,
+    String name,
+    Stream<List<int>> data,
+    int length, {
+    Map<String, dynamic> extra = const {},
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    final file = await upload(name, data, length, extra: extra, onProgress: onProgress);
+    send(to, '', file: file);
+    return file;
+  }
+
+  /// Шифрует файл новым ключом и загружает частями. Возвращает вложение для сообщения: id и ключ.
+  /// Первая часть создаёт загрузку, остальные идут до [_parallel] одновременно.
+  Future<Map<String, dynamic>> upload(
     String name,
     Stream<List<int>> data,
     int length, {
@@ -311,9 +355,74 @@ class AuraClient extends ChangeNotifier {
     await Future.wait(running.toList());
     if (i != parts) throw ApiException('Файл изменился во время отправки');
     if (keep != null) _files[id!] = Future.value(keep.takeBytes());
-    final file = {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra};
-    send(to, '', file: file);
-    return file;
+    return {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra};
+  }
+
+  /// Стирает с сервера загруженные, но так и не отправленные файлы, например начало альбома, который не ушёл.
+  Future<void> discard(List<Map<String, dynamic>> files) async {
+    try {
+      await _request('POST', _api('/api/unsend'), {
+        'files': [for (final f in files) f['id']],
+      });
+    } catch (e) {
+      debugPrint('AURA: удаление загрузок: $e'); // удалятся по сроку
+    }
+    for (final f in files) {
+      _forget(f);
+    }
+  }
+
+  void _forget(Map<String, dynamic> file) {
+    _files.remove(file['id']);
+    forgetFile(file);
+  }
+
+  // --- Удаление ---
+
+  /// Удаляет сообщения у себя, вместе с другими своими устройствами, или у всех (только свои сообщения).
+  /// Вложения стираются с устройства, а при удалении у всех — и с сервера, и у собеседника.
+  /// Удаление дойдёт и после потери связи: оно ждёт в [_deletes], как неотправленное сообщение.
+  void delete(String peer, List<Message> list, {bool everyone = false}) {
+    assert(!everyone || list.every((m) => m.mine));
+    final ids = [for (final m in list) m.id];
+    final d = {
+      'id': _newId(),
+      'peer': peer,
+      'ids': ids,
+      'everyone': everyone,
+      if (everyone) 'files': [for (final m in list) for (final f in m.attachments) f['id']],
+    };
+    _remove(peer, ids.toSet());
+    _deletes.add(d);
+    _save();
+    _sendDelete(d);
+  }
+
+  /// [fromPeer] — удаление пришло от собеседника: он может убрать только свои сообщения.
+  void _remove(String peer, Set<Object?> ids, {bool fromPeer = false}) {
+    chats[peer]?.removeWhere((m) {
+      if (!ids.contains(m.id) || (fromPeer && m.mine)) return false;
+      m.attachments.forEach(_forget);
+      return true;
+    });
+  }
+
+  void _sendDelete(Map<String, dynamic> d) => _serial(() async {
+    if (!connected || !_deletes.contains(d)) return;
+    final String peer = d['peer'], id = d['id'];
+    final everyone = d['everyone'] == true;
+    // Сначала сервер стирает файлы и ещё не доставленные копии, потом уходят уведомления.
+    if (everyone) await _request('POST', _api('/api/unsend'), {'ids': d['ids'], 'files': d['files']});
+    final toPeer = everyone && await _sendCopy(peer, id, {'delete': d['ids']});
+    final toMine = await _sendCopy(nick!, id, {'delete': d['ids'], 'peer': peer});
+    // Ждём подтверждения сервера ('sent'), если было кому отправлять.
+    if (!(everyone ? toPeer : toMine)) _dropDelete(id);
+  });
+
+  void _dropDelete(Object? id) {
+    final before = _deletes.length;
+    _deletes.removeWhere((d) => d['id'] == id);
+    if (_deletes.length != before) _save();
   }
 
   /// Без [id] создаёт загрузку размером [at] байт (итог всех зашифрованных частей),
@@ -467,14 +576,23 @@ class AuraClient extends ChangeNotifier {
     _deliver(to, m);
   }
 
-  /// Превью видео больше этого (символов base64) не влезает в сообщение: сервер принимает до 100000.
+  /// Превью видео больше этого (символов base64) в сообщение не кладём.
   static const maxThumb = 40 << 10;
+
+  /// Сообщение длиннее этого (символов JSON) после шифрования не пройдёт на сервер (до 500000 символов base64).
+  static const maxContent = 350000;
 
   /// Собеседнику, а затем копия на свои другие устройства, чтобы переписка была видна везде.
   Future<void> _deliver(String to, Message m) => _serial(() async {
     // Старые версии клали крупное превью, и такие сообщения застревали в очереди: шлём без него.
-    if (m.file?['thumb'] case final String t when t.length > maxThumb) {
-      m.file!.remove('thumb');
+    // В большом альбоме превью убираем с конца, пока сообщение не влезет.
+    final thumbs = m.attachments.where((f) => f['thumb'] is String).toList();
+    for (final f in thumbs.where((f) => f['thumb'].length > maxThumb).toList()) {
+      thumbs.remove(f..remove('thumb'));
+      _save();
+    }
+    while (thumbs.isNotEmpty && jsonEncode(m.content).length > maxContent) {
+      thumbs.removeLast().remove('thumb');
       _save();
     }
     if (await _sendCopy(to, m.id, m.content)) await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
@@ -508,10 +626,12 @@ class AuraClient extends ChangeNotifier {
       var peer = from;
       String text;
       Map<String, dynamic>? content, file;
+      List<Map<String, dynamic>>? files;
       try {
         content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
         text = content!['text'] ?? '';
         file = content['file'];
+        files = (content['files'] as List?)?.cast();
         if (from == nick) peer = content['peer']; // копия своего сообщения с другого устройства
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
@@ -520,6 +640,8 @@ class AuraClient extends ChangeNotifier {
       await _saveKeys();
       if (content?['receipt'] case final String receipt) {
         _onReceipt(from, Status.values.byName(receipt), (content!['ids'] as List).cast());
+      } else if (content?['delete'] case final List ids) {
+        _remove(peer, ids.toSet(), fromPeer: from != nick);
       } else {
         final mine = from == nick;
         chats
@@ -532,6 +654,7 @@ class AuraClient extends ChangeNotifier {
                 time: msg['sentAt'],
                 status: mine ? Status.sent : Status.delivered,
                 file: file,
+                files: files,
               ),
             );
         if (!mine) _sendReceipt(from, Status.delivered, [id]);
@@ -580,6 +703,12 @@ class AuraClient extends ChangeNotifier {
             _deliver(to, m);
           }
         }
+        _deletes.toList().forEach(_sendDelete);
+      case 'sent' when _deletes.any((d) => d['id'] == msg['id']):
+        // Удаление у всех готово, когда дошло до собеседника, у себя — когда до своих устройств.
+        if (_deletes.any((d) => d['id'] == msg['id'] && (d['everyone'] == true) == (msg['to'] != nick))) {
+          _dropDelete(msg['id']);
+        }
       case 'sent' when msg['to'] != nick:
         for (final list in chats.values) {
           for (final m in list.where((m) => m.id == msg['id'] && m.status == Status.pending)) {
@@ -591,6 +720,7 @@ class AuraClient extends ChangeNotifier {
         // У получателя появилось или пропало устройство: берём новый список и шифруем заново.
         final String to = msg['to'];
         _devices.remove(to);
+        _deletes.where((d) => d['id'] == msg['id']).toList().forEach(_sendDelete);
         for (final MapEntry(key: peer, value: list) in chats.entries) {
           for (final m in list.where((m) => m.id == msg['id'])) {
             if (to == nick) {
@@ -600,6 +730,8 @@ class AuraClient extends ChangeNotifier {
             }
           }
         }
+      case 'error' when _deletes.any((d) => d['id'] == msg['id']):
+        _dropDelete(msg['id']); // сервер не принял уведомление об удалении, повторять бесполезно
       case 'error' when msg['id'] != null && msg['to'] != nick:
         // Сервер отклонил сообщение: «не отправлено», заново по нажатию. Копии на свои устройства не в счёт.
         for (final list in chats.values) {
@@ -631,7 +763,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes}));
     notifyListeners();
   }
 

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:aura/client.dart';
@@ -45,5 +46,40 @@ void main() {
     final parts = await http.runWithClient(() => client.fileParts({...file}).toList(), () => server);
     expect(peak, 4);
     expect(parts.expand((p) => p).toList(), data);
+  });
+
+  test('удаление у себя убирает альбом из истории и ждёт отправки на свои устройства', () async {
+    final album = {
+      'id': 'm1',
+      'mine': false,
+      'text': '',
+      'time': 1,
+      'status': 'read',
+      'files': [
+        {'id': 'f1', 'key': 'k', 'name': 'a.jpg', 'size': 3},
+        {'id': 'f2', 'key': 'k', 'name': 'b.mp4', 'size': 3, 'video': true},
+      ],
+    };
+    SharedPreferences.setMockInitialValues({
+      'chats': jsonEncode({
+        'chats': {
+          'oleg': [album, {...album, 'id': 'm2', 'files': null, 'text': 'привет'}],
+        },
+        'names': {},
+        'lastRead': {},
+      }),
+    });
+    client.chats.clear();
+    await client.load();
+    final m = client.chats['oleg']!.first;
+    expect(m.files, hasLength(2));
+    expect(m.preview, 'Альбом: 2');
+    expect(Message.fromJson(jsonDecode(jsonEncode(m))).attachments.map((f) => f['id']), ['f1', 'f2']);
+
+    client.delete('oleg', [m]);
+    expect(client.chats['oleg']!.map((m) => m.id), ['m2']);
+    final saved = jsonDecode((await SharedPreferences.getInstance()).getString('chats')!);
+    expect(saved['chats']['oleg'], hasLength(1));
+    expect(saved['deletes'].single, containsPair('ids', ['m1']), reason: 'без связи удаление ждёт подключения');
   });
 }
