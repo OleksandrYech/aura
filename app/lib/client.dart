@@ -113,8 +113,13 @@ class AuraClient extends ChangeNotifier {
   /// Время последнего прочтения чата.
   final lastRead = <String, int>{};
 
-  /// Удаления, которые ещё не дошли до сервера: {id, peer, ids, everyone, files}.
+  /// Удаления, которые ещё не дошли до сервера: {id, peer, ids, everyone, files, wait}.
+  /// wait — кому уведомление ушло и ждёт подтверждения сервера: собеседнику и (или) себе.
   final _deletes = <Map<String, dynamic>>[];
+
+  /// id недавно удалённых сообщений: повторная доставка (ответ ack не дошёл) не вернёт их в чат.
+  // ponytail: последние 1000, держать дольше, если удалённое начнёт возвращаться.
+  final _gone = <String>{};
 
   /// Ключи этого устройства; есть, пока выполнен вход.
   SignalKeys? _keys;
@@ -155,6 +160,7 @@ class AuraClient extends ChangeNotifier {
       names.addAll((j['names'] as Map<String, dynamic>).cast());
       lastRead.addAll((j['lastRead'] as Map<String, dynamic>).cast());
       _deletes.addAll((j['deletes'] as List? ?? []).cast());
+      _gone.addAll((j['gone'] as List? ?? []).cast());
     }
     if (signedIn && _keys != null) {
       _connect();
@@ -233,6 +239,7 @@ class AuraClient extends ChangeNotifier {
     names.clear();
     lastRead.clear();
     _deletes.clear();
+    _gone.clear();
     _devices.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
@@ -372,9 +379,12 @@ class AuraClient extends ChangeNotifier {
     }
   }
 
+  /// Файлы забываются по очереди: каждый переписывает общий список путей к оригиналам.
+  Future<void> _forgetting = Future.value();
+
   void _forget(Map<String, dynamic> file) {
     _files.remove(file['id']);
-    forgetFile(file);
+    _forgetting = _forgetting.then((_) => forgetFile(file));
   }
 
   // --- Удаление ---
@@ -403,8 +413,12 @@ class AuraClient extends ChangeNotifier {
     chats[peer]?.removeWhere((m) {
       if (!ids.contains(m.id) || (fromPeer && m.mine)) return false;
       m.attachments.forEach(_forget);
+      _gone.add(m.id);
       return true;
     });
+    while (_gone.length > 1000) {
+      _gone.remove(_gone.first);
+    }
   }
 
   void _sendDelete(Map<String, dynamic> d) => _serial(() async {
@@ -413,16 +427,21 @@ class AuraClient extends ChangeNotifier {
     final everyone = d['everyone'] == true;
     // Сначала сервер стирает файлы и ещё не доставленные копии, потом уходят уведомления.
     if (everyone) await _request('POST', _api('/api/unsend'), {'ids': d['ids'], 'files': d['files']});
-    final toPeer = everyone && await _sendCopy(peer, id, {'delete': d['ids']});
-    final toMine = await _sendCopy(nick!, id, {'delete': d['ids'], 'peer': peer});
-    // Ждём подтверждения сервера ('sent'), если было кому отправлять.
-    if (!(everyone ? toPeer : toMine)) _dropDelete(id);
+    // Ждём подтверждения сервера ('sent') по каждой копии; список готов до отправки, ответ может прийти сразу.
+    final wait = d['wait'] = [if (everyone) peer, nick];
+    if (everyone && !await _sendCopy(peer, id, {'delete': d['ids']})) wait.remove(peer);
+    if (!await _sendCopy(nick!, id, {'delete': d['ids'], 'peer': peer})) wait.remove(nick);
+    _delivered(id, null);
   });
 
-  void _dropDelete(Object? id) {
-    final before = _deletes.length;
-    _deletes.removeWhere((d) => d['id'] == id);
-    if (_deletes.length != before) _save();
+  /// Сервер принял (или отклонил, тогда повторять бесполезно) уведомление об удалении для [to].
+  /// Когда ждать больше некого, удаление закончено.
+  void _delivered(Object? id, String? to) {
+    for (final d in _deletes.where((d) => d['id'] == id && d['wait'] is List).toList()) {
+      (d['wait'] as List).remove(to);
+      if ((d['wait'] as List).isEmpty) _deletes.remove(d);
+    }
+    _save();
   }
 
   /// Без [id] создаёт загрузку размером [at] байт (итог всех зашифрованных частей),
@@ -622,7 +641,7 @@ class AuraClient extends ChangeNotifier {
   Future<void> _receive(Map<String, dynamic> msg) async {
     final String id = msg['id'], from = msg['from'];
     // Дубль (повторная доставка) не расшифровываем второй раз.
-    if (!chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
+    if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
       String text;
       Map<String, dynamic>? content, file;
@@ -705,10 +724,7 @@ class AuraClient extends ChangeNotifier {
         }
         _deletes.toList().forEach(_sendDelete);
       case 'sent' when _deletes.any((d) => d['id'] == msg['id']):
-        // Удаление у всех готово, когда дошло до собеседника, у себя — когда до своих устройств.
-        if (_deletes.any((d) => d['id'] == msg['id'] && (d['everyone'] == true) == (msg['to'] != nick))) {
-          _dropDelete(msg['id']);
-        }
+        _delivered(msg['id'], msg['to']);
       case 'sent' when msg['to'] != nick:
         for (final list in chats.values) {
           for (final m in list.where((m) => m.id == msg['id'] && m.status == Status.pending)) {
@@ -731,7 +747,7 @@ class AuraClient extends ChangeNotifier {
           }
         }
       case 'error' when _deletes.any((d) => d['id'] == msg['id']):
-        _dropDelete(msg['id']); // сервер не принял уведомление об удалении, повторять бесполезно
+        _delivered(msg['id'], msg['to']); // сервер не принял уведомление, повторять бесполезно
       case 'error' when msg['id'] != null && msg['to'] != nick:
         // Сервер отклонил сообщение: «не отправлено», заново по нажатию. Копии на свои устройства не в счёт.
         for (final list in chats.values) {
@@ -763,7 +779,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone]}));
     notifyListeners();
   }
 
