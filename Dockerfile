@@ -19,6 +19,8 @@ RUN cd app && flutter build web --release --no-web-resources-cdn
 RUN cd server && dart build cli -o /out
 
 FROM debian:bookworm-slim
+# Корневые сертификаты: сервер сам ходит по HTTPS (push через Firebase).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/bundle /aura
 COPY --from=build /src/app/build/web /aura/web
 RUN mkdir /data && chown 1000:1000 /data
