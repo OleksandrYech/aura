@@ -1,6 +1,8 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../call.dart';
 import '../client.dart';
@@ -59,13 +61,14 @@ class _CallScreenState extends State<CallScreen> {
     }
     return switch (calls.state) {
       CallState.calling => 'Вызов…',
-      CallState.ringing => 'Входящий звонок',
+      CallState.ringing => calls.peerVideo ? 'Входящий видеозвонок' : 'Входящий звонок',
       _ => 'Соединение…',
     };
   }
 
   Widget _button(IconData icon, String label, VoidCallback? onTap, {Color? color, bool on = false}) {
     final c = AuraColors.of(context);
+    final ink = _onVideo ? Colors.white : c.ink;
     return Column(mainAxisSize: MainAxisSize.min, children: [
       IconButton.filled(
         iconSize: 32,
@@ -79,43 +82,136 @@ class _CallScreenState extends State<CallScreen> {
         icon: Icon(icon),
       ),
       const SizedBox(height: 8),
-      Text(label, style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.7))),
+      Text(label, style: TextStyle(fontSize: 13, color: ink.withValues(alpha: 0.7))),
     ]);
   }
+
+  /// Во весь экран видео собеседника, а пока его нет — своё превью.
+  RTCVideoRenderer? get _big => calls.state == CallState.idle
+      ? null
+      : calls.peerVideo && calls.state != CallState.ringing
+      ? calls.remote
+      : calls.video
+      ? calls.local
+      : null;
+
+  bool get _onVideo => _big != null;
 
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
     final name = calls.peer == null ? '' : client.title(calls.peer!);
     final live = calls.state != CallState.idle;
+    final big = _big;
+    final ink = _onVideo ? Colors.white : c.ink;
+    final small = big == calls.remote && calls.video;
     return Material(
-      color: c.cream,
-      child: SafeArea(
-        child: Column(children: [
-          const Spacer(),
-          Avatar(name, size: 112),
-          const SizedBox(height: 24),
-          Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
-          const SizedBox(height: 8),
-          Text(_status, style: TextStyle(fontSize: 16, color: c.ink.withValues(alpha: 0.6))),
-          const Spacer(flex: 2),
-          if (live)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 48),
-              child: calls.state == CallState.ringing
-                  ? Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                      _button(Icons.call_end, 'Отклонить', calls.hangup, color: Colors.red.shade600),
-                      _button(Icons.call, 'Ответить', calls.accept, color: Colors.green.shade600),
-                    ])
-                  : Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                      _button(calls.muted ? Icons.mic_off : Icons.mic_none, 'Микрофон', calls.toggleMute,
-                          on: calls.muted),
-                      _button(Icons.call_end, 'Завершить', calls.hangup, color: Colors.red.shade600),
-                      _button(Icons.volume_up_outlined, 'Динамик', calls.toggleSpeaker, on: calls.speaker),
-                    ]),
+      color: big != null ? Colors.black : c.cream,
+      child: Stack(
+        children: [
+          if (big != null)
+            Positioned.fill(
+              child: RTCVideoView(
+                big,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                mirror: big == calls.local && calls.front,
+              ),
             ),
-        ]),
+          SafeArea(child: _controls(c, name, live, ink)),
+          if (small)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.topRight,
+                child: Container(
+                  margin: const EdgeInsets.all(16),
+                  width: 110,
+                  height: 160,
+                  clipBehavior: Clip.antiAlias,
+                  decoration: BoxDecoration(borderRadius: BorderRadius.circular(16), color: Colors.black),
+                  child: RTCVideoView(
+                    calls.local,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                    mirror: calls.front,
+                  ),
+                ),
+              ),
+            ),
+          if (calls.video && !kIsWeb && live)
+            SafeArea(
+              child: Align(
+                alignment: small ? const Alignment(1, -0.35) : Alignment.topRight,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: IconButton.filled(
+                    tooltip: 'Сменить камеру',
+                    style: IconButton.styleFrom(backgroundColor: Colors.black45, foregroundColor: Colors.white),
+                    onPressed: calls.switchCamera,
+                    icon: const Icon(Icons.cameraswitch_outlined),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
+
+  Widget _controls(AuraColors c, String name, bool live, Color ink) => Column(
+    children: [
+      if (_onVideo) ...[
+        const SizedBox(height: 24),
+        Text(
+          name,
+          style: TextStyle(fontSize: 22, fontWeight: FontWeight.w500, color: ink),
+        ),
+        const SizedBox(height: 4),
+        Text(_status, style: TextStyle(fontSize: 15, color: ink.withValues(alpha: 0.8))),
+        const Spacer(),
+      ] else ...[
+        const Spacer(),
+        Avatar(name, size: 112),
+        const SizedBox(height: 24),
+        Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
+        const SizedBox(height: 8),
+        Text(_status, style: TextStyle(fontSize: 16, color: c.ink.withValues(alpha: 0.6))),
+        const Spacer(flex: 2),
+      ],
+      if (live)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 48),
+          child: calls.state == CallState.ringing
+              ? Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    _button(Icons.call_end, 'Отклонить', calls.hangup, color: Colors.red.shade600),
+                    _button(
+                      calls.peerVideo ? Icons.videocam : Icons.call,
+                      'Ответить',
+                      calls.accept,
+                      color: Colors.green.shade600,
+                    ),
+                  ],
+                )
+              : Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    _button(
+                      calls.muted ? Icons.mic_off : Icons.mic_none,
+                      'Микрофон',
+                      calls.toggleMute,
+                      on: calls.muted,
+                    ),
+                    _button(
+                      calls.video ? Icons.videocam : Icons.videocam_off_outlined,
+                      'Камера',
+                      calls.toggleCamera,
+                      on: calls.video,
+                    ),
+                    _button(Icons.call_end, 'Завершить', calls.hangup, color: Colors.red.shade600),
+                    _button(Icons.volume_up_outlined, 'Динамик', calls.toggleSpeaker, on: calls.speaker),
+                  ],
+                ),
+        ),
+    ],
+  );
 }
