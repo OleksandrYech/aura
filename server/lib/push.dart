@@ -33,6 +33,8 @@ class Fcm {
         },
       }),
     );
+    // Остальные отказы (чужой проект, нет прав у ключа) иначе не видны нигде.
+    if (r.statusCode != 200) print('push: Firebase ответил ${r.statusCode}: ${r.body}');
     return !(r.statusCode == 404 || (r.statusCode == 400 && r.body.contains('UNREGISTERED')));
   }
 }

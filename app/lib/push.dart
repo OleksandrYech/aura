@@ -24,6 +24,10 @@ const _callId = 1, _messageId = 2;
 /// из убитого приложения «Отклонить» только гасит уведомление.
 void Function(String action)? onCallAction;
 
+/// Живое приложение решает, звонить ли по push о звонке: этот звонок оно могло уже получить
+/// по соединению и отклонить, а push пришёл позже.
+bool Function()? callPushWanted;
+
 const _actionPort = 'aura_call_action';
 
 /// «Отклонить» не открывает приложение, и плагин отдаёт её отдельному isolate: пересылаем основному.
@@ -44,7 +48,8 @@ final _ready = _notes.initialize(
 /// Основной isolate принимает кнопки звонка. Возвращает кнопку, которой приложение запустили, если так.
 Future<String?> initCallActions() async {
   if (!_android) return null;
-  final port = ReceivePort()..listen((a) => onCallAction?.call(a as String));
+  final port = ReceivePort()
+    ..listen((a) => a is SendPort ? a.send(callPushWanted?.call() ?? true) : onCallAction?.call(a as String));
   IsolateNameServer.removePortNameMapping(_actionPort);
   IsolateNameServer.registerPortWithName(port.sendPort, _actionPort);
   try {
@@ -58,13 +63,15 @@ Future<String?> initCallActions() async {
 
 /// Уведомление о входящем звонке или сообщении. В push только вид события: от кого и что,
 /// приложение узнает, когда откроется и заберёт зашифрованное сообщение.
-Future<void> notify(String kind) async {
-  if (!_android) return;
-  try {
-    await _show(kind);
-  } catch (e) {
-    debugPrint('AURA: уведомление: $e');
-  }
+Future<void> notify(String kind) => _then(() => _show(kind));
+
+/// Показ и отмена по очереди: иначе быстрый отказ отменит уведомление раньше, чем оно покажется,
+/// и звонок в шторке останется звонить.
+Future<void> _queue = Future.value();
+
+Future<void> _then(Future<void> Function() f) {
+  if (!_android) return Future.value();
+  return _queue = _queue.then((_) => f()).catchError((Object e) => debugPrint('AURA: уведомление: $e'));
 }
 
 Future<void> _show(String kind) async {
@@ -105,18 +112,27 @@ Future<void> _show(String kind) async {
   }
 }
 
-Future<void> cancelCallNote() async {
-  if (_android) await _notes.cancel(id: _callId);
-}
+Future<void> cancelCallNote() => _then(() => _notes.cancel(id: _callId));
 
-Future<void> cancelNotes() async {
-  if (_android) await _notes.cancelAll();
-}
+Future<void> cancelNotes() => _then(_notes.cancelAll);
 
 @pragma('vm:entry-point')
 Future<void> _background(RemoteMessage m) async {
+  final kind = m.data['kind'] ?? 'message';
+  if (kind == 'call' && !await _mainWantsCall()) return;
   await Firebase.initializeApp(options: _options);
-  await notify(m.data['kind'] ?? 'message');
+  await notify(kind);
+}
+
+Future<bool> _mainWantsCall() async {
+  final main = IsolateNameServer.lookupPortByName(_actionPort);
+  if (main == null) return true;
+  final reply = ReceivePort();
+  main.send(reply.sendPort);
+  // Нет ответа: приложение закрыли, а имя порта осталось.
+  final wanted = await reply.first.timeout(const Duration(seconds: 2), onTimeout: () => true);
+  reply.close();
+  return wanted as bool;
 }
 
 /// Включает push и отдаёт токен устройства в [register] сейчас и при каждой смене.

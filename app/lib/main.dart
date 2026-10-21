@@ -27,7 +27,10 @@ void _notifications() {
   client.onIncoming = () {
     if (background()) notify('message');
   };
+  var busyUntil = DateTime(0); // до этого времени push о звонке — про звонок, который уже был
+  callPushWanted = () => DateTime.now().isAfter(busyUntil);
   calls.addListener(() {
+    if (calls.state != CallState.idle) busyUntil = DateTime.now().add(Calls.ring);
     if (calls.state == CallState.ringing && launchedBy == 'answer') {
       launchedBy = null;
       calls.accept();
