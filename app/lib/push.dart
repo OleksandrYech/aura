@@ -17,12 +17,31 @@ bool get _android => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 final _notes = FlutterLocalNotificationsPlugin();
 const _callId = 1, _messageId = 2;
 
+/// Кнопка в уведомлении о звонке: 'answer' или 'decline'. Работает, пока приложение живо;
+/// из убитого приложения «Отклонить» только гасит уведомление.
+void Function(String action)? onCallAction;
+
+@pragma('vm:entry-point')
+void _backgroundAction(NotificationResponse r) {}
+
 /// Уведомление о входящем звонке или сообщении. В push только вид события: от кого и что,
 /// приложение узнает, когда откроется и заберёт зашифрованное сообщение.
 Future<void> notify(String kind) async {
   if (!_android) return;
+  try {
+    await _show(kind);
+  } catch (e) {
+    debugPrint('AURA: уведомление: $e');
+  }
+}
+
+Future<void> _show(String kind) async {
   await _notes.initialize(
-    settings: const InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher')),
+    settings: const InitializationSettings(android: AndroidInitializationSettings('ic_notification')),
+    onDidReceiveNotificationResponse: (r) {
+      if (r.actionId != null) onCallAction?.call(r.actionId!);
+    },
+    onDidReceiveBackgroundNotificationResponse: _backgroundAction,
   );
   if (kind == 'call') {
     await _notes.show(
@@ -41,6 +60,10 @@ Future<void> notify(String kind) async {
           sound: const RawResourceAndroidNotificationSound('aura_ring'),
           additionalFlags: Int32List.fromList([4]), // FLAG_INSISTENT: мелодия повторяется
           timeoutAfter: 45000, // дольше звонок не ждёт
+          actions: const [
+            AndroidNotificationAction('decline', 'Отклонить'),
+            AndroidNotificationAction('answer', 'Ответить', showsUserInterface: true),
+          ],
         ),
       ),
     );
