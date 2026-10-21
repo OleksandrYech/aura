@@ -122,8 +122,9 @@ class Calls extends ChangeNotifier {
           return;
         }
         _offer = s;
-        _set(CallState.ringing, from, s['id']);
+        // Таймер до _set: слушатель может сразу ответить, и accept() должен его отменить.
         _timeout = Timer(ring, () => _finish('Пропущенный звонок'));
+        _set(CallState.ringing, from, s['id']);
       case 'answer' when mine && state == CallState.calling:
         _timeout?.cancel();
         state = CallState.connecting;
