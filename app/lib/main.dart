@@ -22,28 +22,56 @@ Future<void> main() async {
 void _notifications() {
   bool background() => WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed;
   var ringing = false;
-  String? launchedBy; // «Ответить» из убитого приложения: звонок придёт, когда соединимся
-  initCallActions().then((a) => launchedBy = a);
+  // Кнопка в уведомлении, нажатая раньше, чем сам звонок дошёл по соединению: push обгоняет его,
+  // а из убитого приложения «Ответить» запускает приложение до соединения. Применяем, когда звонок придёт.
+  String? pending;
+  var pendingUntil = DateTime(0);
+  void later(String action) {
+    pending = action;
+    pendingUntil = DateTime.now().add(Calls.ring);
+  }
+
+  initCallActions().then((a) {
+    if (a != null) later(a);
+  });
   client.onIncoming = () {
     if (background()) notify('message');
   };
   var busyUntil = DateTime(0); // до этого времени push о звонке — про звонок, который уже был
-  callPushWanted = () => DateTime.now().isAfter(busyUntil);
+  callPushWanted = () {
+    final wanted = DateTime.now().isAfter(busyUntil);
+    if (wanted) client.checkConnection(); // звонок не дошёл: соединение могло умереть в фоне
+    return wanted;
+  };
   calls.addListener(() {
     if (calls.state != CallState.idle) busyUntil = DateTime.now().add(Calls.ring);
-    if (calls.state == CallState.ringing && launchedBy == 'answer') {
-      launchedBy = null;
-      calls.accept();
+    if (calls.state == CallState.ringing && pending != null) {
+      final action = pending;
+      pending = null;
+      if (DateTime.now().isBefore(pendingUntil)) {
+        cancelCallNote();
+        action == 'answer' ? calls.accept() : calls.hangup();
+        return;
+      }
     }
     if (calls.state == CallState.ringing && !ringing && background()) notify('call');
     if (ringing && calls.state != CallState.ringing) cancelCallNote();
     ringing = calls.state == CallState.ringing;
   });
   onCallAction = (action) {
-    if (calls.state != CallState.ringing) return;
-    action == 'answer' ? calls.accept() : calls.hangup();
+    if (calls.state == CallState.ringing) {
+      action == 'answer' ? calls.accept() : calls.hangup();
+    } else if (calls.state == CallState.idle) {
+      later(action);
+      client.checkConnection();
+    }
   };
-  AppLifecycleListener(onResume: cancelNotes);
+  AppLifecycleListener(
+    onResume: () {
+      cancelNotes();
+      client.checkConnection();
+    },
+  );
   initPush(client.setPushToken);
 }
 

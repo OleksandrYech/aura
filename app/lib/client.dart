@@ -860,14 +860,15 @@ class AuraClient extends ChangeNotifier {
   void _sendPushToken() =>
       _request('PUT', _api('/api/push'), {'token': _pushToken}).catchError((Object e) => debugPrint('AURA: push-токен: $e'));
 
-  /// Будить ли получателя push: только ради сообщений переписки и входящего звонка, не своих устройств.
+  /// Будить ли получателя push: ради сообщений переписки и звонка, не своих устройств.
+  /// end — звонок отменили или ответили на другом устройстве: закрытое приложение гасит уведомление.
   String? _pushKind(String target, Map<String, dynamic> content) => target == nick
       ? null
-      : (content['call'] as Map?)?['type'] == 'offer'
-      ? 'call'
-      : content.containsKey('text')
-      ? 'message'
-      : null;
+      : switch ((content['call'] as Map?)?['type']) {
+          'offer' => 'call',
+          'end' || 'taken' => 'end',
+          _ => content.containsKey('text') ? 'message' : null,
+        };
 
   /// Сигналы звонка (предложение, ответ, сброс) идут зашифрованными сообщениями, но в переписку не попадают.
   void Function(String from, int device, int sentAt, Map<String, dynamic> signal)? onCall;
@@ -992,8 +993,30 @@ class AuraClient extends ChangeNotifier {
     _wsSend({'type': 'ack', 'id': id});
   }
 
+  Timer? _probe;
+
+  /// Проверить соединение сейчас, не дожидаясь паузы между попытками: в фоне оно могло
+  /// умереть незаметно и выглядеть живым. Нет ответа на ping за 5 секунд — подключаемся заново.
+  void checkConnection() {
+    if (!signedIn || _keys == null) return;
+    if (!connected) {
+      if (_retry?.isActive ?? false) _connect();
+      return;
+    }
+    if (_probe?.isActive ?? false) return;
+    _wsSend({'type': 'ping'});
+    _probe = Timer(const Duration(seconds: 5), () {
+      final dead = _ws;
+      connected = false;
+      _connect(); // старое соединение закроется позже, _onClosed его уже не учтёт
+      dead?.sink.close();
+      notifyListeners();
+    });
+  }
+
   void _connect() {
     _retry?.cancel();
+    _probe?.cancel();
     final ws = WebSocketChannel.connect(Uri.parse(server.replaceFirst('http', 'ws')).replace(path: '/ws'));
     _ws = ws;
     ws.sink.add(jsonEncode({'type': 'auth', 'token': token}));
@@ -1024,6 +1047,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _onMessage(Map<String, dynamic> msg) {
+    _probe?.cancel(); // соединение живо
     switch (msg['type']) {
       case 'ready':
         connected = true;

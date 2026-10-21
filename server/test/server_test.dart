@@ -134,7 +134,12 @@ void main() {
 
     await send('m1', 'call');
     await send('r1'); // подтверждения и служебное не будят
-    expect(pushed, [('den1', 'call')]);
+    await send('e1', 'end'); // звонок отменён: уведомление о нём гаснет
+    expect(pushed, [('den1', 'call'), ('den1', 'end')]);
+
+    annaWs.sink.add(jsonEncode({'type': 'ping'}));
+    expect(await annaIn.moveNext(), isTrue);
+    expect(annaIn.current, {'type': 'pong'});
 
     final (denWs, _) = await connect(den['token']);
     await send('m2', 'message');

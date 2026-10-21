@@ -112,13 +112,17 @@ Future<void> _show(String kind) async {
   }
 }
 
-Future<void> cancelCallNote() => _then(() => _notes.cancel(id: _callId));
+Future<void> cancelCallNote() => _then(() async {
+  await _ready;
+  await _notes.cancel(id: _callId);
+});
 
 Future<void> cancelNotes() => _then(_notes.cancelAll);
 
 @pragma('vm:entry-point')
 Future<void> _background(RemoteMessage m) async {
   final kind = m.data['kind'] ?? 'message';
+  if (kind == 'end') return cancelCallNote();
   if (kind == 'call' && !await _mainWantsCall()) return;
   await Firebase.initializeApp(options: _options);
   await notify(kind);

@@ -28,8 +28,8 @@ class Fcm {
         'message': {
           'token': token,
           'data': {'kind': kind},
-          // Звонок без ответа через 45 секунд уже пропущен, будить позже незачем.
-          'android': {'priority': 'HIGH', 'ttl': kind == 'call' ? '45s' : '86400s'},
+          // Звонок и его отмена через 45 секунд уже не нужны, будить позже незачем.
+          'android': {'priority': 'HIGH', 'ttl': kind == 'message' ? '86400s' : '45s'},
         },
       }),
     );

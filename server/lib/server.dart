@@ -532,7 +532,8 @@ class AuraServer {
 
   // --- WebSocket ---
   // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}], push?}, {type: ack, id}
-  // push: message или call — разбудить устройства получателя.
+  // push: message, call или end (звонок отменён) — разбудить устройства получателя.
+  // {type: ping} → {type: pong}: клиент проверяет, живо ли соединение.
   // Сервер → клиент: {type: ready, device, preKeys}, {type: sent, id, to},
   //   {type: message, id, from, device, ctype, body, sentAt}, {type: error, id?, to?, error}
   // body — шифротекст Signal (base64), ctype — его тип (2 обычное, 3 с установкой сессии).
@@ -565,6 +566,8 @@ class AuraServer {
         switch (msg['type']) {
           case 'send':
             _send(me!, ws, msg);
+          case 'ping':
+            ws.sink.add(jsonEncode({'type': 'pong'}));
           case 'ack' when msg['id'] is String:
             db.execute('DELETE FROM messages WHERE id = ? AND recipient = ? AND recipient_device = ?', [
               msg['id'],
@@ -621,7 +624,7 @@ class AuraServer {
       final d = (nick: to, device: p['device'] as int);
       // Будим и тех, кто на связи: свёрнутое приложение Android замораживает, и соединение
       // ещё живо, а сообщение не обрабатывается. Открытое на экране приложение push не показывает.
-      if (wake == 'message' || wake == 'call') _wake(d, wake);
+      if (wake == 'message' || wake == 'call' || wake == 'end') _wake(d, wake);
       _online[d]?.sink.add(
         jsonEncode({
           'type': 'message',
