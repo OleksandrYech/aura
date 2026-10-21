@@ -30,6 +30,10 @@ void _notifications() {
     if (ringing && calls.state != CallState.ringing) cancelCallNote();
     ringing = calls.state == CallState.ringing;
   });
+  onCallAction = (action) {
+    if (calls.state != CallState.ringing) return;
+    action == 'answer' ? calls.accept() : calls.hangup();
+  };
   AppLifecycleListener(onResume: cancelNotes);
   initPush(client.setPushToken);
 }
