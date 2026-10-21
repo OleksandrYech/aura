@@ -10,7 +10,7 @@ import 'client.dart';
 
 enum CallState { idle, calling, ringing, connecting, active }
 
-/// Голосовой звонок один на один через WebRTC. Звук шифруется DTLS-SRTP, а предложение и ответ
+/// Звонок один на один через WebRTC, голосовой или с видео. Звук и видео шифруются DTLS-SRTP, а предложение и ответ
 /// идут зашифрованными сообщениями Signal: подменить их сервер не может.
 /// Кандидаты ICE не шлём по одному: ждём, пока соберутся, и кладём их в само предложение и ответ.
 class Calls extends ChangeNotifier {
@@ -25,8 +25,18 @@ class Calls extends ChangeNotifier {
   bool muted = false, speaker = false;
   DateTime? since;
 
+  /// Своя камера включена; камера собеседника включена; своя камера — фронтальная.
+  bool video = false, peerVideo = false, front = true;
+
+  /// Видео собеседника и своё превью.
+  final remote = RTCVideoRenderer(), local = RTCVideoRenderer();
+
   RTCPeerConnection? _pc;
-  MediaStream? _mic;
+  MediaStream? _mic, _cam, _peerVideo;
+
+  /// Видеоканал есть в каждом звонке с самого начала: камеру включают и выключают заменой дорожки,
+  /// без повторного обмена предложением и ответом.
+  RTCRtpSender? _videoSender;
   Map<String, dynamic>? _offer;
   Timer? _timeout;
 
@@ -77,14 +87,19 @@ class Calls extends ChangeNotifier {
 
   Future<void> _toneQueue = Future.value();
 
-  Future<void> start(String to) async {
+  Future<void> start(String to, {bool video = false}) async {
     if (state != CallState.idle) return;
     _set(CallState.calling, to, '${DateTime.now().microsecondsSinceEpoch}${Random.secure().nextInt(1 << 30)}');
     try {
       final pc = await _connect();
+      _videoSender = (await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+      )).sender;
+      if (video) await _camera(true);
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc)});
+      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc), 'video': this.video});
       _timeout = Timer(ring, () => _finish('Нет ответа', notify: true));
     } catch (e) {
       debugPrint('AURA: звонок $to: $e');
@@ -100,8 +115,23 @@ class Calls extends ChangeNotifier {
     try {
       final pc = await _connect();
       await pc.setRemoteDescription(RTCSessionDescription(_offer!['sdp'], 'offer'));
+      // Видеоканал создало предложение; без SendRecv своё видео по нему не пойдёт.
+      for (final t in await pc.getTransceivers()) {
+        if (t.receiver.track?.kind == 'video') {
+          await t.setDirection(TransceiverDirection.SendRecv);
+          _videoSender = t.sender;
+        }
+      }
+      // На видеозвонок отвечаем с камерой.
+      if (_offer!['video'] == true) await _camera(true);
       await pc.setLocalDescription(await pc.createAnswer());
-      client.sendCall(peer!, {'type': 'answer', 'id': _id, 'sdp': await _gathered(pc), 'device': client.device});
+      client.sendCall(peer!, {
+        'type': 'answer',
+        'id': _id,
+        'sdp': await _gathered(pc),
+        'device': client.device,
+        'video': video,
+      });
     } catch (e) {
       debugPrint('AURA: ответ на звонок: $e');
       _finish('Нет доступа к микрофону', notify: true);
@@ -117,6 +147,53 @@ class Calls extends ChangeNotifier {
       t.enabled = !muted;
     }
     notifyListeners();
+  }
+
+  Future<void> toggleCamera() async {
+    await _camera(!video);
+    if (state != CallState.idle) client.sendCall(peer!, {'type': 'video', 'id': _id, 'on': video});
+  }
+
+  Future<void> switchCamera() async {
+    final t = _cam?.getVideoTracks().firstOrNull;
+    if (t == null) return;
+    front = await Helper.switchCamera(t);
+    notifyListeners();
+  }
+
+  /// Камера не нужна, чтобы разговаривать: если её нет или не дали доступ, звонок идёт без видео.
+  Future<void> _camera(bool on) async {
+    try {
+      if (on && _videoSender != null && _cam == null) {
+        final cam = _cam = await navigator.mediaDevices.getUserMedia({
+          'audio': false,
+          'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
+        });
+        if (state == CallState.idle) {
+          _stopCamera(); // звонок кончился, пока ждали доступ
+          return;
+        }
+        await _videoSender!.replaceTrack(cam.getVideoTracks().first);
+        local.srcObject = cam;
+        video = true;
+        front = true;
+      } else if (!on && _cam != null) {
+        await _videoSender?.replaceTrack(null);
+        _stopCamera();
+      }
+    } catch (e) {
+      debugPrint('AURA: камера: $e');
+      _stopCamera();
+    }
+    notifyListeners();
+  }
+
+  void _stopCamera() {
+    _cam?.getTracks().forEach((t) => t.stop());
+    _cam?.dispose();
+    _cam = null;
+    local.srcObject = null;
+    video = false;
   }
 
   Future<void> toggleSpeaker() async {
@@ -136,16 +213,20 @@ class Calls extends ChangeNotifier {
         _offer = s;
         // Таймер до _set: слушатель может сразу ответить, и accept() должен его отменить.
         _timeout = Timer(ring, () => _finish('Пропущенный звонок'));
-        _set(CallState.ringing, from, s['id']);
+        _set(CallState.ringing, from, s['id'], peerVideo: s['video'] == true);
       case 'answer' when mine && state == CallState.calling:
         _timeout?.cancel();
         state = CallState.connecting;
+        peerVideo = s['video'] == true;
         notifyListeners();
         _pc?.setRemoteDescription(RTCSessionDescription(s['sdp'], 'answer'));
         // Остальные устройства собеседника перестают звонить.
         client.sendCall(from, {'type': 'taken', 'id': _id, 'device': s['device']});
       case 'taken' when mine && state == CallState.ringing && s['device'] != client.device:
         _finish('Ответили на другом устройстве');
+      case 'video' when mine:
+        peerVideo = s['on'] == true;
+        notifyListeners();
       case 'busy' when mine:
         _finish('Занято');
       case 'end' when mine:
@@ -157,19 +238,20 @@ class Calls extends ChangeNotifier {
     }
   }
 
-  void _set(CallState s, String with_, String id) {
+  void _set(CallState s, String with_, String id, {bool peerVideo = false}) {
     state = s;
     peer = with_;
     _id = id;
     ended = null;
     muted = speaker = false;
+    this.peerVideo = peerVideo;
     since = null;
     notifyListeners();
   }
 
   Future<RTCPeerConnection> _connect() async {
     if (!_audioReady) {
-      await _audio.initialize();
+      await Future.wait([_audio.initialize(), remote.initialize(), local.initialize()]);
       _audioReady = true;
     }
     _mic = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
@@ -177,13 +259,23 @@ class Calls extends ChangeNotifier {
     for (final t in _mic!.getAudioTracks()) {
       await pc.addTrack(t, _mic!);
     }
-    pc.onTrack = (e) {
-      if (e.streams.isNotEmpty) _audio.srcObject = e.streams.first;
+    pc.onTrack = (e) async {
+      if (e.track.kind == 'video') {
+        // Видео идёт без потока: собираем свой, чтобы рендерер его показал. На вебе в нём нет звука,
+        // иначе голос собеседника играл бы дважды.
+        final s = _peerVideo ??= await createLocalMediaStream('peer');
+        await s.addTrack(e.track);
+        remote.srcObject = s;
+      } else if (e.streams.isNotEmpty) {
+        _audio.srcObject = e.streams.first;
+      }
     };
     pc.onConnectionState = (s) {
       if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected && state == CallState.connecting) {
         state = CallState.active;
         since = DateTime.now();
+        // Видеозвонок держат перед собой, а не у уха.
+        if ((video || peerVideo) && !speaker) toggleSpeaker();
         notifyListeners();
       } else if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
         _finish('Не удалось соединиться', notify: true);
@@ -213,6 +305,12 @@ class Calls extends ChangeNotifier {
     _mic?.getTracks().forEach((t) => t.stop());
     _mic?.dispose();
     _mic = null;
+    _stopCamera();
+    _videoSender = null;
+    _peerVideo?.dispose();
+    _peerVideo = null;
+    peerVideo = false;
+    remote.srcObject = null;
     _audio.srcObject = null;
     _offer = null;
     state = CallState.idle;

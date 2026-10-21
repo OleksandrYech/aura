@@ -591,6 +591,11 @@ class _ChatScreenState extends State<ChatScreen> {
               onPressed: () => calls.start(widget.peer),
             ),
             IconButton(
+              tooltip: 'Видеозвонок',
+              icon: const Icon(Icons.videocam_outlined),
+              onPressed: () => calls.start(widget.peer, video: true),
+            ),
+            IconButton(
               tooltip: 'Код безопасности',
               icon: const Icon(Icons.verified_user_outlined),
               onPressed: () => showDialog(context: context, builder: (_) => SafetyNumberDialog(peer: widget.peer)),
