@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+  workflow_dispatch: # ручной запуск, если push в main не запустил сборку
   pull_request:
 
 env:
