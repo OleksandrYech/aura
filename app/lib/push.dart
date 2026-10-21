@@ -1,3 +1,6 @@
+import 'dart:isolate';
+import 'dart:ui';
+
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
@@ -21,8 +24,37 @@ const _callId = 1, _messageId = 2;
 /// из убитого приложения «Отклонить» только гасит уведомление.
 void Function(String action)? onCallAction;
 
+const _actionPort = 'aura_call_action';
+
+/// «Отклонить» не открывает приложение, и плагин отдаёт её отдельному isolate: пересылаем основному.
 @pragma('vm:entry-point')
-void _backgroundAction(NotificationResponse r) {}
+void _backgroundAction(NotificationResponse r) {
+  if (r.actionId != null) IsolateNameServer.lookupPortByName(_actionPort)?.send(r.actionId);
+}
+
+/// Один раз на isolate: основной, фоновый push и фоновая кнопка у каждого свой.
+final _ready = _notes.initialize(
+  settings: const InitializationSettings(android: AndroidInitializationSettings('ic_notification')),
+  onDidReceiveNotificationResponse: (r) {
+    if (r.actionId != null) onCallAction?.call(r.actionId!);
+  },
+  onDidReceiveBackgroundNotificationResponse: _backgroundAction,
+);
+
+/// Основной isolate принимает кнопки звонка. Возвращает кнопку, которой приложение запустили, если так.
+Future<String?> initCallActions() async {
+  if (!_android) return null;
+  final port = ReceivePort()..listen((a) => onCallAction?.call(a as String));
+  IsolateNameServer.removePortNameMapping(_actionPort);
+  IsolateNameServer.registerPortWithName(port.sendPort, _actionPort);
+  try {
+    await _ready;
+    return (await _notes.getNotificationAppLaunchDetails())?.notificationResponse?.actionId;
+  } catch (e) {
+    debugPrint('AURA: уведомления: $e');
+    return null;
+  }
+}
 
 /// Уведомление о входящем звонке или сообщении. В push только вид события: от кого и что,
 /// приложение узнает, когда откроется и заберёт зашифрованное сообщение.
@@ -36,13 +68,7 @@ Future<void> notify(String kind) async {
 }
 
 Future<void> _show(String kind) async {
-  await _notes.initialize(
-    settings: const InitializationSettings(android: AndroidInitializationSettings('ic_notification')),
-    onDidReceiveNotificationResponse: (r) {
-      if (r.actionId != null) onCallAction?.call(r.actionId!);
-    },
-    onDidReceiveBackgroundNotificationResponse: _backgroundAction,
-  );
+  await _ready;
   if (kind == 'call') {
     await _notes.show(
       id: _callId,
