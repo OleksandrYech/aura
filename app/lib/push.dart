@@ -28,6 +28,10 @@ void Function(String action)? onCallAction;
 /// по соединению и отклонить, а push пришёл позже.
 bool Function()? callPushWanted;
 
+/// Push пришёл живому приложению: соединение могло умереть в фоне, а звонок или его отмена
+/// ждут на сервере.
+void Function()? onPushWake;
+
 const _actionPort = 'aura_call_action';
 
 /// «Отклонить» не открывает приложение, и плагин отдаёт её отдельному isolate: пересылаем основному.
@@ -49,7 +53,11 @@ final _ready = _notes.initialize(
 Future<String?> initCallActions() async {
   if (!_android) return null;
   final port = ReceivePort()
-    ..listen((a) => a is SendPort ? a.send(callPushWanted?.call() ?? true) : onCallAction?.call(a as String));
+    ..listen((a) => switch (a) {
+      SendPort reply => reply.send(callPushWanted?.call() ?? true),
+      'wake' => onPushWake?.call(),
+      _ => onCallAction?.call(a as String),
+    });
   IsolateNameServer.removePortNameMapping(_actionPort);
   IsolateNameServer.registerPortWithName(port.sendPort, _actionPort);
   try {
@@ -122,7 +130,10 @@ Future<void> cancelNotes() => _then(_notes.cancelAll);
 @pragma('vm:entry-point')
 Future<void> _background(RemoteMessage m) async {
   final kind = m.data['kind'] ?? 'message';
-  if (kind == 'end') return cancelCallNote();
+  if (kind == 'end') {
+    IsolateNameServer.lookupPortByName(_actionPort)?.send('wake'); // живое приложение заберёт отмену
+    return cancelCallNote();
+  }
   if (kind == 'call' && !await _mainWantsCall()) return;
   await Firebase.initializeApp(options: _options);
   await notify(kind);
@@ -145,6 +156,7 @@ Future<void> initPush(void Function(String token) register) async {
   try {
     await Firebase.initializeApp(options: _options);
     FirebaseMessaging.onBackgroundMessage(_background);
+    FirebaseMessaging.onMessage.listen((_) => onPushWake?.call()); // открытое приложение
     await FirebaseMessaging.instance.requestPermission();
     // Регистрационный токен FCM, его принимает HTTP v1 API на сервере; новый API с FID пока не трогаем.
     // ignore: deprecated_member_use

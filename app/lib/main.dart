@@ -66,10 +66,15 @@ void _notifications() {
       client.checkConnection();
     }
   };
+  onPushWake = client.checkConnection;
   AppLifecycleListener(
     onResume: () {
       cancelNotes();
       client.checkConnection();
+    },
+    // Свернули во время входящего: дальше звонит уведомление (мелодия приложения в фоне молчит).
+    onHide: () {
+      if (calls.state == CallState.ringing) notify('call');
     },
   );
   initPush(client.setPushToken);
