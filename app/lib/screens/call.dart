@@ -113,6 +113,8 @@ class _CallScreenState extends State<CallScreen> {
             Positioned.fill(
               child: RTCVideoView(
                 big,
+                // На вебе вид запоминает элемент видео при создании: при смене своего на собеседника нужен новый.
+                key: ObjectKey(big),
                 objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
                 mirror: big == calls.local && calls.front,
               ),

@@ -87,7 +87,7 @@ class Calls extends ChangeNotifier {
 
   Future<void> _toneQueue = Future.value();
 
-  Future<void> start(String to, {bool video = false}) async {
+  Future<void> start(String to) async {
     if (state != CallState.idle) return;
     _set(CallState.calling, to, '${DateTime.now().microsecondsSinceEpoch}${Random.secure().nextInt(1 << 30)}');
     try {
@@ -96,10 +96,9 @@ class Calls extends ChangeNotifier {
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
       )).sender;
-      if (video) await _camera(true);
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc), 'video': this.video});
+      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc)});
       _timeout = Timer(ring, () => _finish('Нет ответа', notify: true));
     } catch (e) {
       debugPrint('AURA: звонок $to: $e');
@@ -251,6 +250,9 @@ class Calls extends ChangeNotifier {
 
   Future<RTCPeerConnection> _connect() async {
     if (!_audioReady) {
+      // Аппаратные кодеки видео на части Android отдают поток, который браузер не показывает:
+      // у собеседника чёрный экран. Программные работают везде. До первого обращения к WebRTC.
+      if (!kIsWeb) await WebRTC.initialize(options: {'forceSWCodec': true});
       await Future.wait([_audio.initialize(), remote.initialize(), local.initialize()]);
       _audioReady = true;
     }
