@@ -101,7 +101,7 @@ void main() {
     expect(turn['credential'], base64.encode(hmac.bytes));
   });
 
-  test('push будит только устройства без соединения, устаревший токен забывается', () async {
+  test('push будит получателя, даже на связи; устаревший токен забывается', () async {
     final pushed = <(String, String)>[];
     await http.close(force: true);
     aura.close();
@@ -138,7 +138,7 @@ void main() {
 
     final (denWs, _) = await connect(den['token']);
     await send('m2', 'message');
-    expect(pushed, hasLength(1), reason: 'Денис на связи');
+    expect(pushed.last, ('den1', 'message'), reason: 'свёрнутое приложение заморожено, хоть и на связи');
     await denWs.sink.close();
     await Future.delayed(const Duration(milliseconds: 100));
 

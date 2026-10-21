@@ -28,7 +28,7 @@ typedef Device = ({String nick, int device});
 class AuraServer {
   /// [turn] — адрес TURN-сервера (например turn:aura-msg.space:3478) и общий с coturn секрет
   /// (static-auth-secret): звонки, которым не хватило прямого соединения, идут через него.
-  /// [push] — отправка push на устройство без соединения (см. Fcm); false — токен устарел.
+  /// [push] — отправка push на устройство (см. Fcm); false — токен устарел.
   AuraServer(String dbPath, {String? files, this.turn, this.push})
     : db = sqlite3.open(dbPath),
       files = Directory(files ?? p.join(p.dirname(dbPath), 'files'))..createSync(recursive: true) {
@@ -290,7 +290,7 @@ class AuraServer {
     return _ok({});
   }
 
-  /// Будит устройство без соединения. Ошибки сети не мешают доставке: сообщение ждёт в очереди.
+  /// Будит устройство через push. Ошибки сети не мешают доставке: сообщение ждёт в очереди.
   void _wake(Device d, String kind) {
     final push = this.push;
     if (push == null) return;
@@ -532,7 +532,7 @@ class AuraServer {
 
   // --- WebSocket ---
   // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}], push?}, {type: ack, id}
-  // push: message или call — разбудить устройства получателя без соединения.
+  // push: message или call — разбудить устройства получателя.
   // Сервер → клиент: {type: ready, device, preKeys}, {type: sent, id, to},
   //   {type: message, id, from, device, ctype, body, sentAt}, {type: error, id?, to?, error}
   // body — шифротекст Signal (base64), ctype — его тип (2 обычное, 3 с установкой сессии).
@@ -619,7 +619,9 @@ class AuraServer {
         sentAt,
       ]);
       final d = (nick: to, device: p['device'] as int);
-      if (_online[d] == null && (wake == 'message' || wake == 'call')) _wake(d, wake);
+      // Будим и тех, кто на связи: свёрнутое приложение Android замораживает, и соединение
+      // ещё живо, а сообщение не обрабатывается. Открытое на экране приложение push не показывает.
+      if (wake == 'message' || wake == 'call') _wake(d, wake);
       _online[d]?.sink.add(
         jsonEncode({
           'type': 'message',

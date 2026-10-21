@@ -22,10 +22,16 @@ Future<void> main() async {
 void _notifications() {
   bool background() => WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed;
   var ringing = false;
+  String? launchedBy; // «Ответить» из убитого приложения: звонок придёт, когда соединимся
+  initCallActions().then((a) => launchedBy = a);
   client.onIncoming = () {
     if (background()) notify('message');
   };
   calls.addListener(() {
+    if (calls.state == CallState.ringing && launchedBy == 'answer') {
+      launchedBy = null;
+      calls.accept();
+    }
     if (calls.state == CallState.ringing && !ringing && background()) notify('call');
     if (ringing && calls.state != CallState.ringing) cancelCallNote();
     ringing = calls.state == CallState.ringing;
