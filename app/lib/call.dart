@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'client.dart';
@@ -39,7 +40,18 @@ class Calls extends ChangeNotifier {
   void init() {
     client.onCall = _onSignal;
     addListener(_sound);
+    AppLifecycleListener(onStateChange: (_) => _sound());
   }
+
+  /// Свёрнутое приложение на Android звонит уведомлением, а не своей мелодией: Android замораживает
+  /// его в фоне, и мелодию, которую плеер крутит по кругу, уже некому остановить.
+  bool get _ringHere =>
+      kIsWeb ||
+      defaultTargetPlatform != TargetPlatform.android ||
+      switch (WidgetsBinding.instance.lifecycleState) {
+        AppLifecycleState.hidden || AppLifecycleState.paused || AppLifecycleState.detached => false,
+        _ => true,
+      };
 
   final _tone = AudioPlayer();
   String? _playing;
@@ -48,7 +60,7 @@ class Calls extends ChangeNotifier {
   void _sound() {
     final want = switch (state) {
       CallState.calling => 'ringback',
-      CallState.ringing => 'ringtone',
+      CallState.ringing when _ringHere => 'ringtone',
       CallState.idle when ended != null => 'end',
       _ => null,
     };
@@ -196,7 +208,7 @@ class Calls extends ChangeNotifier {
     if (state == CallState.idle) return;
     if (notify) client.sendCall(peer!, {'type': 'end', 'id': _id});
     _timeout?.cancel();
-    _pc?.close();
+    _pc?.dispose(); // только dispose возвращает Android обычный режим звука, close оставляет «звонок»
     _pc = null;
     _mic?.getTracks().forEach((t) => t.stop());
     _mic?.dispose();
