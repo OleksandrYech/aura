@@ -273,9 +273,9 @@ class Calls extends ChangeNotifier {
 
   Future<RTCPeerConnection> _connect() async {
     if (!_audioReady) {
-      // Аппаратные кодеки видео на части Android отдают поток, который браузер не показывает:
-      // у собеседника чёрный экран. Программные работают везде. До первого обращения к WebRTC.
-      if (!kIsWeb) await WebRTC.initialize(options: {'forceSWCodec': true});
+      // Только программные кодеки видео, до первого обращения к WebRTC. Пустой forceSWCodecList
+      // обязателен: без него телефон предлагает и аппаратный H264, а декодировать его потом нечем.
+      if (!kIsWeb) await WebRTC.initialize(options: {'forceSWCodec': true, 'forceSWCodecList': []});
       await Future.wait([_audio.initialize(), remote.initialize(), local.initialize()]);
       _audioReady = true;
     }
