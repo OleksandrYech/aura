@@ -176,6 +176,15 @@ class _CallScreenState extends State<CallScreen> {
         Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
         const SizedBox(height: 8),
         Text(_status, style: TextStyle(fontSize: 16, color: c.ink.withValues(alpha: 0.6))),
+        if (calls.cameraError != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(32, 12, 32, 0),
+            child: Text(
+              'Камера не включилась: ${calls.cameraError}',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.6)),
+            ),
+          ),
         const Spacer(flex: 2),
       ],
       if (live)

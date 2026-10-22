@@ -28,6 +28,9 @@ class Calls extends ChangeNotifier {
   /// Своя камера включена; камера собеседника включена; своя камера — фронтальная.
   bool video = false, peerVideo = false, front = true;
 
+  /// Почему не включилась камера: показываем в звонке, иначе кнопка просто молча не срабатывает.
+  String? cameraError;
+
   /// Видео собеседника и своё превью.
   final remote = RTCVideoRenderer(), local = RTCVideoRenderer();
 
@@ -162,8 +165,10 @@ class Calls extends ChangeNotifier {
 
   /// Камера не нужна, чтобы разговаривать: если её нет или не дали доступ, звонок идёт без видео.
   Future<void> _camera(bool on) async {
+    cameraError = null;
     try {
-      if (on && _videoSender != null && _cam == null) {
+      if (on && _videoSender == null) throw 'нет видеоканала в звонке';
+      if (on && _cam == null) {
         final cam = _cam = await navigator.mediaDevices.getUserMedia({
           'audio': false,
           'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
@@ -182,6 +187,7 @@ class Calls extends ChangeNotifier {
       }
     } catch (e) {
       debugPrint('AURA: камера: $e');
+      cameraError = '$e';
       _stopCamera();
     }
     notifyListeners();
@@ -242,6 +248,7 @@ class Calls extends ChangeNotifier {
     peer = with_;
     _id = id;
     ended = null;
+    cameraError = null;
     muted = speaker = false;
     this.peerVideo = peerVideo;
     since = null;
