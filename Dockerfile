@@ -14,8 +14,9 @@ COPY server/pubspec.* server/
 RUN cd server && dart pub get
 COPY app app
 COPY server server
-# CanvasKit из сборки, без запросов к CDN Google.
-RUN cd app && flutter build web --release --no-web-resources-cdn
+# CanvasKit из сборки, без запросов к CDN Google. Видео звонка — обычным <video>:
+# браузер сам поворачивает кадры с вертикального телефона, при копировании кадров через WebGL такое видео было чёрным.
+RUN cd app && flutter build web --release --no-web-resources-cdn --dart-define=WEBRTC_USE_HTML_ELEMENT_VIEW=true
 RUN cd server && dart build cli -o /out
 
 FROM debian:bookworm-slim
