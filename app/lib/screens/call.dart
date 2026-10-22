@@ -35,7 +35,22 @@ class CallScreen extends StatefulWidget {
 
 class _CallScreenState extends State<CallScreen> {
   // Секундомер разговора.
-  late final _tick = Timer.periodic(const Duration(seconds: 1), (_) => setState(() {}));
+  late final _tick = Timer.periodic(const Duration(seconds: 1), (_) async {
+    if (_stats != null) _stats = await calls.videoStats();
+    if (mounted) setState(() {});
+  });
+
+  /// Статистика видео для отладки, null — скрыта.
+  String? _stats;
+
+  Widget _statusText(TextStyle style) => GestureDetector(
+    onLongPress: () => setState(() => _stats = _stats == null ? '' : null),
+    child: Column(children: [
+      Text(_status, style: style),
+      if (_stats != null)
+        Text(_stats!, textAlign: TextAlign.center, style: style.copyWith(fontSize: 11)),
+    ]),
+  );
 
   @override
   void initState() {
@@ -167,7 +182,7 @@ class _CallScreenState extends State<CallScreen> {
           style: TextStyle(fontSize: 22, fontWeight: FontWeight.w500, color: ink),
         ),
         const SizedBox(height: 4),
-        Text(_status, style: TextStyle(fontSize: 15, color: ink.withValues(alpha: 0.8))),
+        _statusText(TextStyle(fontSize: 15, color: ink.withValues(alpha: 0.8))),
         const Spacer(),
       ] else ...[
         const Spacer(),
@@ -175,7 +190,7 @@ class _CallScreenState extends State<CallScreen> {
         const SizedBox(height: 24),
         Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
         const SizedBox(height: 8),
-        Text(_status, style: TextStyle(fontSize: 16, color: c.ink.withValues(alpha: 0.6))),
+        _statusText(TextStyle(fontSize: 16, color: c.ink.withValues(alpha: 0.6))),
         if (calls.cameraError != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(32, 12, 32, 0),
