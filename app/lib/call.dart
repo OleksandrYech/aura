@@ -156,6 +156,22 @@ class Calls extends ChangeNotifier {
     if (state != CallState.idle) client.sendCall(peer!, {'type': 'video', 'id': _id, 'on': video});
   }
 
+  /// Отладка видео по статистике WebRTC: что уходит и что приходит. Включается долгим нажатием на статус.
+  Future<String> videoStats() async {
+    final reports = await _pc?.getStats() ?? <StatsReport>[];
+    final byId = {for (final r in reports) r.id: r.values};
+    String codec(Map v) => '${byId[v['codecId']]?['mimeType'] ?? '?'}'.replaceFirst('video/', '');
+    return [
+      for (final r in reports)
+        if (r.values['kind'] == 'video' && r.type == 'outbound-rtp')
+          '→ ${codec(r.values)} ${r.values['frameWidth']}x${r.values['frameHeight']} отправлено ${r.values['framesSent']} '
+              'ключевых ${r.values['keyFramesEncoded']} PLI ${r.values['pliCount']} ${r.values['qualityLimitationReason']}'
+        else if (r.values['kind'] == 'video' && r.type == 'inbound-rtp')
+          '← ${codec(r.values)} ${r.values['frameWidth']}x${r.values['frameHeight']} пришло ${r.values['framesReceived']} '
+              'декод ${r.values['framesDecoded']} ключевых ${r.values['keyFramesDecoded']} PLI ${r.values['pliCount']}',
+    ].join('\n');
+  }
+
   Future<void> switchCamera() async {
     final t = _cam?.getVideoTracks().firstOrNull;
     if (t == null) return;
@@ -171,7 +187,7 @@ class Calls extends ChangeNotifier {
       if (on && _cam == null) {
         final cam = _cam = await navigator.mediaDevices.getUserMedia({
           'audio': false,
-          'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
+          'video': {'facingMode': 'user', 'width': 640, 'height': 480}, // программный кодек телефона тянет без пропусков
         });
         if (state == CallState.idle) {
           _stopCamera(); // звонок кончился, пока ждали доступ
