@@ -30,6 +30,8 @@ jobs:
       - run: dart test
 
   docker:
+    # Тяжёлые сборки только в main, PR проверяют server и web.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +57,7 @@ jobs:
           path: app/build/web
 
   android:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30 # обычно ~12 минут; зависшая сборка не должна съедать минуты Actions
     permissions:
@@ -102,6 +105,7 @@ jobs:
           gh release create v0.1.${{ github.run_number }} aura.apk --target ${{ github.sha }} --title "AURA 0.1.${{ github.run_number }}" --notes "$NOTES"
 
   ios:
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
