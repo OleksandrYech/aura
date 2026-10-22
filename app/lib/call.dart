@@ -165,10 +165,10 @@ class Calls extends ChangeNotifier {
       for (final r in reports)
         if (r.values['kind'] == 'video' && r.type == 'outbound-rtp')
           '→ ${codec(r.values)} ${r.values['frameWidth']}x${r.values['frameHeight']} отправлено ${r.values['framesSent']} '
-              'ключевых ${r.values['keyFramesEncoded']} PLI ${r.values['pliCount']} ${r.values['qualityLimitationReason']}'
+              '${r.values['framesPerSecond'] ?? 0} к/с ${((r.values['targetBitrate'] ?? 0) as num) ~/ 1000} кбит/с ключевых ${r.values['keyFramesEncoded']} PLI ${r.values['pliCount']} ${r.values['qualityLimitationReason']}'
         else if (r.values['kind'] == 'video' && r.type == 'inbound-rtp')
           '← ${codec(r.values)} ${r.values['frameWidth']}x${r.values['frameHeight']} пришло ${r.values['framesReceived']} '
-              'декод ${r.values['framesDecoded']} ключевых ${r.values['keyFramesDecoded']} PLI ${r.values['pliCount']}',
+              'декод ${r.values['framesDecoded']} ${r.values['framesPerSecond'] ?? 0} к/с ключевых ${r.values['keyFramesDecoded']} PLI ${r.values['pliCount']}',
     ].join('\n');
   }
 
@@ -187,7 +187,7 @@ class Calls extends ChangeNotifier {
       if (on && _cam == null) {
         final cam = _cam = await navigator.mediaDevices.getUserMedia({
           'audio': false,
-          'video': {'facingMode': 'user', 'width': 640, 'height': 480}, // программный кодек телефона тянет без пропусков
+          'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
         });
         if (state == CallState.idle) {
           _stopCamera(); // звонок кончился, пока ждали доступ
