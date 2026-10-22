@@ -18,11 +18,16 @@ late SecurityContext _serverTls;
 
 /// Клиент ходит на https://web.aura-msg.space через прокси из окружения (https_proxy). Любое TCP-соединение
 /// клиента уводим на свой «прокси», а туннель — на поддельный TLS-сервер с сертификатом на web.aura-msg.space,
-/// которому тест доверяет. Без https_proxy в окружении запустите: https_proxy=http://127.0.0.1:9 flutter test ...
+/// которому тест доверяет.
 final class _Redirect extends IOOverrides {
   @override
   Future<ConnectionTask<Socket>> socketStartConnect(host, int port, {sourceAddress, int sourcePort = 0}) =>
       super.socketStartConnect(InternetAddress.loopbackIPv4, _proxyPort, sourceAddress: sourceAddress, sourcePort: sourcePort);
+}
+
+final class _ViaProxy extends HttpOverrides {
+  @override
+  String findProxyFromEnvironment(Uri url, Map<String, String>? environment) => 'PROXY 127.0.0.1:$_proxyPort';
 }
 
 Future<void> _setUpNetwork() async {
@@ -63,6 +68,7 @@ Future<void> _setUpNetwork() async {
     }, onDone: () => up?.destroy(), onError: (_) => up?.destroy());
   });
   IOOverrides.global = _Redirect();
+  HttpOverrides.global = _ViaProxy(); // без https_proxy в окружении (CI) клиент тоже идёт через CONNECT
 }
 
 class _Fake {
@@ -148,7 +154,7 @@ Future<void> boot({Map<String, dynamic>? groups, Map<String, dynamic>? chats}) a
   });
   await client.load();
   await fake.ready.future.timeout(const Duration(seconds: 5),
-      onTimeout: () => throw StateError('клиент не дошёл до поддельного сервера: нужен https_proxy в окружении'));
+      onTimeout: () => throw StateError('клиент не дошёл до поддельного сервера'));
   expect(await waitFor(() => client.connected), isTrue);
 }
 

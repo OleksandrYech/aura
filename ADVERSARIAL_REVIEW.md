@@ -12,7 +12,7 @@
 cd server && dart test test/adversarial_test.dart          # +6 -12
 cd app && flutter test test/adversarial_test.dart test/adversarial_lock_test.dart   # +5 -9
 ```
-Клиентские тесты A19–A29 уводят соединения на локальный прокси и требуют переменную `https_proxy`. Если её нет: `https_proxy=http://127.0.0.1:9 flutter test ...`.
+Клиентские тесты A19–A29 уводят соединения клиента на локальный поддельный сервер, переменные прокси не нужны.
 
 ## Подтверждено (тест падает)
 
