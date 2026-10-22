@@ -90,7 +90,7 @@ base64 -w0 aura.jks > aura.jks.b64
 
 ```sh
 # Web: собрать приложение и раздать его сервером на http://localhost:8080
-(cd app && flutter build web --no-web-resources-cdn)
+(cd app && flutter build web --no-web-resources-cdn --dart-define=WEBRTC_USE_HTML_ELEMENT_VIEW=true)
 (cd server && AURA_WEB=../app/build/web dart run bin/main.dart)
 ```
 

@@ -48,7 +48,7 @@ jobs:
       - run: flutter analyze
       - run: flutter test
       # CanvasKit из сборки, без запросов к CDN Google.
-      - run: flutter build web --release --no-web-resources-cdn
+      - run: flutter build web --release --no-web-resources-cdn --dart-define=WEBRTC_USE_HTML_ELEMENT_VIEW=true
       - uses: actions/upload-artifact@v4
         with:
           name: aura-web
