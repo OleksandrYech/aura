@@ -96,6 +96,14 @@ class AuraServer {
     if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'push_token')) {
       db.execute('ALTER TABLE devices ADD COLUMN push_token TEXT');
     }
+    if (!db.select('PRAGMA table_info(users)').any((c) => c['name'] == 'identity_key')) {
+      // Ключ аккаунта: у старых аккаунтов берём ключ самого старого устройства.
+      db.execute('''
+        ALTER TABLE users ADD COLUMN identity_key TEXT;
+        UPDATE users SET identity_key = (SELECT identity_key FROM devices d
+          WHERE d.nick = users.nick AND d.identity_key IS NOT NULL ORDER BY d.device LIMIT 1);
+      ''');
+    }
   }
 
   final Database db;
@@ -270,7 +278,7 @@ class AuraServer {
   Response _session(String nick) {
     final token = base64Url.encode(List.generate(32, (_) => _random.nextInt(256)));
     final user = db.select(
-      'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, next_device - 1 AS device',
+      'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, identity_key, next_device - 1 AS device',
       [nick],
     ).first;
     db.execute('INSERT INTO devices (token_hash, nick, device, created_at) VALUES (?, ?, ?, ?)', [
@@ -279,7 +287,13 @@ class AuraServer {
       user['device'],
       _now(),
     ]);
-    return _ok({'token': token, 'nick': nick, 'name': user['name'], 'device': user['device']});
+    return _ok({
+      'token': token,
+      'nick': nick,
+      'name': user['name'],
+      'device': user['device'],
+      'identityKey': user['identity_key'],
+    });
   }
 
   Response _logout(Request req, Device me) {
@@ -320,6 +334,8 @@ class AuraServer {
         me.nick,
         me.device,
       ]);
+      // Первое устройство с ключом задаёт ключ аккаунта. Проверок пока нет (план: PR 6).
+      db.execute('UPDATE users SET identity_key = ? WHERE nick = ? AND identity_key IS NULL', [identity, me.nick]);
     }
     if (spk is Map) {
       db.execute(
@@ -385,9 +401,14 @@ class AuraServer {
     ]);
   }
 
-  Response _devices(Request req, Device me, String nick) => _ok([
-    for (final r in _readyDevices(nick.toLowerCase())) {'device': r['device'], 'identityKey': r['identity_key']},
-  ]);
+  /// accountKey — ключ аккаунта, одинаковый во всех записях: список остаётся списком для старых клиентов.
+  Response _devices(Request req, Device me, String nick) {
+    final account = db.select('SELECT identity_key FROM users WHERE nick = ?', [nick.toLowerCase()]).firstOrNull;
+    return _ok([
+      for (final r in _readyDevices(nick.toLowerCase()))
+        {'device': r['device'], 'identityKey': r['identity_key'], 'accountKey': account?['identity_key']},
+    ]);
+  }
 
   /// Одноразовых prekey на устройство: клиент держит пачку в 50, запас на пополнения (A05).
   static const maxPreKeys = 1000;

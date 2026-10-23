@@ -171,7 +171,7 @@ void main() {
     expect((await post('/api/keys', {'preKeys': 'x'}, method: 'PUT', token: den['token'])).$1, 400);
 
     expect(await get('/api/devices/den', anna['token']), [
-      {'device': 1, 'identityKey': 'idDen'},
+      {'device': 1, 'identityKey': 'idDen', 'accountKey': 'idDen'},
     ]);
     final b1 = await get('/api/keys/den/1', anna['token']);
     expect(b1['identityKey'], 'idDen');
@@ -239,6 +239,51 @@ void main() {
       expect(await link(den, d), 200);
     }
     expect(await link(den, 2 + AuraServer.maxPendingLinks), 429, reason: 'не больше трёх ожидающих конвертов на аккаунт');
+  });
+
+  test('ключ аккаунта задаёт первое устройство с ключом', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    expect(den['identityKey'], isNull);
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    expect(den2['identityKey'], 'idDen', reason: 'вход отдаёт ключ аккаунта');
+    await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token']);
+    expect(await get('/api/devices/den', anna['token']), [
+      {'device': 1, 'identityKey': 'idDen', 'accountKey': 'idDen'},
+      {'device': 2, 'identityKey': 'idDen2', 'accountKey': 'idDen'},
+    ], reason: 'второе устройство ключ аккаунта не меняет');
+    await post('/api/logout', {}, token: den['token']);
+    final (_, den3) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    expect(den3['identityKey'], 'idDen', reason: 'выход устройства ключ аккаунта не сбрасывает');
+  });
+
+  test('старая база: ключ аккаунта берётся у самого старого устройства', () async {
+    final dir = await Directory.systemTemp.createTemp();
+    final path = '${dir.path}/v1.db';
+    final old = AuraServer(path);
+    old.db.execute('ALTER TABLE users DROP COLUMN identity_key');
+    for (final (nick, device, key) in [('anna', 3, 'a3'), ('anna', 2, 'a2'), ('anna', 4, null), ('den', 1, null)]) {
+      old.db.execute('INSERT OR IGNORE INTO users (nick, name, password_hash, created_at) VALUES (?, ?, ?, 0)', [
+        nick,
+        nick,
+        'x',
+      ]);
+      old.db.execute('INSERT INTO devices (token_hash, nick, device, created_at, identity_key) VALUES (?, ?, ?, 0, ?)', [
+        '$nick$device',
+        nick,
+        device,
+        key,
+      ]);
+    }
+    old.close();
+    final upgraded = AuraServer(path);
+    expect(upgraded.db.select('SELECT identity_key FROM users ORDER BY nick').map((r) => r['identity_key']), [
+      'a2',
+      null,
+    ]);
+    upgraded.close();
+    await dir.delete(recursive: true);
   });
 
   test('доставка шифротекста на каждое устройство', () async {
