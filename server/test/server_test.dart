@@ -286,6 +286,19 @@ void main() {
     expect(await link(den, 2 + AuraServer.maxPendingLinks), 429, reason: 'не больше трёх ожидающих конвертов на аккаунт');
   });
 
+  test('отвязка: удалить можно только устройство своего аккаунта', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token']);
+    expect((await post('/api/devices/2', {}, method: 'DELETE', token: anna['token'])).$1, 200);
+    expect(await get('/api/devices/den', anna['token']), hasLength(2), reason: 'anna удаляет только своё устройство 2');
+    expect((await post('/api/devices/2', {}, method: 'DELETE', token: den['token'])).$1, 200);
+    expect(await get('/api/devices/den', anna['token']), hasLength(1));
+    expect((await post('/api/me', {'name': 'Den'}, method: 'PUT', token: den2['token'])).$1, 401);
+  });
+
   test('доставка шифротекста на каждое устройство', () async {
     final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});

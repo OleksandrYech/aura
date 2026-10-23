@@ -7,6 +7,7 @@ import 'push.dart';
 import 'screens/auth.dart';
 import 'screens/call.dart';
 import 'screens/home.dart';
+import 'screens/link.dart';
 import 'theme.dart';
 
 Future<void> main() async {
@@ -97,7 +98,11 @@ class AuraApp extends StatelessWidget {
         // Корневой экран следует за состоянием входа: вход и выход переключают его сами.
         home: ListenableBuilder(
           listenable: client,
-          builder: (context, _) => client.signedIn ? const HomeScreen() : const WelcomeScreen(),
+          builder: (context, _) => client.signedIn
+              ? const HomeScreen()
+              : client.needsLink
+                  ? const LinkScreen()
+                  : const WelcomeScreen(),
         ),
         routes: {
           '/sign-in': (_) => const SignInScreen(),

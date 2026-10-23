@@ -190,6 +190,7 @@ class AuraServer {
       ..put('/api/me', _authed(_updateMe))
       ..put('/api/keys', _authed(_putKeys))
       ..get('/api/devices/<nick>', _authed(_devices))
+      ..delete('/api/devices/<device>', _authed(_unlink))
       ..get('/api/ice', _authed(_ice))
       ..put('/api/push', _authed(_putPush))
       ..post('/api/link/<device>', _authed(_postLink))
@@ -299,6 +300,14 @@ class AuraServer {
   Response _logout(Request req, Device me) {
     _online.remove(me)?.sink.close(4401, 'logout');
     db.execute('DELETE FROM devices WHERE nick = ? AND device = ?', [me.nick, me.device]);
+    return _ok({});
+  }
+
+  /// Отвязать устройство своего аккаунта: оно удаляется, как при выходе, и отключается.
+  Response _unlink(Request req, Device me, String device) {
+    final d = (nick: me.nick, device: int.tryParse(device) ?? 0);
+    _online.remove(d)?.sink.close(4401, 'unlinked');
+    db.execute('DELETE FROM devices WHERE nick = ? AND device = ?', [d.nick, d.device]);
     return _ok({});
   }
 
