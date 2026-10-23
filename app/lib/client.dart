@@ -262,8 +262,22 @@ class AuraClient extends ChangeNotifier {
     linkError = null;
     _awaitLink(mine, run);
     return base64Url.encode(
-      utf8.encode(jsonEncode({'nick': nick, 'device': device, 'key': base64.encode(mine.publicKey.serialize())})),
+      utf8.encode(
+        jsonEncode({
+          'nick': nick,
+          'device': device,
+          'name': kIsWeb ? 'Браузер' : defaultTargetPlatform.name,
+          'key': base64.encode(mine.publicKey.serialize()),
+        }),
+      ),
     );
+  }
+
+  /// Привязка невозможна (старого устройства нет под рукой): войти со своим новым ключом, как раньше.
+  // ponytail: уходит в PR 6–7, когда сервер начнёт требовать ключ аккаунта; дальше — «Начать заново» (PR 8).
+  Future<void> skipLinking() {
+    _linkRun++;
+    return _signIn(SignalKeys.generate());
   }
 
   Future<void> _awaitLink(ECKeyPair mine, int run) async {
@@ -272,7 +286,7 @@ class AuraClient extends ChangeNotifier {
       final Map res;
       try {
         res = await _request('GET', _api('/api/link'), null);
-      } on ApiException {
+      } catch (_) {
         // Конверта пока нет (сервер ждал 25 секунд) или нет связи.
         await Future<void>.delayed(const Duration(seconds: 1));
         continue;
@@ -292,19 +306,39 @@ class AuraClient extends ChangeNotifier {
   }
 
   /// Старое устройство: отправить ключ аккаунта новому устройству по коду из его QR.
-  Future<void> linkDevice(String code) async {
-    final ({String? nick, int device, ECPublicKey key}) c;
+  /// Конверт уходит, только если [confirm] (название и номер нового устройства из кода) вернёт true:
+  /// подменённый по пути текстовый код иначе привязал бы чужое устройство.
+  Future<void> linkDevice(String code, Future<bool> Function(String name, int device) confirm) async {
+    final ({String? nick, int device, String name, ECPublicKey key}) c;
     try {
       final j = jsonDecode(utf8.decode(base64Url.decode(code.trim()))) as Map;
-      c = (nick: j['nick'] as String?, device: j['device'] as int, key: Curve.decodePoint(base64.decode(j['key']), 0));
+      c = (
+        nick: j['nick'] as String?,
+        device: j['device'] as int,
+        name: j['name'] as String? ?? '',
+        key: Curve.decodePoint(base64.decode(j['key']), 0),
+      );
     } catch (_) {
       throw ApiException('Неверный код привязки');
     }
     if (c.nick != nick) throw ApiException('Код от другого аккаунта');
+    if (!await confirm(c.name, c.device)) return;
     final identity = await _keys!.getIdentityKeyPair();
     await _request('POST', _api('/api/link/${c.device}'), {
       'envelope': LinkEnvelope.seal(c.key, identity, nick!, c.device),
     });
+  }
+
+  /// Устройства своего аккаунта, включая это.
+  Future<List<int>> myDevices() async {
+    _devices.remove(nick);
+    return [device!, ...await _devicesOf(nick!)]..sort();
+  }
+
+  /// Отвязать другое устройство своего аккаунта: сервер удаляет его, и оно выходит.
+  Future<void> unlinkDevice(int d) async {
+    await _request('DELETE', _api('/api/devices/$d'), null);
+    _devices.remove(nick);
   }
 
   Future<void> updateName(String newName) async {

@@ -4,6 +4,7 @@ import '../client.dart';
 import '../lock.dart';
 import '../theme.dart';
 import 'home.dart';
+import 'link.dart';
 
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
@@ -39,6 +40,12 @@ class _SettingsTabState extends State<SettingsTab> {
           ),
         ),
         section('ПРИВАТНОСТЬ И БЕЗОПАСНОСТЬ'),
+        ListTile(
+          leading: const Icon(Icons.devices_outlined),
+          title: const Text('Устройства'),
+          subtitle: const Text('Привязать новое или отвязать старое'),
+          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DevicesScreen())),
+        ),
         FutureBuilder(
           future: AppLock.available(),
           builder: (context, snap) => snap.data != true

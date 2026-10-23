@@ -495,11 +495,13 @@ void main() {
       utf8.encode(jsonEncode({'nick': nick, 'device': 2, 'key': base64.encode(mine.publicKey.serialize())})),
     );
 
-    await expectLater(client.linkDevice(code('eve')), throwsA(isA<ApiException>()), reason: 'чужой аккаунт');
-    await expectLater(client.linkDevice('мусор'), throwsA(isA<ApiException>()));
-    expect(sent, isNull);
+    Future<bool> yes(String name, int device) async => true;
+    await expectLater(client.linkDevice(code('eve'), yes), throwsA(isA<ApiException>()), reason: 'чужой аккаунт');
+    await expectLater(client.linkDevice('мусор', yes), throwsA(isA<ApiException>()));
+    await client.linkDevice(code('anna'), (name, device) async => false);
+    expect(sent, isNull, reason: 'без подтверждения конверт не уходит');
 
-    await client.linkDevice(code('anna'));
+    await client.linkDevice(code('anna'), (name, device) async => device == 2);
     final identity = LinkEnvelope.open(sent!, mine, 'anna', 2);
     expect(base64.encode(identity.getPublicKey().serialize()), annaPub['identityKey']);
   });
