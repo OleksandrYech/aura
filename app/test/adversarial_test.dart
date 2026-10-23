@@ -317,6 +317,20 @@ void main() {
   });
 
 
+  test('A23: время сообщения не задаётся сервером произвольно (метаданные не связаны с шифротекстом)', () async {
+    await boot();
+    final eve = peerKeys('eve');
+    // Новый клиент кладёт своё время внутрь шифротекста, сервер подставляет 2001 год.
+    final id = await deliver(eve, 'eve', {'text': 'сейчас', 'time': DateTime.now().millisecondsSinceEpoch},
+        sentAt: DateTime(2001).millisecondsSinceEpoch);
+    await acked(id);
+    final t = DateTime.fromMillisecondsSinceEpoch(client.chats['eve']!.single.time);
+    expect(DateTime.now().difference(t).inDays.abs(), lessThan(1), reason: 'сообщение показано датой $t');
+  });
+
+  // --- Злонамеренный собеседник ---
+
+
   test('A24: неизвестный статус квитанции не ломает обработку: сообщение подтверждается (ack)', () async {
     await boot();
     final eve = peerKeys('eve');
@@ -345,8 +359,6 @@ void main() {
     })(), isTrue, reason: 'Message.preview бросает исключение: экран чатов не строится, сообщение сохранено навсегда');
   });
 
-
-  // A23 добавится вместе с исправлениями этапа 4.
 
   test('A26: участник без прав админа не может изменить состав и админов группы', () async {
     await boot(groups: {

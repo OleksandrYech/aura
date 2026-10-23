@@ -899,8 +899,14 @@ class AuraClient extends ChangeNotifier {
     }
   }
 
-  /// Отправитель внутри шифротекста: получатель сверяет его с конвертом сервера (A21).
-  Map<String, dynamic> _signed(Map<String, dynamic> content) => {...content, 'sender': nick, 'senderDevice': device};
+  /// Отправитель и время внутри шифротекста: получатель сверяет отправителя с конвертом сервера (A21)
+  /// и показывает время отправителя, а не сервера (A23).
+  Map<String, dynamic> _signed(Map<String, dynamic> content) => {
+    ...content,
+    'sender': nick,
+    'senderDevice': device,
+    'time': DateTime.now().millisecondsSinceEpoch,
+  };
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет
   /// или среди них новое неподтверждённое.
@@ -1090,7 +1096,8 @@ class AuraClient extends ChangeNotifier {
                 id: id,
                 mine: mine,
                 text: text,
-                time: msg['sentAt'],
+                // Время сервера — только для старых клиентов; из будущего не бывает.
+                time: min(content?['time'] is int ? content!['time'] : msg['sentAt'], DateTime.now().millisecondsSinceEpoch),
                 status: mine ? Status.sent : Status.delivered,
                 file: file,
                 files: files,
