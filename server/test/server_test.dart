@@ -7,6 +7,8 @@ import 'package:server/server.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:test/test.dart';
+
+import 'signal_keys.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
@@ -55,8 +57,8 @@ void main() {
 
   Map keys(String identity, {int preKeys = 2}) => {
     'registrationId': 7,
-    'identityKey': identity,
-    'signedPreKey': {'id': 1, 'key': 'spk', 'signature': 'sig'},
+    'identityKey': id(identity),
+    'signedPreKey': signedPreKey(identity),
     'preKeys': [
       for (var i = 1; i <= preKeys; i++) {'id': i, 'key': 'pk$i'},
     ],
@@ -171,11 +173,11 @@ void main() {
     expect((await post('/api/keys', {'preKeys': 'x'}, method: 'PUT', token: den['token'])).$1, 400);
 
     expect(await get('/api/devices/den', anna['token']), [
-      {'device': 1, 'identityKey': 'idDen', 'accountKey': 'idDen'},
+      {'device': 1, 'identityKey': id('idDen'), 'accountKey': id('idDen')},
     ]);
     final b1 = await get('/api/keys/den/1', anna['token']);
-    expect(b1['identityKey'], 'idDen');
-    expect(b1['signedPreKey'], {'id': 1, 'key': 'spk', 'signature': 'sig'});
+    expect(b1['identityKey'], id('idDen'));
+    expect(b1['signedPreKey'], containsPair('id', 1));
     expect((await get('/api/keys/den/1', anna['token']))['preKey'], isNull, reason: 'тому же собеседнику — раз в час');
     final (_, eve) = await post('/api/register', {'nick': 'eve', 'password': 'secret3'});
     final b2 = await get('/api/keys/den/1', eve['token']);
@@ -193,17 +195,17 @@ void main() {
     expect(den['identityKey'], isNull);
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
     final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
-    expect(den2['identityKey'], 'idDen', reason: 'вход отдаёт ключ аккаунта');
+    expect(den2['identityKey'], id('idDen'), reason: 'вход отдаёт ключ аккаунта');
     expect((await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token'])).$1, 409,
         reason: 'свой ключ на втором устройстве не принимается');
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den2['token']);
     expect(await get('/api/devices/den', anna['token']), [
-      {'device': 1, 'identityKey': 'idDen', 'accountKey': 'idDen'},
-      {'device': 2, 'identityKey': 'idDen', 'accountKey': 'idDen'},
+      {'device': 1, 'identityKey': id('idDen'), 'accountKey': id('idDen')},
+      {'device': 2, 'identityKey': id('idDen'), 'accountKey': id('idDen')},
     ]);
     await post('/api/logout', {}, token: den['token']);
     final (_, den3) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
-    expect(den3['identityKey'], 'idDen', reason: 'выход устройства ключ аккаунта не сбрасывает');
+    expect(den3['identityKey'], id('idDen'), reason: 'выход устройства ключ аккаунта не сбрасывает');
   });
 
   test('старая база: ключ аккаунта берётся у самого старого устройства', () async {
@@ -270,6 +272,26 @@ void main() {
     expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 200, reason: 'место освободилось');
   });
 
+  test('вход убирает непривязанные и давно неактивные устройства, не дожидаясь их токена', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    await post('/api/keys', keys('idAnna'), method: 'PUT', token: anna['token']);
+    for (var i = 1; i < AuraServer.maxDevices; i++) {
+      await post('/api/login', {'nick': 'anna', 'password': 'secret1'}); // привязка брошена
+    }
+    expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 403, reason: 'свежие ждут привязки');
+
+    final ago = DateTime.now().subtract(AuraServer.unlinkedTtl + const Duration(minutes: 1)).millisecondsSinceEpoch;
+    aura.db.execute('UPDATE devices SET created_at = ?', [ago]);
+    expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 200);
+    int count() => aura.db.select('SELECT count(*) AS n FROM devices').first['n'] as int;
+    expect(count(), 2, reason: 'осталось устройство с ключом и новый вход');
+
+    final old = DateTime.now().subtract(AuraServer.deviceTtl + const Duration(days: 1)).millisecondsSinceEpoch;
+    aura.db.execute('UPDATE devices SET seen_at = ? WHERE device = 1', [old]);
+    await post('/api/login', {'nick': 'anna', 'password': 'secret1'});
+    expect(aura.db.select('SELECT 1 FROM devices WHERE device = 1'), isEmpty, reason: 'неактивное 90 дней');
+  });
+
   test('привязка: конверт от своего старого устройства новому, один, живёт ограниченное время', () async {
     await http.close(force: true);
     aura.close();
@@ -330,6 +352,9 @@ void main() {
     final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den2['token']);
+    final (_, den3) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    expect((await post('/api/devices/2', {}, method: 'DELETE', token: den3['token'])).$1, 403, reason: 'без ключа нельзя');
+    await post('/api/keys', keys('idAnna'), method: 'PUT', token: anna['token']);
     expect((await post('/api/devices/2', {}, method: 'DELETE', token: anna['token'])).$1, 200);
     expect(await get('/api/devices/den', anna['token']), hasLength(2), reason: 'anna удаляет только своё устройство 2');
     expect((await post('/api/devices/2', {}, method: 'DELETE', token: den['token'])).$1, 200);
@@ -354,7 +379,7 @@ void main() {
     expect((await post('/api/me', {'name': 'D'}, method: 'PUT', token: den['token'])).$1, 401);
     expect((await post('/api/keys', keys('idNew'), method: 'PUT', token: fresh['token'])).$1, 200);
     expect(await get('/api/devices/den', anna['token']), [
-      {'device': 2, 'identityKey': 'idNew', 'accountKey': 'idNew'},
+      {'device': 2, 'identityKey': id('idNew'), 'accountKey': id('idNew')},
     ]);
 
     for (var i = 0; i < AuraServer.maxLogins; i++) {
