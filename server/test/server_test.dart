@@ -187,6 +187,60 @@ void main() {
     expect(await get('/api/devices/den', anna['token']), isEmpty);
   });
 
+  test('привязка: конверт от своего старого устройства новому, один, живёт ограниченное время', () async {
+    await http.close(force: true);
+    aura.close();
+    final files = Directory.systemTemp.createTempSync('aura').path;
+    aura = AuraServer(':memory:', files: files, linkTtl: const Duration(milliseconds: 300));
+    http = await io.serve(aura.handler, 'localhost', 0);
+    base = Uri.parse('http://localhost:${http.port}');
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    final (_, eve) = await post('/api/register', {'nick': 'eve', 'password': 'secret3'});
+    await post('/api/keys', keys('idEve'), method: 'PUT', token: eve['token']);
+    final (_, eve2) = await post('/api/login', {'nick': 'eve', 'password': 'secret3'});
+    expect(den2['device'], 2);
+    expect(eve2['device'], 2);
+    Future<int> link(Map who, int device, [Object envelope = 'e']) async =>
+        (await post('/api/link/$device', {'envelope': envelope}, token: who['token'])).$1;
+    Future<(int, dynamic)> fetch(Map who) async {
+      final req = await HttpClient().getUrl(base.resolve('/api/link'));
+      req.headers.set('authorization', 'Bearer ${who['token']}');
+      final res = await req.close();
+      return (res.statusCode, jsonDecode(await res.transform(utf8.decoder).join()));
+    }
+
+    expect(await link(den2, 1), 403, reason: 'без ключа привязывать нельзя');
+    expect(await link(den, 1), 403, reason: 'устройство с ключом не новое');
+    expect(await link(den, 9), 403, reason: 'устройства нет');
+    expect(await link(den, 2, 'x' * (AuraServer.maxLink + 1)), 400);
+    expect(await link(den, 2, 7), 400);
+
+    final waiting = fetch(den2);
+    await Future.delayed(const Duration(milliseconds: 50));
+    expect(await link(den, 2, 'e1'), 200);
+    expect((await waiting).$2, {'envelope': 'e1'}, reason: 'ожидающее устройство получает конверт сразу');
+
+    expect(await link(eve, 2, 'e2'), 200, reason: 'eve:2 — устройство Евы, а не Дена');
+    expect(await link(den, 2, 'e3'), 200);
+    expect(await link(den, 2, 'e4'), 409, reason: 'второй конверт');
+    expect((await fetch(den2)).$2, {'envelope': 'e3'});
+    expect((await fetch(eve2)).$2, {'envelope': 'e2'});
+
+    expect(await link(den, 2, 'e5'), 200);
+    await Future.delayed(const Duration(milliseconds: 400));
+    expect((await fetch(den2)).$1, 404, reason: 'конверт истёк');
+
+    for (var i = 0; i < AuraServer.maxPendingLinks; i++) {
+      await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    }
+    for (var d = 2; d < 2 + AuraServer.maxPendingLinks; d++) {
+      expect(await link(den, d), 200);
+    }
+    expect(await link(den, 2 + AuraServer.maxPendingLinks), 429, reason: 'не больше трёх ожидающих конвертов на аккаунт');
+  });
+
   test('ключ аккаунта задаёт первое устройство с ключом', () async {
     final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
