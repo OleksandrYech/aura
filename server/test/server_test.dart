@@ -194,11 +194,13 @@ void main() {
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
     final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
     expect(den2['identityKey'], 'idDen', reason: 'вход отдаёт ключ аккаунта');
-    await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token']);
+    expect((await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token'])).$1, 409,
+        reason: 'свой ключ на втором устройстве не принимается');
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den2['token']);
     expect(await get('/api/devices/den', anna['token']), [
       {'device': 1, 'identityKey': 'idDen', 'accountKey': 'idDen'},
-      {'device': 2, 'identityKey': 'idDen2', 'accountKey': 'idDen'},
-    ], reason: 'второе устройство ключ аккаунта не меняет');
+      {'device': 2, 'identityKey': 'idDen', 'accountKey': 'idDen'},
+    ]);
     await post('/api/logout', {}, token: den['token']);
     final (_, den3) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
     expect(den3['identityKey'], 'idDen', reason: 'выход устройства ключ аккаунта не сбрасывает');
@@ -230,6 +232,42 @@ void main() {
     ]);
     upgraded.close();
     await dir.delete(recursive: true);
+  });
+
+  test('миграция: устройства со своим ключом удаляются при запуске сервера', () async {
+    final dir = await Directory.systemTemp.createTemp();
+    final path = '${dir.path}/v2.db';
+    final old = AuraServer(path);
+    old.db.execute("INSERT INTO users (nick, name, password_hash, created_at, identity_key) VALUES ('anna', 'a', 'x', 0, 'a1')");
+    for (final (device, key) in [(1, 'a1'), (2, 'a2'), (3, null), (4, 'a1')]) {
+      old.db.execute('INSERT INTO devices (token_hash, nick, device, created_at, identity_key) VALUES (?, ?, ?, 0, ?)', [
+        'anna$device',
+        'anna',
+        device,
+        key,
+      ]);
+    }
+    old.db.execute('UPDATE users SET identity_key = ? WHERE nick = ?', ['a1', 'anna']);
+    old.close();
+    final upgraded = AuraServer(path);
+    expect(upgraded.db.select('SELECT device FROM devices ORDER BY device').map((r) => r['device']), [1, 3, 4],
+        reason: 'устройство 2 со своим ключом удалено, без ключа (ждёт привязки) осталось');
+    upgraded.close();
+    await dir.delete(recursive: true);
+  });
+
+  test('не больше 10 устройств; неактивное 90 дней устройство выходит', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    for (var i = 1; i < AuraServer.maxDevices; i++) {
+      expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 200);
+    }
+    expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 403);
+
+    expect((await post('/api/me', {'name': 'A'}, method: 'PUT', token: anna['token'])).$1, 200);
+    final old = DateTime.now().subtract(AuraServer.deviceTtl + const Duration(days: 1)).millisecondsSinceEpoch;
+    aura.db.execute('UPDATE devices SET seen_at = ? WHERE device = 1', [old]);
+    expect((await post('/api/me', {'name': 'A'}, method: 'PUT', token: anna['token'])).$1, 401);
+    expect((await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$1, 200, reason: 'место освободилось');
   });
 
   test('привязка: конверт от своего старого устройства новому, один, живёт ограниченное время', () async {
@@ -291,7 +329,7 @@ void main() {
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
     final (_, den2) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
     await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
-    await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token']);
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den2['token']);
     expect((await post('/api/devices/2', {}, method: 'DELETE', token: anna['token'])).$1, 200);
     expect(await get('/api/devices/den', anna['token']), hasLength(2), reason: 'anna удаляет только своё устройство 2');
     expect((await post('/api/devices/2', {}, method: 'DELETE', token: den['token'])).$1, 200);
@@ -323,7 +361,7 @@ void main() {
     expect(annaIn.current['error'], 'devices', reason: 'лишнее устройство');
 
     // Появилось второе устройство: отправка по старому списку отклоняется.
-    await post('/api/keys', keys('idDen2'), method: 'PUT', token: den2['token']);
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den2['token']);
     annaWs.sink.add(
       jsonEncode({
         'type': 'send',
@@ -383,7 +421,7 @@ void main() {
 
     // Копия себе на другие устройства: своё устройство в списке не нужно.
     final (_, anna2) = await post('/api/login', {'nick': 'anna', 'password': 'secret1'});
-    await post('/api/keys', keys('idAnna2'), method: 'PUT', token: anna2['token']);
+    await post('/api/keys', keys('idAnna'), method: 'PUT', token: anna2['token']);
     annaWs.sink.add(
       jsonEncode({
         'type': 'send',

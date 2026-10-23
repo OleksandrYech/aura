@@ -104,6 +104,15 @@ class AuraServer {
           WHERE d.nick = users.nick AND d.identity_key IS NOT NULL ORDER BY d.device LIMIT 1);
       ''');
     }
+    if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'seen_at')) {
+      db.execute('ALTER TABLE devices ADD COLUMN seen_at INTEGER');
+    }
+    // Один ключ на аккаунт: устройства со своим ключом (входы до привязки) удаляются вместе с очередью
+    // и при следующем подключении получают 4401 — их надо привязать заново.
+    db.execute('''
+      DELETE FROM devices WHERE identity_key IS NOT NULL
+        AND identity_key IS NOT (SELECT identity_key FROM users u WHERE u.nick = devices.nick)
+    ''');
   }
 
   final Database db;
@@ -114,6 +123,10 @@ class AuraServer {
   static const maxRequest = 25 << 20;
   static const maxFile = (2 << 30) + (1 << 20); // 2 ГБ плюс запас на заголовки частей
   static const fileDays = 30;
+
+  /// Устройств на аккаунт; устройство без активности дольше [deviceTtl] выходит.
+  static const maxDevices = 10;
+  static const deviceTtl = Duration(days: 90);
 
   /// Шифротекст одного сообщения для одного устройства, символов base64: хватает на альбом из 10 видео с превью.
   static const maxMessage = 500000;
@@ -255,6 +268,8 @@ class AuraServer {
       return _error(401, 'Неверный никнейм или пароль');
     }
     _hits.remove('login:$nick');
+    final devices = db.select('SELECT count(*) AS n FROM devices WHERE nick = ?', [nick]).first['n'] as int;
+    if (devices >= maxDevices) return _error(403, 'Слишком много устройств: отвяжите лишние в настройках');
     return _session(nick);
   }
 
@@ -337,13 +352,17 @@ class AuraServer {
       if (current['identity_key'] != null && current['identity_key'] != identity) {
         return _error(409, 'Ключ устройства уже задан');
       }
+      final account = db.select('SELECT identity_key FROM users WHERE nick = ?', [me.nick]).first['identity_key'];
+      if (account != null && account != identity) return _error(409, 'Ключ не совпадает с ключом аккаунта');
       db.execute('UPDATE devices SET identity_key = ?, registration_id = ? WHERE nick = ? AND device = ?', [
         identity,
         reg,
         me.nick,
         me.device,
       ]);
-      // Первое устройство с ключом задаёт ключ аккаунта. Проверок пока нет (план: PR 6).
+      // Первое устройство с ключом задаёт ключ аккаунта, остальные получают его привязкой.
+      // ponytail: подпись signed prekey сервер не проверяет — её проверяют клиенты собеседников
+      // (A30), а сервер в модели угроз и так может подменить что угодно.
       db.execute('UPDATE users SET identity_key = ? WHERE nick = ? AND identity_key IS NULL', [identity, me.nick]);
     }
     if (spk is Map) {
@@ -491,10 +510,24 @@ class AuraServer {
     return envelope == null ? _error(404, 'Конверта нет') : _ok({'envelope': envelope});
   }
 
+  /// Устройство по токену. Заходившее последний раз дольше [deviceTtl] назад удаляется (выход).
   Device? _deviceFor(Object? token) {
     if (token is! String) return null;
-    final r = db.select('SELECT nick, device FROM devices WHERE token_hash = ?', [_sha(token)]).firstOrNull;
-    return r == null ? null : (nick: r['nick'] as String, device: r['device'] as int);
+    final hash = _sha(token), now = _now();
+    final r = db.select('SELECT nick, device, coalesce(seen_at, created_at) AS seen FROM devices WHERE token_hash = ?', [
+      hash,
+    ]).firstOrNull;
+    if (r == null) return null;
+    final seen = r['seen'] as int;
+    if (seen < now - deviceTtl.inMilliseconds) {
+      db.execute('DELETE FROM devices WHERE token_hash = ?', [hash]);
+      return null;
+    }
+    // Отметка раз в сутки, а не на каждый запрос.
+    if (seen < now - const Duration(days: 1).inMilliseconds) {
+      db.execute('UPDATE devices SET seen_at = ? WHERE token_hash = ?', [now, hash]);
+    }
+    return (nick: r['nick'] as String, device: r['device'] as int);
   }
 
   Handler _authed(Function h) => (req) {
