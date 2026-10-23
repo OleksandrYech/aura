@@ -160,7 +160,7 @@ class AuraServer {
 
   void _hit(String key) {
     // Мусорные ключи (входы в несуществующие ники) не копятся: изредка чистим всё.
-    if (_hits.length > 10000) _hits.removeWhere((k, v) => !_over(k, 1, loginWindow));
+    if (_hits.length > 10000) _hits.removeWhere((k, v) => !_over(k, 1, preKeyWindow));
     _hits.putIfAbsent(key, () => []).add(_now());
   }
 
@@ -186,6 +186,9 @@ class AuraServer {
         return await api(req);
       } on _TooLarge {
         return _error(413, 'Слишком большой запрос');
+      } on TypeError {
+        // Поле не того типа ('nick': 123) — ошибка клиента, а не сервера (A02).
+        return _error(400, 'Некорректный запрос');
       }
     };
   }
@@ -201,6 +204,7 @@ class AuraServer {
     final name = (body['name'] as String? ?? '').trim();
     if (!_nickRe.hasMatch(nick)) return _error(400, 'Никнейм: 3–32 символа, латиница, цифры и _');
     if (password.length < 6) return _error(400, 'Пароль должен быть не короче 6 символов');
+    if (name.length > 64) return _error(400, 'Имя длиннее 64 символов');
     final hash = await Isolate.run(() => hashPassword(password));
     // Проверка и вставка без await между ними, поэтому гонки двух регистраций нет.
     if (db.select('SELECT 1 FROM users WHERE nick = ?', [nick]).isNotEmpty) {
@@ -217,12 +221,13 @@ class AuraServer {
 
   Future<Response> _login(Request req) async {
     final body = await _json(req);
-    final nick = (body['nick'] as String? ?? '').trim().toLowerCase();
+    // Не строка — просто неверный вход, а не 400: ответ не должен отличаться от обычной ошибки.
+    final nick = (body['nick'] is String ? body['nick'] as String : '').trim().toLowerCase();
     // Перебор пароля: после серии ошибок ник закрыт на время, даже для верного пароля.
     // ponytail: только по нику, поэтому злоумышленник может так закрыть чужой ник на 15 минут; добавить счёт по IP за прокси.
     if (_over('login:$nick', maxLogins, loginWindow)) return _error(429, 'Слишком много попыток, попробуйте позже');
     final row = db.select('SELECT password_hash FROM users WHERE nick = ?', [nick]).firstOrNull;
-    final password = body['password'] as String? ?? '';
+    final password = body['password'] is String ? body['password'] as String : '';
     final stored = row?['password_hash'] as String?;
     // Хеширование в отдельном изоляте, чтобы не тормозить доставку сообщений.
     if (stored == null || !await Isolate.run(() => verifyPassword(password, stored))) {
@@ -289,6 +294,7 @@ class AuraServer {
         preKeys.any((p) => p is! Map || p['id'] is! int || !key(p['key']))) {
       return _error(400, 'Некорректные ключи');
     }
+    if (_preKeyCount(me) + preKeys.length > maxPreKeys) return _error(400, 'Слишком много одноразовых ключей');
     final current = db.select('SELECT identity_key FROM devices WHERE nick = ? AND device = ?', [
       me.nick,
       me.device,
@@ -372,14 +378,25 @@ class AuraServer {
     for (final r in _readyDevices(nick.toLowerCase())) {'device': r['device'], 'identityKey': r['identity_key']},
   ]);
 
+  /// Одноразовых prekey на устройство: клиент держит пачку в 50, запас на пополнения (A05).
+  static const maxPreKeys = 1000;
+
+  /// Одноразовый prekey одному собеседнику для одного устройства — не чаще раза в [preKeyWindow] (A06).
+  static const preKeyWindow = Duration(hours: 1);
+
   /// Набор ключей для X3DH. Одноразовый prekey выдаётся один раз и удаляется.
+  /// Повторный запрос того же собеседника получает набор без него: X3DH работает и так,
+  /// а посторонний не может быстро израсходовать все одноразовые ключи жертвы.
   Response _bundle(Request req, Device me, String nick, String device) {
     final d = db.select(
       'SELECT * FROM devices WHERE nick = ? AND device = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL',
       [nick.toLowerCase(), int.tryParse(device)],
     ).firstOrNull;
     if (d == null) return _error(404, 'Устройство не найдено');
-    final pk = db.select(
+    final asked = 'prekey:${me.nick}>${d['nick']}:${d['device']}';
+    final fresh = !_over(asked, 1, preKeyWindow);
+    if (fresh) _hit(asked);
+    final pk = !fresh ? null : db.select(
       'DELETE FROM prekeys WHERE rowid = (SELECT rowid FROM prekeys WHERE nick = ? AND device = ? LIMIT 1) RETURNING key_id, public_key',
       [d['nick'], d['device']],
     ).firstOrNull;
@@ -531,8 +548,12 @@ class AuraServer {
     if (range == null) {
       return Response.ok(f.openRead(), headers: {'content-type': 'application/octet-stream', 'content-length': '$size'});
     }
-    final start = int.parse(range[1]!), end = min(int.parse(range[2]!), size - 1);
-    if (start > end) return Response(416, headers: {'content-range': 'bytes */$size'});
+    // Числа длиннее int64 не разбираются: это тоже недопустимый диапазон (A07).
+    final start = int.tryParse(range[1]!), last = int.tryParse(range[2]!);
+    if (start == null || last == null || start > min(last, size - 1)) {
+      return Response(416, headers: {'content-range': 'bytes */$size'});
+    }
+    final end = min(last, size - 1);
     return Response(206, body: f.openRead(start, end + 1), headers: {
       'content-type': 'application/octet-stream',
       'content-length': '${end - start + 1}',
@@ -683,6 +704,15 @@ class AuraServer {
       } else {
         _hit('call:${me.nick}>$to');
       }
+    }
+    // Чужой id в очереди получателя: INSERT OR IGNORE молча потерял бы сообщение, а отправитель
+    // увидел бы «отправлено» (A17). Отвечаем ошибкой, клиент покажет «не отправлено».
+    for (final p in payloads) {
+      final other = db.select(
+        'SELECT sender FROM messages WHERE id = ? AND recipient = ? AND recipient_device = ?',
+        [id, to, p['device']],
+      ).firstOrNull?['sender'];
+      if (other != null && other != me.nick) return error('id');
     }
     final sentAt = _now();
     for (final p in payloads) {
