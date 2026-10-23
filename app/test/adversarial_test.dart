@@ -299,6 +299,55 @@ void main() {
     expect([for (final m in client.chats['eve'] ?? <Message>[]) m.text], isNot(contains('секрет Дена')));
   });
 
+  test('A22: повтор (replay) старого шифротекста сервером не добавляет сообщений в чат', () async {
+    await boot();
+    final eve = peerKeys('eve');
+    await eve.startSession('anna', bundleOf(annaPub, 1, _nextPreKey++));
+    final c = await eve.encrypt('anna', 1, jsonEncode({'text': 'привет'}));
+    Map<String, dynamic> frame(String id) =>
+        {'type': 'message', 'id': id, 'from': 'eve', 'device': 1, 'ctype': c['type'], 'body': c['body'], 'sentAt': 1};
+    fake.push(frame('r1'));
+    await acked('r1');
+    for (var i = 0; i < 5; i++) {
+      fake.push(frame('replay$i'));
+      await acked('replay$i');
+    }
+    expect([for (final m in client.chats['eve']!) m.text], ['привет'],
+        reason: 'сервер повторами наполняет чат мусором');
+  });
+
+
+  test('A24: неизвестный статус квитанции не ломает обработку: сообщение подтверждается (ack)', () async {
+    await boot();
+    final eve = peerKeys('eve');
+    final id = await deliver(eve, 'eve', {'receipt': 'pwned', 'ids': []});
+    expect(await acked(id), isTrue, reason: 'исключение вне try: ack не ушёл, сервер будет доставлять это вечно');
+  });
+
+
+  test('A25: вложение с не-строковым name не роняет список чатов (preview)', () async {
+    await boot();
+    final eve = peerKeys('eve');
+    final id = await deliver(eve, 'eve', {
+      'text': '',
+      'file': {'id': 'abc', 'key': 'AAAA', 'name': 42, 'size': 1},
+    });
+    await acked(id);
+    final m = client.chats['eve']?.lastOrNull;
+    expect(m == null || (() {
+      try {
+        m.preview;
+        return true;
+      } catch (e) {
+        printOnFailure('preview: $e');
+        return false;
+      }
+    })(), isTrue, reason: 'Message.preview бросает исключение: экран чатов не строится, сообщение сохранено навсегда');
+  });
+
+
+  // A23 добавится вместе с исправлениями этапа 4.
+
   test('A26: участник без прав админа не может изменить состав и админов группы', () async {
     await boot(groups: {
       '#g1': {'name': 'G', 'members': ['anna', 'den', 'eve'], 'admins': ['den'], 'v': 1},
