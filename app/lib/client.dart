@@ -103,8 +103,11 @@ class Message {
 }
 
 class ApiException implements Exception {
-  ApiException(this.message);
+  ApiException(this.message, [this.status]);
   final String message;
+
+  /// Код ответа сервера; null — сервер не ответил.
+  final int? status;
   @override
   String toString() => message;
 }
@@ -218,7 +221,11 @@ class AuraClient extends ChangeNotifier {
     if (signedIn) {
       _connect();
     } else if (token != null) {
-      await logout(); // вход сделан до шифрования: нужно войти заново
+      // Ключей нет (вход до шифрования или данные восстановлены на другом телефоне без них): входим заново.
+      // На сервере не выходим: токен может принадлежать другому живому устройству, а брошенное устройство
+      // сервер уберёт сам при следующем входе.
+      token = null;
+      await logout();
     }
   }
 
@@ -288,9 +295,11 @@ class AuraClient extends ChangeNotifier {
       final Map res;
       try {
         res = await _request('GET', _api('/api/link'), null);
-      } catch (_) {
-        // Конверта пока нет (сервер ждал 25 секунд) или нет связи.
-        await Future<void>.delayed(const Duration(seconds: 1));
+      } catch (e) {
+        // Устройство отвязали или вход удалён: ждать нечего.
+        if (e is ApiException && e.status == 401) return logout();
+        // 404 — сервер ждал 25 секунд, а конверта пока нет; иначе нет связи, и повтор через секунду.
+        if (e is! ApiException || e.status != 404) await Future<void>.delayed(const Duration(seconds: 1));
         continue;
       }
       if (!current()) return;
@@ -479,7 +488,9 @@ class AuraClient extends ChangeNotifier {
       throw ApiException('Нет связи с сервером');
     }
     final data = jsonDecode(utf8.decode(res.bodyBytes));
-    if (res.statusCode != 200) throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера');
+    if (res.statusCode != 200) {
+      throw ApiException(data is Map ? data['error'] ?? 'Ошибка сервера' : 'Ошибка сервера', res.statusCode);
+    }
     return data;
   }
 
@@ -1359,7 +1370,13 @@ class AuraClient extends ChangeNotifier {
       await _secure.write(key: 'signal', value: old);
       await _prefs.remove('signal');
     }
-    return _secure.read(key: 'signal');
+    try {
+      return await _secure.read(key: 'signal');
+    } catch (_) {
+      // Хранилище не расшифровать (например, ключ Keystore потерян): без ключей устройство привязывается заново.
+      await _secure.delete(key: 'signal').catchError((_) {});
+      return null;
+    }
   }
 
   void _wsSend(Map<String, dynamic> msg) {

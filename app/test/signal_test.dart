@@ -65,6 +65,17 @@ void main() {
     expect(migrated.identityOf('den'), den.identityKey);
     expect(migrated.hasSession('den', 1), isTrue);
     expect(migrated.hasSession('den', 2), isFalse, reason: 'сессия с чужим ключом забыта');
+
+    // Устройство 1 вышло, ключом аккаунта на сервере стал ключ устройства 2: ему уже доверяли.
+    final restarted = SignalKeys.fromJson(migrated.toJson());
+    await restarted.startSession('den', serverBundle(den2.publicBundle(), 2));
+    expect(restarted.identityOf('den'), den2.identityKey);
+    final impostor = SignalKeys.generate().publicBundle();
+    await expectLater(
+      SignalKeys.fromJson(migrated.toJson()).startSession('den', serverBundle(impostor, 3)),
+      throwsA(anything),
+      reason: 'ключ, которому не доверяли, по-прежнему требует подтверждения',
+    );
   });
 
   test('ключ отправителя в группе: шифрует для всех, переживает перезапуск и смену', () async {

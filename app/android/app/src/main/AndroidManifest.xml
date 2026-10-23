@@ -16,8 +16,10 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <!-- Входящий звонок на весь экран, даже на заблокированном телефоне. -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <!-- Без резервного копирования: ключи Keystore в бэкап не попадают, и восстановленные данные не расшифровать, а переписка в открытом виде не должна уходить в облако. -->
     <application
         android:label="AURA"
+        android:allowBackup="false"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
