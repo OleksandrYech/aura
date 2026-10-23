@@ -5,7 +5,8 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart' show UntrustedIdentityException;
+import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart'
+    show DuplicateMessageException, UntrustedIdentityException;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -898,8 +899,14 @@ class AuraClient extends ChangeNotifier {
     }
   }
 
-  /// Отправитель внутри шифротекста: получатель сверяет его с конвертом сервера (A21).
-  Map<String, dynamic> _signed(Map<String, dynamic> content) => {...content, 'sender': nick, 'senderDevice': device};
+  /// Отправитель и время внутри шифротекста: получатель сверяет отправителя с конвертом сервера (A21)
+  /// и показывает время отправителя, а не сервера (A23).
+  Map<String, dynamic> _signed(Map<String, dynamic> content) => {
+    ...content,
+    'sender': nick,
+    'senderDevice': device,
+    'time': DateTime.now().millisecondsSinceEpoch,
+  };
 
   /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет
   /// или среди них новое неподтверждённое.
@@ -956,7 +963,17 @@ class AuraClient extends ChangeNotifier {
   Future<List<Map<String, dynamic>>> iceServers() async =>
       (await _request('GET', _api('/api/ice'), null) as List).cast();
 
+  /// Подтверждение (ack) уходит всегда: иначе любое исключение при разборе оставит
+  /// сообщение в очереди сервера, и оно будет приходить вечно (A24).
   Future<void> _receive(Map<String, dynamic> msg) async {
+    try {
+      await _handle(msg);
+    } finally {
+      _wsSend({'type': 'ack', 'id': msg['id']});
+    }
+  }
+
+  Future<void> _handle(Map<String, dynamic> msg) async {
     final String id = msg['id'], from = msg['from'];
     // Дубль (повторная доставка) не расшифровываем второй раз.
     if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
@@ -984,9 +1001,14 @@ class AuraClient extends ChangeNotifier {
           if (!hadSession) _keys!.forget(from, fromDevice);
           throw const _Forged();
         }
-        text = content['text'] ?? '';
+        text = content['text'] is String ? content['text'] : '';
         file = content['file'];
         files = (content['files'] as List?)?.cast();
+        // Вложение с полями не того типа сломало бы список чатов и скачивание (A25).
+        if ((file != null && !_validFile(file)) || (files != null && !files.every(_validFile))) {
+          text = '⚠ Некорректное вложение';
+          file = files = null;
+        }
         update = content['groupUpdate'];
         if (content['group'] case final String g) {
           peer = '#$g';
@@ -995,6 +1017,10 @@ class AuraClient extends ChangeNotifier {
         }
       } on _Forged {
         debugPrint('AURA: $id от $from: отправитель внутри не совпадает с конвертом');
+        drop = true;
+        text = '';
+      } on DuplicateMessageException {
+        // Повтор уже расшифрованного шифротекста под новым id: сервер или сбой сети, не показываем (A22).
         drop = true;
         text = '';
       } on UntrustedIdentityException {
@@ -1046,7 +1072,8 @@ class AuraClient extends ChangeNotifier {
       } else if (content?['call'] case final Map signal) {
         onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
       } else if (content?['receipt'] case final String receipt) {
-        _onReceipt(Status.values.byName(receipt), (content!['ids'] as List).cast());
+        // Неизвестный статус (новая версия или мусор) пропускаем.
+        if (Status.values.asNameMap()[receipt] case final status?) _onReceipt(status, (content!['ids'] as List).cast());
       } else if (content?['delete'] case final List ids) {
         _remove(peer, ids.toSet(), by: from == nick ? null : from);
       } else if (update != null && (!group || !_allowed(peer, from, update))) {
@@ -1069,7 +1096,8 @@ class AuraClient extends ChangeNotifier {
                 id: id,
                 mine: mine,
                 text: text,
-                time: msg['sentAt'],
+                // Время сервера — только для старых клиентов; из будущего не бывает.
+                time: min(content?['time'] is int ? content!['time'] : msg['sentAt'], DateTime.now().millisecondsSinceEpoch),
                 status: mine ? Status.sent : Status.delivered,
                 file: file,
                 files: files,
@@ -1084,7 +1112,6 @@ class AuraClient extends ChangeNotifier {
       }
       _save();
     }
-    _wsSend({'type': 'ack', 'id': id});
   }
 
   Timer? _probe;
@@ -1252,6 +1279,17 @@ class _Upload extends http.BaseRequest with http.Abortable {
     }());
   }
 }
+
+/// Вложение от собеседника: {id, key, name, size, chunk?, thumb?} нужных типов.
+bool _validFile(Object? f) =>
+    f is Map &&
+    f['id'] is String &&
+    f['key'] is String &&
+    f['name'] is String &&
+    f['size'] is int &&
+    f['size'] >= 0 &&
+    (f['chunk'] == null || (f['chunk'] is int && f['chunk'] > 0)) &&
+    (f['thumb'] == null || f['thumb'] is String);
 
 /// Отправитель внутри шифротекста не совпадает с конвертом сервера.
 class _Forged implements Exception {

@@ -67,6 +67,8 @@ void main() {
   Future<(int, dynamic)> post(String path, Object body, {String method = 'POST', String? token}) =>
       raw(method, path, utf8.encode(jsonEncode(body)), token: token);
 
+  Future<dynamic> get(String path, String token) async => (await raw('GET', path, [], token: token)).$2;
+
   Map keys(String identity, {int preKeys = 2, int from = 1}) => {
     'registrationId': 7,
     'identityKey': identity,
@@ -103,7 +105,6 @@ void main() {
   };
 
   // --- Входные данные HTTP ---
-  // A02, A04–A07 и A17 добавятся вместе с исправлениями этапа 4.
 
   test('A01: огромное JSON-тело без авторизации отклоняется 413, а не читается в память целиком', () async {
     final big = utf8.encode(jsonEncode({'nick': 'x' * (40 << 20), 'password': 'secret1'}));
@@ -119,6 +120,58 @@ void main() {
     }
     expect(codes, contains(429), reason: 'все попытки обработаны: $codes');
   });
+
+  test('A02: неверные типы полей дают 400, а не 500', () async {
+    final (s1, _) = await post('/api/register', {'nick': 123, 'password': 'secret1'});
+    final (s2, _) = await post('/api/login', {'nick': 'anna', 'password': 42});
+    final u = await user('anna');
+    final (s3, _) = await post('/api/me', {'name': 7}, method: 'PUT', token: u['token']);
+    expect([s1, s2, s3], [400, 401, 400]);
+  });
+
+
+  test('A04: имя при регистрации ограничено 64 символами, как в PUT /api/me', () async {
+    expect((await post('/api/register', {'nick': 'name65', 'password': 'secret1', 'name': 'Я' * 65})).$1, 400);
+    final (s, u) = await post('/api/register', {'nick': 'longname', 'password': 'secret1', 'name': 'Я' * 100000});
+    // 100000 «Я» — это 200 КБ: такой запрос отсекает уже лимит тела (A01, 413).
+    expect(s == 400 || s == 413 || (u['name'] as String).length <= 64, isTrue,
+        reason: 'принято имя: $s ${u['name']?.length}');
+  });
+
+
+  test('A05: одноразовые prekey не копятся без предела', () async {
+    final u = await user('hoarder', withKeys: false);
+    await post('/api/keys', keys('id_h', preKeys: 0), method: 'PUT', token: u['token']);
+    var count = 0;
+    for (var i = 0; i < 25; i++) {
+      final (_, r) = await post('/api/keys', {'preKeys': keys('x', preKeys: 200, from: i * 200)['preKeys']},
+          method: 'PUT', token: u['token']);
+      count = r['preKeys'] ?? count;
+    }
+    expect(count, lessThanOrEqualTo(1000), reason: 'на сервере хранится $count prekey одного устройства');
+  });
+
+
+  test('A06: посторонний не может за секунды выбрать все одноразовые prekey жертвы', () async {
+    final victim = await user('victim');
+    final eve = await user('eve');
+    for (var i = 0; i < 10; i++) {
+      await get('/api/keys/victim/${victim['device']}', eve['token']);
+    }
+    // Повторные запросы получают набор без одноразового ключа, у жертвы ключи остаются.
+    final left = aura.db.select("SELECT count(*) AS n FROM prekeys WHERE nick = 'victim'").first['n'];
+    expect(left, greaterThan(0), reason: 'все prekey жертвы израсходованы посторонним');
+    expect((await get('/api/keys/victim/${victim['device']}', eve['token']))['identityKey'], 'id_victim');
+  });
+
+
+  test('A07: Range с огромными числами даёт 416, а не 500', () async {
+    final u = await user('anna');
+    final (_, up) = await raw('POST', '/api/files', List.filled(100, 1), token: u['token']);
+    final (s, _) = await raw('GET', '/api/files/${up['id']}', [], token: u['token'], range: 'bytes=99999999999999999999-1');
+    expect(s, anyOf(206, 416));
+  });
+
 
   test('A08: путь с .. в id файла не выходит за каталог файлов', () async {
     final u = await user('anna');
@@ -223,6 +276,29 @@ void main() {
     final calls = pushed.where((p) => p.$2 == 'call').length;
     expect(calls, lessThanOrEqualTo(3), reason: 'за секунду ушло $calls push «Входящий звонок» от постороннего с мусором вместо шифротекста');
   });
+
+  test('A17: одинаковый id от разных отправителей не теряется молча: второму отправителю ошибка', () async {
+    final den = await user('den');
+    final eve = await user('eve');
+    final anna = await user('anna');
+    final (eveWs, eveIn) = await connect(eve['token']);
+    eveWs.sink.add(jsonEncode(sendMsg('shared-id', 'den', 'from-eve')));
+    await eveIn.moveNext().timeout(const Duration(seconds: 5));
+    final (annaWs, annaIn) = await connect(anna['token']);
+    annaWs.sink.add(jsonEncode(sendMsg('shared-id', 'den', 'from-anna')));
+    await annaIn.moveNext().timeout(const Duration(seconds: 5));
+    expect(annaIn.current['type'], 'error', reason: 'анне ответили «sent», будто сообщение принято');
+    final (denWs, denIn) = await connect(den['token']);
+    final got = <String>[];
+    while (await denIn.moveNext().timeout(const Duration(seconds: 2), onTimeout: () => false)) {
+      got.add(denIn.current['body']);
+    }
+    await eveWs.sink.close();
+    await annaWs.sink.close();
+    await denWs.sink.close();
+    expect(got, ['from-eve'], reason: 'сообщение Евы не заглушено, Анна узнала об ошибке');
+  });
+
 
   test('A18: сообщение для чужого устройства или лишнего устройства отклоняется', () async {
     await user('den');
