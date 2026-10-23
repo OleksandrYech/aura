@@ -230,36 +230,56 @@ void main() {
     expect(stolen, isNull, reason: 'сервер прочитал сообщение через призрачное устройство: $stolen');
   });
 
-  test('A19: после подтверждения нового устройства сообщение уходит и на него', () async {
+  test('A19: новое устройство с ключом аккаунта принимается само, смена ключа — после подтверждения', () async {
     await boot();
     final den = SignalKeys.generate(), denPub = den.publicBundle();
-    final den2 = SignalKeys.generate(), den2Pub = den2.publicBundle();
+    final den2 = SignalKeys.generate(await den.getIdentityKeyPair()), den2Pub = den2.publicBundle();
     fake.devices['den'] = [
       {'device': 1, 'identityKey': denPub['identityKey']},
     ];
     fake.bundles['den/1'] = bundleOf(denPub, 1);
     client.send('den', 'первое');
     expect(await waitFor(() => fake.frames.any((f) => f['type'] == 'send' && f['to'] == 'den')), isTrue);
+    final before = await client.safetyNumber('den');
 
+    // Ден привязал второе устройство: ключ тот же, подтверждать нечего, код не меняется.
     fake.devices['den']!.add({'device': 2, 'identityKey': den2Pub['identityKey']});
     fake.bundles['den/2'] = bundleOf(den2Pub, 2);
     client.send('den', 'второе');
-    final m = client.chats['den']!.firstWhere((m) => m.text == 'второе');
-    await waitFor(() => fake.frames.any((f) => f['id'] == m.id));
-    fake.push({'type': 'error', 'id': m.id, 'to': 'den', 'error': 'devices'});
-    expect(await waitFor(() => m.status == Status.failed), isTrue, reason: 'без подтверждения не отправлено');
-    expect(client.hasNewDevice('den'), isTrue);
-    expect(client.chats['den']!.any((m) => m.update != null && m.text.contains('новое устройство')), isTrue);
-
-    final before = await client.safetyNumber('den');
-    await client.approveDevices('den');
+    final m2 = client.chats['den']!.firstWhere((m) => m.text == 'второе');
+    await waitFor(() => fake.frames.any((f) => f['id'] == m2.id));
+    fake.push({'type': 'error', 'id': m2.id, 'to': 'den', 'error': 'devices'});
     expect(
-      await waitFor(() => fake.frames.any((f) => f['id'] == m.id && (f['payloads'] as List).any((p) => p['device'] == 2))),
+      await waitFor(() => fake.frames.any((f) => f['id'] == m2.id && (f['payloads'] as List).any((p) => p['device'] == 2))),
       isTrue,
     );
-    final p = (fake.frames.lastWhere((f) => f['id'] == m.id)['payloads'] as List).firstWhere((p) => p['device'] == 2);
-    expect(jsonDecode(await den2.decrypt('anna', 1, p['type'], p['body']))['text'], 'второе');
-    expect(await client.safetyNumber('den'), isNot(before), reason: 'код учитывает подтверждённое устройство');
+    final p2 = (fake.frames.lastWhere((f) => f['id'] == m2.id)['payloads'] as List).firstWhere((p) => p['device'] == 2);
+    expect(jsonDecode(await den2.decrypt('anna', 1, p2['type'], p2['body']))['text'], 'второе');
+    expect(client.hasNewDevice('den'), isFalse);
+    expect(await client.safetyNumber('den'), before, reason: 'новое устройство код безопасности не меняет');
+
+    // Ден начал заново: старых устройств нет, у нового другой ключ аккаунта.
+    final reset = SignalKeys.generate(), resetPub = reset.publicBundle();
+    fake.devices['den'] = [
+      {'device': 3, 'identityKey': resetPub['identityKey']},
+    ];
+    fake.bundles['den/3'] = bundleOf(resetPub, 3);
+    client.send('den', 'третье');
+    final m3 = client.chats['den']!.firstWhere((m) => m.text == 'третье');
+    await waitFor(() => fake.frames.any((f) => f['id'] == m3.id));
+    fake.push({'type': 'error', 'id': m3.id, 'to': 'den', 'error': 'devices'});
+    expect(await waitFor(() => m3.status == Status.failed), isTrue, reason: 'без подтверждения не отправлено');
+    expect(client.hasNewDevice('den'), isTrue);
+    expect(client.chats['den']!.any((m) => m.update != null && m.text.contains('Код безопасности')), isTrue);
+
+    await client.approveDevices('den');
+    expect(
+      await waitFor(() => fake.frames.any((f) => f['id'] == m3.id && (f['payloads'] as List).any((p) => p['device'] == 3))),
+      isTrue,
+    );
+    final p3 = (fake.frames.lastWhere((f) => f['id'] == m3.id)['payloads'] as List).single;
+    expect(jsonDecode(await reset.decrypt('anna', 1, p3['type'], p3['body']))['text'], 'третье');
+    expect(await client.safetyNumber('den'), isNot(before), reason: 'код безопасности учитывает новый ключ');
   });
 
   test('A19: сервер не может подсунуть новое устройство знакомого собеседника входящим сообщением', () async {
@@ -446,7 +466,7 @@ void main() {
     fake.routes['GET /api/link'] = (_) async => {'envelope': await envelope.future};
     fake.routes['PUT /api/keys'] = (body) => published = jsonDecode(body);
 
-    await client.login('anna', 'pw', link: true);
+    await client.login('anna', 'pw');
     expect(client.needsLink, isTrue);
     expect(client.signedIn, isFalse, reason: 'без ключа аккаунта вход не завершён');
     expect(published, isNull, reason: 'своих ключей личности новое устройство не создаёт');
@@ -474,7 +494,7 @@ void main() {
         {'token': 't2', 'nick': 'anna', 'name': 'Anna', 'device': 2, 'identityKey': annaPub['identityKey']};
     fake.routes['GET /api/link'] = (_) async => {'envelope': await envelope.future};
 
-    await client.login('anna', 'pw', link: true);
+    await client.login('anna', 'pw');
     final code = jsonDecode(utf8.decode(base64Url.decode(client.startLinking())));
     final mallory = await SignalKeys.generate().getIdentityKeyPair();
     envelope.complete(LinkEnvelope.seal(Curve.decodePoint(base64.decode(code['key']), 0), mallory, 'anna', 2));

@@ -192,7 +192,7 @@ class AuraClient extends ChangeNotifier {
     name = _prefs.getString('name');
     device = _prefs.getInt('device');
     final keys = _prefs.getString('signal');
-    if (keys != null) _keys = SignalKeys.fromJson(keys)..allowed.addAll([?nick]);
+    if (keys != null && nick != null) _keys = SignalKeys.fromJson(keys)..trustOwn(nick!);
     final raw = _prefs.getString('chats');
     if (raw != null) {
       final j = jsonDecode(raw) as Map<String, dynamic>;
@@ -217,12 +217,11 @@ class AuraClient extends ChangeNotifier {
   Future<void> register(String nick, String password) =>
       _auth('/api/register', {'nick': nick, 'password': password});
 
-  /// [link] — на аккаунт с ключом войти привязкой ([startLinking]), а не со своим новым ключом.
-  // ponytail: false по умолчанию, пока нет экранов привязки (PR 5); с PR 6–7 привязка обязательна.
-  Future<void> login(String nick, String password, {bool link = false}) =>
-      _auth('/api/login', {'nick': nick, 'password': password}, link: link);
+  /// На аккаунт с ключом новое устройство входит привязкой ([startLinking]).
+  Future<void> login(String nick, String password) =>
+      _auth('/api/login', {'nick': nick, 'password': password});
 
-  Future<void> _auth(String path, Map body, {bool link = false}) async {
+  Future<void> _auth(String path, Map body) async {
     final res = await _request('POST', _api(path), body);
     token = res['token'];
     nick = res['nick'];
@@ -231,7 +230,7 @@ class AuraClient extends ChangeNotifier {
     _accountKey = res['identityKey'];
     linkError = null;
     // Каждый вход — новое устройство. Ключ аккаунта создаёт только первое, остальные получают его привязкой.
-    if (link && _accountKey != null) return notifyListeners();
+    if (_accountKey != null) return notifyListeners();
     await _signIn(SignalKeys.generate());
   }
 
@@ -244,7 +243,7 @@ class AuraClient extends ChangeNotifier {
       rethrow;
     }
     _keys = keys;
-    keys.allowed.add(nick!); // свои новые устройства — входы на этом же аккаунте
+    keys.trustOwn(nick!);
     await _prefs.setString('token', token!);
     await _prefs.setString('nick', nick!);
     await _prefs.setString('name', name!);
@@ -271,13 +270,6 @@ class AuraClient extends ChangeNotifier {
         }),
       ),
     );
-  }
-
-  /// Привязка невозможна (старого устройства нет под рукой): войти со своим новым ключом, как раньше.
-  // ponytail: уходит в PR 6–7, когда сервер начнёт требовать ключ аккаунта; дальше — «Начать заново» (PR 8).
-  Future<void> skipLinking() {
-    _linkRun++;
-    return _signIn(SignalKeys.generate());
   }
 
   Future<void> _awaitLink(ECKeyPair mine, int run) async {
@@ -358,23 +350,19 @@ class AuraClient extends ChangeNotifier {
   }
 
   /// Код безопасности с собеседником: сверьте его при встрече или по другому каналу.
-  /// Считается по ключам, на которые реально шифруются сообщения (из сессий), а не по списку
-  /// с сервера: иначе сервер покажет настоящие ключи, а сессии построит на свои (A20).
-  /// Неподтверждённые новые устройства собеседника в код не входят: им ничего не шифруется.
+  /// Считается по двум ключам аккаунтов, которым доверяют сессии, а не по списку с сервера:
+  /// иначе сервер покажет настоящий ключ, а сессии построит на свой (A20). Новые устройства
+  /// собеседника его не меняют: у них тот же ключ аккаунта.
   Future<String> safetyNumber(String peer) async {
     final keys = _keys!;
-    Future<List<String>> ids(String n) async {
-      _devices.remove(n);
-      return [
-        if (n == nick) keys.identityKey,
-        for (final d in await _devicesOf(n))
-          if (await _session(n, d)) keys.identityOf(n, d)!,
-      ];
+    if (keys.identityOf(peer) == null) {
+      _devices.remove(peer);
+      for (final d in await _devicesOf(peer)) {
+        if (await _session(peer, d)) break;
+      }
+      await _saveKeys();
     }
-
-    final mine = await ids(nick!), theirs = await ids(peer);
-    await _saveKeys();
-    return SignalKeys.safetyNumber(nick!, mine, peer, theirs);
+    return SignalKeys.safetyNumber(nick!, [keys.identityKey], peer, [?keys.identityOf(peer)]);
   }
 
   /// Сессия с устройством, при необходимости по набору ключей с сервера.
@@ -394,7 +382,7 @@ class AuraClient extends ChangeNotifier {
 
   bool hasNewDevice(String peer) => _newDevices.contains(peer);
 
-  /// У собеседника новое устройство: сообщение не уходит, пока пользователь не подтвердит.
+  /// У собеседника устройство с другим ключом аккаунта: сообщение не уходит, пока пользователь не подтвердит.
   void _onNewDevice(String peer, String? id) {
     for (final m in chats[peer] ?? <Message>[]) {
       if (m.id == id && m.status == Status.pending) m.status = Status.failed;
@@ -406,8 +394,8 @@ class AuraClient extends ChangeNotifier {
             Message(
               id: _newId(),
               mine: false,
-              text: 'У ${nameOf(peer)} новое устройство, код безопасности изменился. '
-                  'Сообщения на него не отправляются, пока вы не подтвердите.',
+              text: 'Код безопасности с ${nameOf(peer)} изменился: у аккаунта новый ключ. '
+                  'Сообщения не отправляются, пока вы не подтвердите.',
               time: DateTime.now().millisecondsSinceEpoch,
               status: Status.read,
               update: const {'note': true},
@@ -418,12 +406,10 @@ class AuraClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Пользователь подтвердил новые устройства собеседника: им доверяем и шлём заново не отправленное.
+  /// Пользователь подтвердил новый ключ собеседника: забываем старый и шлём заново не отправленное.
   Future<void> approveDevices(String peer) async {
     _devices.remove(peer);
-    for (final d in await _devicesOf(peer)) {
-      _keys!.allowed.add('$peer:$d');
-    }
+    _keys!.untrust(peer);
     _newDevices.remove(peer);
     for (final m in [...?chats[peer]].where((m) => m.mine && m.status == Status.failed)) {
       retry(peer, m);

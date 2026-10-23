@@ -513,15 +513,15 @@ class _ChatScreenState extends State<ChatScreen> {
     return sent;
   }
 
-  /// Повтор не отправленного сообщения. Если у собеседника новое устройство, сначала спросить.
+  /// Повтор не отправленного сообщения. Если у собеседника новый ключ аккаунта, сначала спросить.
   Future<void> _retry(Message m) async {
     if (!client.hasNewDevice(widget.peer)) return client.retry(widget.peer, m);
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Новое устройство'),
-        content: Text('У ${client.title(widget.peer)} появилось новое устройство. Если вы не ждали этого, '
-            'сначала сверьте код безопасности: новое устройство мог добавить кто-то другой.'),
+        title: const Text('Код безопасности изменился'),
+        content: Text('У ${client.title(widget.peer)} новый ключ аккаунта: так бывает, если собеседник начал заново. '
+            'Если вы этого не ждали, сначала сверьте код безопасности: ключ мог подменить кто-то другой.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Отмена')),
           TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Отправить всё равно')),

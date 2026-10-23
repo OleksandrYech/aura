@@ -14,13 +14,9 @@ class SignalKeys extends InMemorySignalProtocolStore {
   final int _registrationId;
   int nextPreKeyId;
 
-  /// Ключи собеседников по адресу «ник:устройство». Адрес на сервере не переиспользуется,
-  /// поэтому другой ключ на известном адресе означает подмену, и такая сессия не устанавливается.
-  final _trusted = <SignalProtocolAddress, IdentityKey>{};
-
-  /// Ники и адреса «ник:устройство», чьи новые устройства принимаются без подтверждения:
-  /// свой ник и устройства, которые пользователь подтвердил. Не сохраняется.
-  final allowed = <String>{};
+  /// Ключ аккаунта собеседника по нику: у всех его устройств один ключ. Устройство с другим ключом
+  /// сервер добавить не может (у него нет приватного ключа аккаунта), а клиент его не принимает.
+  final _trusted = <String, IdentityKey>{};
 
   static const preKeyBatch = 50;
 
@@ -96,7 +92,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
   }
 
   /// Код безопасности из 60 цифр: одинаковый у обоих собеседников, пока никто не подменил ключи.
-  /// Ключи — все устройства каждого аккаунта (base64, как их отдаёт сервер).
+  /// Ключи — ключи аккаунтов (base64, как их отдаёт сервер).
   static String safetyNumber(String me, List<String> myKeys, String peer, List<String> peerKeys) {
     List<IdentityKey> ids(List<String> keys) => [for (final k in keys) IdentityKey.fromBytes(_bytes(k), 0)];
     return NumericFingerprintGenerator(5200)
@@ -147,41 +143,52 @@ class SignalKeys extends InMemorySignalProtocolStore {
 
   // --- Доверие к ключам собеседников ---
 
-  /// Новое устройство знакомого собеседника не принимается, пока его не подтвердили ([allowed]):
-  /// иначе сервер может молча добавить собеседнику своё устройство и читать переписку (A19).
-  /// Ключ первого собеседника принимается на доверии, его проверяет сверка кода безопасности.
+  /// Устройство с ключом не аккаунта не принимается, пока пользователь не подтвердит смену ключа
+  /// ([untrust]): иначе сервер может молча добавить собеседнику своё устройство и читать переписку (A19).
+  /// Ключ нового собеседника принимается на доверии, его проверяет сверка кода безопасности.
   @override
   Future<bool> isTrustedIdentity(SignalProtocolAddress address, IdentityKey? identityKey, Direction direction) async {
     if (identityKey == null) return false;
-    if (_trusted[address] case final known?) return known == identityKey;
-    final name = address.getName();
-    return allowed.contains(name) || allowed.contains(_addr(address)) || !_trusted.keys.any((a) => a.getName() == name);
+    final known = _trusted[address.getName()];
+    return known == null || known == identityKey;
   }
 
-  /// Ключ, которому доверяет сессия с устройством, или null, если сессии ещё не было.
-  String? identityOf(String nick, int device) {
-    final key = _trusted[SignalProtocolAddress(nick, device)];
+  /// Ключ аккаунта, которому доверяем, или null, если сессий с ним ещё не было.
+  String? identityOf(String nick) {
+    final key = _trusted[nick];
     return key == null ? null : _b64(key.serialize());
   }
 
   String get identityKey => _b64(_identity.getPublicKey().serialize());
 
-  /// Забыть сессию и ключ устройства: расшифрованное оказалось чужим (A21).
+  /// Свои устройства принимаются только с ключом аккаунта.
+  void trustOwn(String nick) {
+    if (_trusted[nick] == _identity.getPublicKey()) return;
+    untrust(nick);
+    _trusted[nick] = _identity.getPublicKey();
+  }
+
+  /// Пользователь подтвердил смену ключа собеседника: забываем старый ключ и сессии с ним.
+  void untrust(String nick) {
+    _trusted.remove(nick);
+    sessionStore.sessions.removeWhere((a, _) => a.getName() == nick);
+  }
+
+  /// Забыть сессию: расшифрованное оказалось чужим (A21). Ключ — если он пришёл с этой сессией.
   void forget(String nick, int device) {
-    final a = SignalProtocolAddress(nick, device);
-    sessionStore.sessions.remove(a);
-    _trusted.remove(a);
+    sessionStore.sessions.remove(SignalProtocolAddress(nick, device));
+    if (!sessionStore.sessions.keys.any((a) => a.getName() == nick)) _trusted.remove(nick);
   }
 
   @override
   Future<bool> saveIdentity(SignalProtocolAddress address, IdentityKey? identityKey) async {
-    if (identityKey == null || _trusted[address] == identityKey) return false;
-    _trusted[address] = identityKey;
+    if (identityKey == null || _trusted[address.getName()] == identityKey) return false;
+    _trusted[address.getName()] = identityKey;
     return true;
   }
 
   @override
-  Future<IdentityKey?> getIdentity(SignalProtocolAddress address) async => _trusted[address];
+  Future<IdentityKey?> getIdentity(SignalProtocolAddress address) async => _trusted[address.getName()];
 
   // --- Сохранение ---
 
@@ -198,7 +205,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
     'preKeys': {for (final e in preKeyStore.store.entries) '${e.key}': _b64(e.value)},
     'signedPreKeys': {for (final e in signedPreKeyStore.store.entries) '${e.key}': _b64(e.value)},
     'sessions': {for (final e in sessionStore.sessions.entries) _addr(e.key): _b64(e.value)},
-    'trusted': {for (final e in _trusted.entries) _addr(e.key): _b64(e.value.serialize())},
+    'trusted': {for (final e in _trusted.entries) e.key: _b64(e.value.serialize())},
     'senderKeys': {for (final e in senderKeys.entries) e.key: _b64(e.value)},
   });
 
@@ -218,9 +225,19 @@ class SignalKeys extends InMemorySignalProtocolStore {
     for (final MapEntry(:key, :value) in (j['sessions'] as Map<String, dynamic>).entries) {
       keys.sessionStore.sessions[_parseAddr(key)] = _bytes(value);
     }
+    // До одного ключа на аккаунт ключи хранились по адресу «ник:устройство». Ключом аккаунта
+    // остаётся ключ самого старого устройства (как на сервере), сессии с другими ключами забываются.
+    final old = <SignalProtocolAddress, IdentityKey>{};
     for (final MapEntry(:key, :value) in (j['trusted'] as Map<String, dynamic>).entries) {
-      keys._trusted[_parseAddr(key)] = IdentityKey.fromBytes(_bytes(value), 0);
+      final k = IdentityKey.fromBytes(_bytes(value), 0);
+      key.contains(':') ? old[_parseAddr(key)] = k : keys._trusted[key] = k;
     }
+    for (final a in old.keys.toList()..sort((a, b) => a.getDeviceId() - b.getDeviceId())) {
+      keys._trusted.putIfAbsent(a.getName(), () => old[a]!);
+    }
+    old.forEach((a, k) {
+      if (keys._trusted[a.getName()] != k) keys.sessionStore.sessions.remove(a);
+    });
     for (final MapEntry(:key, :value) in (j['senderKeys'] as Map<String, dynamic>? ?? {}).entries) {
       keys.senderKeys[key] = _bytes(value);
     }
