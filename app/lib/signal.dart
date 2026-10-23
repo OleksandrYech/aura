@@ -18,6 +18,11 @@ class SignalKeys extends InMemorySignalProtocolStore {
   /// сервер добавить не может (у него нет приватного ключа аккаунта), а клиент его не принимает.
   final _trusted = <String, IdentityKey>{};
 
+  /// Ключи других устройств собеседника, которым доверяли до одного ключа на аккаунт. Сервер выбрал
+  /// ключом аккаунта ключ самого старого из живых устройств, и он может оказаться здесь, а не в [_trusted]:
+  /// такой ключ принимается без предупреждения, пользователь ему уже доверял.
+  final _formerly = <String, Set<String>>{}; // base64: у IdentityKey hashCode не по содержимому
+
   static const preKeyBatch = 50;
 
   /// [identity] — ключ аккаунта, полученный при привязке (см. LinkEnvelope); без него создаётся новый.
@@ -150,7 +155,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
   Future<bool> isTrustedIdentity(SignalProtocolAddress address, IdentityKey? identityKey, Direction direction) async {
     if (identityKey == null) return false;
     final known = _trusted[address.getName()];
-    return known == null || known == identityKey;
+    return known == null || known == identityKey || (_formerly[address.getName()]?.contains(_b64(identityKey.serialize())) ?? false);
   }
 
   /// Ключ аккаунта, которому доверяем, или null, если сессий с ним ещё не было.
@@ -171,6 +176,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
   /// Пользователь подтвердил смену ключа собеседника: забываем старый ключ и сессии с ним.
   void untrust(String nick) {
     _trusted.remove(nick);
+    _formerly.remove(nick);
     sessionStore.sessions.removeWhere((a, _) => a.getName() == nick);
   }
 
@@ -184,6 +190,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
   Future<bool> saveIdentity(SignalProtocolAddress address, IdentityKey? identityKey) async {
     if (identityKey == null || _trusted[address.getName()] == identityKey) return false;
     _trusted[address.getName()] = identityKey;
+    _formerly.remove(address.getName());
     return true;
   }
 
@@ -206,6 +213,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
     'signedPreKeys': {for (final e in signedPreKeyStore.store.entries) '${e.key}': _b64(e.value)},
     'sessions': {for (final e in sessionStore.sessions.entries) _addr(e.key): _b64(e.value)},
     'trusted': {for (final e in _trusted.entries) e.key: _b64(e.value.serialize())},
+    'formerly': {for (final e in _formerly.entries) e.key: [...e.value]},
     'senderKeys': {for (final e in senderKeys.entries) e.key: _b64(e.value)},
   });
 
@@ -236,8 +244,13 @@ class SignalKeys extends InMemorySignalProtocolStore {
       keys._trusted.putIfAbsent(a.getName(), () => old[a]!);
     }
     old.forEach((a, k) {
-      if (keys._trusted[a.getName()] != k) keys.sessionStore.sessions.remove(a);
+      if (keys._trusted[a.getName()] == k) return;
+      keys.sessionStore.sessions.remove(a);
+      keys._formerly.putIfAbsent(a.getName(), () => {}).add(_b64(k.serialize()));
     });
+    for (final MapEntry(:key, :value) in (j['formerly'] as Map<String, dynamic>? ?? {}).entries) {
+      keys._formerly[key] = {...(value as List).cast<String>()};
+    }
     for (final MapEntry(:key, :value) in (j['senderKeys'] as Map<String, dynamic>? ?? {}).entries) {
       keys.senderKeys[key] = _bytes(value);
     }

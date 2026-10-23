@@ -7,6 +7,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart' show Curve;
 import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
@@ -127,6 +128,9 @@ class AuraServer {
   /// Устройств на аккаунт; устройство без активности дольше [deviceTtl] выходит.
   static const maxDevices = 10;
   static const deviceTtl = Duration(days: 90);
+
+  /// Сколько вход без ключа ждёт привязки, прежде чем следующий вход его удалит.
+  static const unlinkedTtl = Duration(hours: 1);
 
   /// Шифротекст одного сообщения для одного устройства, символов base64: хватает на альбом из 10 видео с превью.
   static const maxMessage = 500000;
@@ -269,6 +273,13 @@ class AuraServer {
       return _error(401, 'Неверный никнейм или пароль');
     }
     _hits.remove('login:$nick');
+    // Места не занимают устройства, которые так и не привязались (их токен потерян с перезапуском
+    // приложения), и неактивные дольше [deviceTtl]: сами они больше не придут, а в списке их не видно.
+    final now = _now();
+    db.execute(
+      'DELETE FROM devices WHERE nick = ? AND ((identity_key IS NULL AND created_at < ?) OR coalesce(seen_at, created_at) < ?)',
+      [nick, now - unlinkedTtl.inMilliseconds, now - deviceTtl.inMilliseconds],
+    );
     final devices = db.select('SELECT count(*) AS n FROM devices WHERE nick = ?', [nick]).first['n'] as int;
     if (devices >= maxDevices) return _error(403, 'Слишком много устройств: отвяжите лишние в настройках');
     return _session(nick);
@@ -347,7 +358,14 @@ class AuraServer {
   }
 
   /// Отвязать устройство своего аккаунта: оно удаляется, как при выходе, и отключается.
+  /// Только с привязанного устройства: одного пароля мало, чтобы выкинуть устройства с ключом.
   Response _unlink(Request req, Device me, String device) {
+    if (db.select('SELECT 1 FROM devices WHERE nick = ? AND device = ? AND identity_key IS NOT NULL', [
+      me.nick,
+      me.device,
+    ]).isEmpty) {
+      return _error(403, 'Отвязать устройство можно только с привязанного');
+    }
     final d = (nick: me.nick, device: int.tryParse(device) ?? 0);
     _online.remove(d)?.sink.close(4401, 'unlinked');
     db.execute('DELETE FROM devices WHERE nick = ? AND device = ?', [d.nick, d.device]);
@@ -355,6 +373,19 @@ class AuraServer {
   }
 
   // --- Ключи Signal Protocol (только публичные части) ---
+
+  /// Подписан ли [key] ключом личности [identity] (всё в base64, как присылает клиент).
+  static bool _signed(Object? identity, Object? key, Object? signature) {
+    try {
+      return Curve.verifySignature(
+        Curve.decodePoint(base64.decode(identity as String), 0),
+        base64.decode(key as String),
+        base64.decode(signature as String),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// {registrationId, identityKey, signedPreKey: {id, key, signature}, preKeys: [{id, key}]}.
   /// Ключ личности задаётся один раз, остальное можно обновлять и пополнять.
@@ -376,6 +407,11 @@ class AuraServer {
       me.nick,
       me.device,
     ]).first;
+    // Публичный ключ аккаунта знает любой, поэтому без проверки подписи вход по одному паролю
+    // добавил бы аккаунту устройство с мусорным signed prekey, и собеседники не смогли бы ему писать.
+    if (spk is Map && !_signed(identity ?? current['identity_key'], spk['key'], spk['signature'])) {
+      return _error(400, 'Подпись ключа не сходится');
+    }
     if (identity != null) {
       if (current['identity_key'] != null && current['identity_key'] != identity) {
         return _error(409, 'Ключ устройства уже задан');
@@ -389,8 +425,6 @@ class AuraServer {
         me.device,
       ]);
       // Первое устройство с ключом задаёт ключ аккаунта, остальные получают его привязкой.
-      // ponytail: подпись signed prekey сервер не проверяет — её проверяют клиенты собеседников
-      // (A30), а сервер в модели угроз и так может подменить что угодно.
       db.execute('UPDATE users SET identity_key = ? WHERE nick = ? AND identity_key IS NULL', [identity, me.nick]);
     }
     if (spk is Map) {

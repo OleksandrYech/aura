@@ -10,6 +10,8 @@ import 'dart:io';
 import 'package:server/server.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:test/test.dart';
+
+import 'signal_keys.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
@@ -71,8 +73,8 @@ void main() {
 
   Map keys(String identity, {int preKeys = 2, int from = 1}) => {
     'registrationId': 7,
-    'identityKey': identity,
-    'signedPreKey': {'id': 1, 'key': 'spk', 'signature': 'sig'},
+    'identityKey': id(identity),
+    'signedPreKey': signedPreKey(identity),
     'preKeys': [
       for (var i = from; i < from + preKeys; i++) {'id': i, 'key': 'pk$i'},
     ],
@@ -161,7 +163,7 @@ void main() {
     // Повторные запросы получают набор без одноразового ключа, у жертвы ключи остаются.
     final left = aura.db.select("SELECT count(*) AS n FROM prekeys WHERE nick = 'victim'").first['n'];
     expect(left, greaterThan(0), reason: 'все prekey жертвы израсходованы посторонним');
-    expect((await get('/api/keys/victim/${victim['device']}', eve['token']))['identityKey'], 'id_victim');
+    expect((await get('/api/keys/victim/${victim['device']}', eve['token']))['identityKey'], id('id_victim'));
   });
 
 
@@ -198,6 +200,16 @@ void main() {
     expect(s, 409);
     await post('/api/logout', {}, token: anna['token']);
     expect((await raw('GET', '/api/ice', [], token: anna['token'])).$1, 401);
+  });
+
+  test('вход по одному паролю не добавляет аккаунту устройство с ключом аккаунта и мусорной подписью', () async {
+    final anna = await user('anna');
+    final (_, stolen) = await post('/api/login', {'nick': 'anna', 'password': 'secret1'});
+    final bad = keys('id_anna')..['signedPreKey'] = {...signedPreKey('id_eve'), 'id': 1};
+    expect((await post('/api/keys', bad, method: 'PUT', token: stolen['token'])).$1, 400);
+    final noKey = {'signedPreKey': signedPreKey('id_eve')};
+    expect((await post('/api/keys', noKey, method: 'PUT', token: stolen['token'])).$1, 400, reason: 'ключа личности нет');
+    expect(await get('/api/devices/anna', anna['token']), hasLength(1));
   });
 
   // --- WebSocket ---
