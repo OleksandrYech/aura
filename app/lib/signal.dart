@@ -5,7 +5,7 @@ import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart';
 
 /// Ключи Signal Protocol этого устройства и сессии с собеседниками.
 /// Приватные ключи не покидают устройство: на сервер уходят только публичные части.
-// ponytail: хранится в SharedPreferences, перейти на защищённое хранилище ОС (Keychain/Keystore) вместе с биометрией.
+// Хранится в Keychain/Keystore (AuraClient._saveKeys); в Web — в localStorage, защищённого хранилища там нет.
 // ponytail: signed prekey не ротируется, добавить ротацию раз в месяц.
 class SignalKeys extends InMemorySignalProtocolStore {
   SignalKeys._(this._identity, this._registrationId, this.nextPreKeyId) : super(_identity, _registrationId);
