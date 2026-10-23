@@ -24,8 +24,9 @@ class SignalKeys extends InMemorySignalProtocolStore {
 
   static const preKeyBatch = 50;
 
-  factory SignalKeys.generate() {
-    final keys = SignalKeys._(generateIdentityKeyPair(), generateRegistrationId(false), 1);
+  /// [identity] — ключ аккаунта, полученный при привязке (см. LinkEnvelope); без него создаётся новый.
+  factory SignalKeys.generate([IdentityKeyPair? identity]) {
+    final keys = SignalKeys._(identity ?? generateIdentityKeyPair(), generateRegistrationId(false), 1);
     final spk = generateSignedPreKey(keys._identity, 1);
     keys.signedPreKeyStore.store[spk.id] = spk.serialize();
     return keys;
