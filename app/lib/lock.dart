@@ -16,12 +16,30 @@ class AppLock {
   /// Системный экран выбора файла уводит приложение в фон; на это время не блокируем.
   static int _picking = 0;
 
+  /// Когда приложение ушло в фон во время выбора файла.
+  static DateTime? _hiddenAt;
+
+  /// Выбор файла дольше этого считается «оставленным телефоном»: после него запираем.
+  static const pickLimit = Duration(minutes: 1);
+
+  /// Запереть открытый [LockGate].
+  static void Function()? _lock;
+
+  /// Выбор кончился, а приложение ещё в фоне или выбирали слишком долго — запираем (A31).
   static Future<T> whilePicking<T>(Future<T> Function() pick) async {
     _picking++;
     try {
       return await pick();
     } finally {
       _picking--;
+      final away = _hiddenAt;
+      if (_picking == 0 && away != null) {
+        _hiddenAt = null;
+        if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed ||
+            DateTime.now().difference(away) > pickLimit) {
+          _lock?.call();
+        }
+      }
     }
   }
 
@@ -65,20 +83,34 @@ class _LockGateState extends State<LockGate> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    AppLock._lock = _lockNow;
     if (_locked) WidgetsBinding.instance.addPostFrameCallback((_) => _unlock());
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (AppLock._lock == _lockNow) AppLock._lock = null;
     super.dispose();
+  }
+
+  void _lockNow() {
+    if (!AppLock.enabled.value || !mounted) return;
+    // Фокус уходит из полей ввода: иначе клавиатура продолжит писать в скрытый чат (A32).
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => _locked = true);
+    if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) _unlock();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Только уход в фон: системный диалог биометрии делает приложение лишь inactive.
-    if (state == AppLifecycleState.hidden && AppLock.enabled.value && !_unlocking && AppLock._picking == 0) {
-      setState(() => _locked = true);
+    if (state == AppLifecycleState.hidden && AppLock.enabled.value && !_unlocking) {
+      if (AppLock._picking == 0) {
+        _lockNow();
+      } else {
+        AppLock._hiddenAt ??= DateTime.now();
+      }
     } else if (state == AppLifecycleState.resumed && _locked) {
       _unlock();
     }
@@ -98,7 +130,10 @@ class _LockGateState extends State<LockGate> with WidgetsBindingObserver {
     return Stack(
       children: [
         // Содержимое остаётся живым (открытый чат не теряется), но не рисуется под замком.
-        Offstage(offstage: _locked, child: widget.child),
+        Offstage(
+          offstage: _locked,
+          child: ExcludeFocus(excluding: _locked, child: widget.child),
+        ),
         if (_locked)
           Positioned.fill(
             child: Material(

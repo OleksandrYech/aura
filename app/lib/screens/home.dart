@@ -513,6 +513,24 @@ class _ChatScreenState extends State<ChatScreen> {
     return sent;
   }
 
+  /// Повтор не отправленного сообщения. Если у собеседника новое устройство, сначала спросить.
+  Future<void> _retry(Message m) async {
+    if (!client.hasNewDevice(widget.peer)) return client.retry(widget.peer, m);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Новое устройство'),
+        content: Text('У ${client.title(widget.peer)} появилось новое устройство. Если вы не ждали этого, '
+            'сначала сверьте код безопасности: новое устройство мог добавить кто-то другой.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Отмена')),
+          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Отправить всё равно')),
+        ],
+      ),
+    );
+    if (ok == true) await client.approveDevices(widget.peer);
+  }
+
   /// Меню сообщения по долгому нажатию: копировать текст и удалить.
   Future<void> _menu(Message m) async {
     final choice = await showModalBottomSheet<String>(
@@ -622,7 +640,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
                       // Не отправленное сообщение уходит заново по нажатию, долгое нажатие открывает меню.
                       child: GestureDetector(
-                        onTap: m.status == Status.failed ? () => client.retry(widget.peer, m) : null,
+                        onTap: m.status == Status.failed ? () => _retry(m) : null,
                         onLongPress: () => _menu(m),
                         child: Container(
                           constraints: const BoxConstraints(maxWidth: 260),

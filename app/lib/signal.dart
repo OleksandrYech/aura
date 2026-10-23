@@ -18,6 +18,10 @@ class SignalKeys extends InMemorySignalProtocolStore {
   /// поэтому другой ключ на известном адресе означает подмену, и такая сессия не устанавливается.
   final _trusted = <SignalProtocolAddress, IdentityKey>{};
 
+  /// Ники и адреса «ник:устройство», чьи новые устройства принимаются без подтверждения:
+  /// свой ник и устройства, которые пользователь подтвердил. Не сохраняется.
+  final allowed = <String>{};
+
   static const preKeyBatch = 50;
 
   factory SignalKeys.generate() {
@@ -32,7 +36,7 @@ class SignalKeys extends InMemorySignalProtocolStore {
     final spk = SignedPreKeyRecord.fromSerialized(signedPreKeyStore.store.values.single);
     return {
       'registrationId': _registrationId,
-      'identityKey': _b64(_identity.getPublicKey().serialize()),
+      'identityKey': identityKey,
       'signedPreKey': {
         'id': spk.id,
         'key': _b64(spk.getKeyPair().publicKey.serialize()),
@@ -142,10 +146,30 @@ class SignalKeys extends InMemorySignalProtocolStore {
 
   // --- Доверие к ключам собеседников ---
 
+  /// Новое устройство знакомого собеседника не принимается, пока его не подтвердили ([allowed]):
+  /// иначе сервер может молча добавить собеседнику своё устройство и читать переписку (A19).
+  /// Ключ первого собеседника принимается на доверии, его проверяет сверка кода безопасности.
   @override
   Future<bool> isTrustedIdentity(SignalProtocolAddress address, IdentityKey? identityKey, Direction direction) async {
-    final known = _trusted[address];
-    return identityKey != null && (known == null || known == identityKey);
+    if (identityKey == null) return false;
+    if (_trusted[address] case final known?) return known == identityKey;
+    final name = address.getName();
+    return allowed.contains(name) || allowed.contains(_addr(address)) || !_trusted.keys.any((a) => a.getName() == name);
+  }
+
+  /// Ключ, которому доверяет сессия с устройством, или null, если сессии ещё не было.
+  String? identityOf(String nick, int device) {
+    final key = _trusted[SignalProtocolAddress(nick, device)];
+    return key == null ? null : _b64(key.serialize());
+  }
+
+  String get identityKey => _b64(_identity.getPublicKey().serialize());
+
+  /// Забыть сессию и ключ устройства: расшифрованное оказалось чужим (A21).
+  void forget(String nick, int device) {
+    final a = SignalProtocolAddress(nick, device);
+    sessionStore.sessions.remove(a);
+    _trusted.remove(a);
   }
 
   @override
