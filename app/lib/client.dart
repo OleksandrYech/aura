@@ -5,6 +5,8 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart'
+    show DuplicateMessageException, UntrustedIdentityException;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -179,7 +181,7 @@ class AuraClient extends ChangeNotifier {
     name = _prefs.getString('name');
     device = _prefs.getInt('device');
     final keys = _prefs.getString('signal');
-    if (keys != null) _keys = SignalKeys.fromJson(keys);
+    if (keys != null) _keys = SignalKeys.fromJson(keys)..allowed.addAll([?nick]);
     final raw = _prefs.getString('chats');
     if (raw != null) {
       final j = jsonDecode(raw) as Map<String, dynamic>;
@@ -220,6 +222,7 @@ class AuraClient extends ChangeNotifier {
     }
     _keys = keys;
     nick = res['nick'];
+    keys.allowed.add(nick!); // свои новые устройства — входы на этом же аккаунте
     name = res['name'];
     device = res['device'];
     await _prefs.setString('token', token!);
@@ -248,11 +251,76 @@ class AuraClient extends ChangeNotifier {
   }
 
   /// Код безопасности с собеседником: сверьте его при встрече или по другому каналу.
+  /// Считается по ключам, на которые реально шифруются сообщения (из сессий), а не по списку
+  /// с сервера: иначе сервер покажет настоящие ключи, а сессии построит на свои (A20).
+  /// Неподтверждённые новые устройства собеседника в код не входят: им ничего не шифруется.
   Future<String> safetyNumber(String peer) async {
-    Future<List<String>> keys(String n) async => [
-      for (final d in await _request('GET', _api('/api/devices/$n'), null) as List) d['identityKey'] as String,
-    ];
-    return SignalKeys.safetyNumber(nick!, await keys(nick!), peer, await keys(peer));
+    final keys = _keys!;
+    Future<List<String>> ids(String n) async {
+      _devices.remove(n);
+      return [
+        if (n == nick) keys.identityKey,
+        for (final d in await _devicesOf(n))
+          if (await _session(n, d)) keys.identityOf(n, d)!,
+      ];
+    }
+
+    final mine = await ids(nick!), theirs = await ids(peer);
+    await _saveKeys();
+    return SignalKeys.safetyNumber(nick!, mine, peer, theirs);
+  }
+
+  /// Сессия с устройством, при необходимости по набору ключей с сервера.
+  /// false — это новое устройство знакомого собеседника, и пользователь его не подтвердил.
+  Future<bool> _session(String target, int d) async {
+    if (_keys!.hasSession(target, d)) return true;
+    try {
+      await _keys!.startSession(target, await _request('GET', _api('/api/keys/$target/$d'), null));
+      return true;
+    } on UntrustedIdentityException {
+      return false;
+    }
+  }
+
+  /// Собеседники, у которых появилось неподтверждённое устройство (см. [approveDevices]).
+  final _newDevices = <String>{};
+
+  bool hasNewDevice(String peer) => _newDevices.contains(peer);
+
+  /// У собеседника новое устройство: сообщение не уходит, пока пользователь не подтвердит.
+  void _onNewDevice(String peer, String? id) {
+    for (final m in chats[peer] ?? <Message>[]) {
+      if (m.id == id && m.status == Status.pending) m.status = Status.failed;
+    }
+    if (_newDevices.add(peer)) {
+      chats
+          .putIfAbsent(peer, () => [])
+          .add(
+            Message(
+              id: _newId(),
+              mine: false,
+              text: 'У ${nameOf(peer)} новое устройство, код безопасности изменился. '
+                  'Сообщения на него не отправляются, пока вы не подтвердите.',
+              time: DateTime.now().millisecondsSinceEpoch,
+              status: Status.read,
+              update: const {'note': true},
+            ),
+          );
+    }
+    _save();
+    notifyListeners();
+  }
+
+  /// Пользователь подтвердил новые устройства собеседника: им доверяем и шлём заново не отправленное.
+  Future<void> approveDevices(String peer) async {
+    _devices.remove(peer);
+    for (final d in await _devicesOf(peer)) {
+      _keys!.allowed.add('$peer:$d');
+    }
+    _newDevices.remove(peer);
+    for (final m in [...?chats[peer]].where((m) => m.mine && m.status == Status.failed)) {
+      retry(peer, m);
+    }
   }
 
   Future<void> logout() async {
@@ -272,6 +340,7 @@ class AuraClient extends ChangeNotifier {
     _gone.clear();
     _devices.clear();
     _skSent.clear();
+    _newDevices.clear();
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
@@ -799,7 +868,7 @@ class AuraClient extends ChangeNotifier {
     if (!connected || _keys == null) return;
     final keys = _keys!, gid = chat.substring(1);
     final key = await keys.senderKey(gid, nick!, device!);
-    final body = '$gid:${await keys.groupEncrypt(gid, nick!, device!, jsonEncode(_contentFor(chat, m.content, '')))}';
+    final body = '$gid:${await keys.groupEncrypt(gid, nick!, device!, jsonEncode(_signed(_contentFor(chat, m.content, ''))))}';
     await _saveKeys();
     for (final r in only ?? [..._recipients(chat), nick!]) {
       try {
@@ -824,11 +893,23 @@ class AuraClient extends ChangeNotifier {
   Future<void> _sendKey(String chat, String r, String key, List<int> devices) async {
     final sent = _skSent.putIfAbsent(chat, () => {});
     if (devices.every((d) => sent.contains('$r:$d'))) return;
-    await _sendCopy(r, _newId(), {'group': chat.substring(1), 'senderKey': key, 'state': groups[chat]});
-    sent.addAll(devices.map((d) => '$r:$d'));
+    // Не ушёл (новое неподтверждённое устройство) — не отмечаем, иначе ключ не уйдёт и после подтверждения.
+    if (await _sendCopy(r, _newId(), {'group': chat.substring(1), 'senderKey': key, 'state': groups[chat]})) {
+      sent.addAll(devices.map((d) => '$r:$d'));
+    }
   }
 
-  /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет.
+  /// Отправитель и время внутри шифротекста: получатель сверяет отправителя с конвертом сервера (A21)
+  /// и показывает время отправителя, а не сервера (A23).
+  Map<String, dynamic> _signed(Map<String, dynamic> content) => {
+    ...content,
+    'sender': nick,
+    'senderDevice': device,
+    'time': DateTime.now().millisecondsSinceEpoch,
+  };
+
+  /// Шифрует сообщение для каждого устройства [target]. false — если устройств пока нет
+  /// или среди них новое неподтверждённое.
   Future<bool> _sendCopy(String target, String id, Map<String, dynamic> content) async {
     if (!connected || _keys == null) return false;
     final keys = _keys!;
@@ -836,10 +917,11 @@ class AuraClient extends ChangeNotifier {
     if (devices.isEmpty) return false;
     final payloads = [];
     for (final d in devices) {
-      if (!keys.hasSession(target, d)) {
-        await keys.startSession(target, await _request('GET', _api('/api/keys/$target/$d'), null));
+      if (!await _session(target, d)) {
+        _onNewDevice(target, id);
+        return false;
       }
-      payloads.add(await keys.encrypt(target, d, jsonEncode(content)));
+      payloads.add(await keys.encrypt(target, d, jsonEncode(_signed(content))));
     }
     await _saveKeys();
     _wsSend({'type': 'send', 'id': id, 'to': target, 'payloads': payloads, 'push': ?_pushKind(target, content)});
@@ -881,7 +963,17 @@ class AuraClient extends ChangeNotifier {
   Future<List<Map<String, dynamic>>> iceServers() async =>
       (await _request('GET', _api('/api/ice'), null) as List).cast();
 
+  /// Подтверждение (ack) уходит всегда: иначе любое исключение при разборе оставит
+  /// сообщение в очереди сервера, и оно будет приходить вечно (A24).
   Future<void> _receive(Map<String, dynamic> msg) async {
+    try {
+      await _handle(msg);
+    } finally {
+      _wsSend({'type': 'ack', 'id': msg['id']});
+    }
+  }
+
+  Future<void> _handle(Map<String, dynamic> msg) async {
     final String id = msg['id'], from = msg['from'];
     // Дубль (повторная доставка) не расшифровываем второй раз.
     if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
@@ -889,6 +981,9 @@ class AuraClient extends ChangeNotifier {
       String text;
       Map<String, dynamic>? content, file, update;
       List<Map<String, dynamic>>? files;
+      final int fromDevice = msg['device'];
+      final hadSession = _keys!.hasSession(from, fromDevice);
+      var drop = false;
       try {
         if (msg['ctype'] == SignalKeys.groupType) {
           final String body = msg['body'];
@@ -900,15 +995,38 @@ class AuraClient extends ChangeNotifier {
         } else {
           content = jsonDecode(await _keys!.decrypt(from, msg['device'], msg['ctype'], msg['body']));
         }
-        text = content!['text'] ?? '';
+        // Сервер не может приписать сообщение другому отправителю. Старые клиенты поля не присылают.
+        if (content!.containsKey('sender') &&
+            (content['sender'] != from || content['senderDevice'] != fromDevice)) {
+          if (!hadSession) _keys!.forget(from, fromDevice);
+          throw const _Forged();
+        }
+        text = content['text'] is String ? content['text'] : '';
         file = content['file'];
         files = (content['files'] as List?)?.cast();
+        // Вложение с полями не того типа сломало бы список чатов и скачивание (A25).
+        if ((file != null && !_validFile(file)) || (files != null && !files.every(_validFile))) {
+          text = '⚠ Некорректное вложение';
+          file = files = null;
+        }
         update = content['groupUpdate'];
         if (content['group'] case final String g) {
           peer = '#$g';
         } else if (from == nick) {
           peer = content['peer']; // копия своего сообщения с другого устройства
         }
+      } on _Forged {
+        debugPrint('AURA: $id от $from: отправитель внутри не совпадает с конвертом');
+        drop = true;
+        text = '';
+      } on DuplicateMessageException {
+        // Повтор уже расшифрованного шифротекста под новым id: сервер или сбой сети, не показываем (A22).
+        drop = true;
+        text = '';
+      } on UntrustedIdentityException {
+        _onNewDevice(from, null);
+        drop = true;
+        text = '';
       } catch (e) {
         debugPrint('AURA: не расшифровано $id от $from: $e');
         text = '⚠ Не удалось расшифровать сообщение';
@@ -927,7 +1045,9 @@ class AuraClient extends ChangeNotifier {
       }
       await _saveKeys();
       final group = isGroup(peer);
-      if (content?['senderKey'] case final String key) {
+      if (drop) {
+        // отброшено выше
+      } else if (content?['senderKey'] case final String key) {
         try {
           await _keys!.processSenderKey(content!['group'], from, msg['device'], key);
           await _saveKeys();
@@ -952,7 +1072,8 @@ class AuraClient extends ChangeNotifier {
       } else if (content?['call'] case final Map signal) {
         onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
       } else if (content?['receipt'] case final String receipt) {
-        _onReceipt(Status.values.byName(receipt), (content!['ids'] as List).cast());
+        // Неизвестный статус (новая версия или мусор) пропускаем.
+        if (Status.values.asNameMap()[receipt] case final status?) _onReceipt(status, (content!['ids'] as List).cast());
       } else if (content?['delete'] case final List ids) {
         _remove(peer, ids.toSet(), by: from == nick ? null : from);
       } else if (update != null && (!group || !_allowed(peer, from, update))) {
@@ -975,7 +1096,8 @@ class AuraClient extends ChangeNotifier {
                 id: id,
                 mine: mine,
                 text: text,
-                time: msg['sentAt'],
+                // Время сервера — только для старых клиентов; из будущего не бывает.
+                time: min(content?['time'] is int ? content!['time'] : msg['sentAt'], DateTime.now().millisecondsSinceEpoch),
                 status: mine ? Status.sent : Status.delivered,
                 file: file,
                 files: files,
@@ -990,7 +1112,6 @@ class AuraClient extends ChangeNotifier {
       }
       _save();
     }
-    _wsSend({'type': 'ack', 'id': id});
   }
 
   Timer? _probe;
@@ -1157,4 +1278,20 @@ class _Upload extends http.BaseRequest with http.Abortable {
       }
     }());
   }
+}
+
+/// Вложение от собеседника: {id, key, name, size, chunk?, thumb?} нужных типов.
+bool _validFile(Object? f) =>
+    f is Map &&
+    f['id'] is String &&
+    f['key'] is String &&
+    f['name'] is String &&
+    f['size'] is int &&
+    f['size'] >= 0 &&
+    (f['chunk'] == null || (f['chunk'] is int && f['chunk'] > 0)) &&
+    (f['thumb'] == null || f['thumb'] is String);
+
+/// Отправитель внутри шифротекста не совпадает с конвертом сервера.
+class _Forged implements Exception {
+  const _Forged();
 }
