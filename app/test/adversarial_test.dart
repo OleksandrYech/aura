@@ -9,8 +9,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:aura/client.dart';
+import 'package:aura/link.dart';
 import 'package:aura/signal.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart' show Curve;
 import 'package:shared_preferences/shared_preferences.dart';
 
 int _proxyPort = 0, _tlsPort = 0;
@@ -77,6 +79,9 @@ class _Fake {
   final frames = <Map<String, dynamic>>[];
   final devices = <String, List<Map<String, dynamic>>>{};
   final bundles = <String, Map<String, dynamic>>{};
+
+  /// Свои ответы на «МЕТОД /путь» (тело запроса — строкой); остальное отвечает по умолчанию.
+  final routes = <String, FutureOr<Object?> Function(String body)>{};
   final ready = Completer<void>();
 
   Future<void> start() async {
@@ -96,9 +101,10 @@ class _Fake {
         });
         return;
       }
-      await utf8.decoder.bind(req).join();
+      final body = await utf8.decoder.bind(req).join();
       final seg = req.uri.pathSegments;
       Object? res = {};
+      if (routes['${req.method} ${req.uri.path}'] case final route?) res = await route(body);
       if (seg.length == 3 && seg[1] == 'devices') res = devices[seg[2]] ?? [];
       if (seg.length == 4 && seg[1] == 'keys') res = bundles['${seg[2]}/${seg[3]}'];
       req.response
@@ -422,5 +428,79 @@ void main() {
     final other = SignalKeys.generate().publicBundle();
     final forged = {...bundleOf(pub, 1), 'signedPreKey': {...pub['signedPreKey'], 'signature': other['signedPreKey']['signature']}};
     await expectLater(a.startSession('x', forged), throwsA(anything));
+  });
+
+  // --- Привязка устройства (план «Один ключ на аккаунт», PR 4) ---
+
+  test('новое устройство получает ключ аккаунта от старого и публикует prekey, подписанные им', () async {
+    fake = _Fake();
+    await fake.start();
+    anna = SignalKeys.generate();
+    annaPub = anna.publicBundle();
+    SharedPreferences.setMockInitialValues({});
+    await client.load();
+    final envelope = Completer<String>();
+    Map<String, dynamic>? published;
+    fake.routes['POST /api/login'] = (_) =>
+        {'token': 't2', 'nick': 'anna', 'name': 'Anna', 'device': 2, 'identityKey': annaPub['identityKey']};
+    fake.routes['GET /api/link'] = (_) async => {'envelope': await envelope.future};
+    fake.routes['PUT /api/keys'] = (body) => published = jsonDecode(body);
+
+    await client.login('anna', 'pw', link: true);
+    expect(client.needsLink, isTrue);
+    expect(client.signedIn, isFalse, reason: 'без ключа аккаунта вход не завершён');
+    expect(published, isNull, reason: 'своих ключей личности новое устройство не создаёт');
+
+    final code = jsonDecode(utf8.decode(base64Url.decode(client.startLinking())));
+    expect(code, containsPair('device', 2));
+    final to = Curve.decodePoint(base64.decode(code['key']), 0);
+    envelope.complete(LinkEnvelope.seal(to, await anna.getIdentityKeyPair(), 'anna', 2));
+
+    expect(await waitFor(() => client.signedIn), isTrue);
+    expect(published!['identityKey'], annaPub['identityKey']);
+    // Собеседник принимает набор ключей: signed prekey подписан ключом аккаунта.
+    await SignalKeys.generate().startSession('anna', bundleOf(published!, 2));
+  });
+
+  test('конверт с ключом не этого аккаунта не завершает привязку', () async {
+    fake = _Fake();
+    await fake.start();
+    anna = SignalKeys.generate();
+    annaPub = anna.publicBundle();
+    SharedPreferences.setMockInitialValues({});
+    await client.load();
+    final envelope = Completer<String>();
+    fake.routes['POST /api/login'] = (_) =>
+        {'token': 't2', 'nick': 'anna', 'name': 'Anna', 'device': 2, 'identityKey': annaPub['identityKey']};
+    fake.routes['GET /api/link'] = (_) async => {'envelope': await envelope.future};
+
+    await client.login('anna', 'pw', link: true);
+    final code = jsonDecode(utf8.decode(base64Url.decode(client.startLinking())));
+    final mallory = await SignalKeys.generate().getIdentityKeyPair();
+    envelope.complete(LinkEnvelope.seal(Curve.decodePoint(base64.decode(code['key']), 0), mallory, 'anna', 2));
+
+    expect(await waitFor(() => client.linkError != null), isTrue);
+    expect(client.signedIn, isFalse);
+  });
+
+  test('старое устройство отправляет конверт по коду из QR своего аккаунта', () async {
+    await boot();
+    String? sent;
+    fake.routes['POST /api/link/2'] = (body) {
+      sent = jsonDecode(body)['envelope'];
+      return {};
+    };
+    final mine = Curve.generateKeyPair();
+    String code(String nick) => base64Url.encode(
+      utf8.encode(jsonEncode({'nick': nick, 'device': 2, 'key': base64.encode(mine.publicKey.serialize())})),
+    );
+
+    await expectLater(client.linkDevice(code('eve')), throwsA(isA<ApiException>()), reason: 'чужой аккаунт');
+    await expectLater(client.linkDevice('мусор'), throwsA(isA<ApiException>()));
+    expect(sent, isNull);
+
+    await client.linkDevice(code('anna'));
+    final identity = LinkEnvelope.open(sent!, mine, 'anna', 2);
+    expect(base64.encode(identity.getPublicKey().serialize()), annaPub['identityKey']);
   });
 }
