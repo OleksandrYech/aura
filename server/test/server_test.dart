@@ -176,9 +176,12 @@ void main() {
     final b1 = await get('/api/keys/den/1', anna['token']);
     expect(b1['identityKey'], 'idDen');
     expect(b1['signedPreKey'], {'id': 1, 'key': 'spk', 'signature': 'sig'});
-    final b2 = await get('/api/keys/den/1', anna['token']);
+    expect((await get('/api/keys/den/1', anna['token']))['preKey'], isNull, reason: 'тому же собеседнику — раз в час');
+    final (_, eve) = await post('/api/register', {'nick': 'eve', 'password': 'secret3'});
+    final b2 = await get('/api/keys/den/1', eve['token']);
     expect({b1['preKey']['id'], b2['preKey']['id']}, {1, 2}, reason: 'prekey выдаётся один раз');
-    expect((await get('/api/keys/den/1', anna['token']))['preKey'], isNull);
+    final (_, mallory) = await post('/api/register', {'nick': 'mallory', 'password': 'secret4'});
+    expect((await get('/api/keys/den/1', mallory['token']))['preKey'], isNull, reason: 'ключи кончились');
 
     expect((await post('/api/logout', {}, token: den['token'])).$1, 200);
     expect(await get('/api/devices/den', anna['token']), isEmpty);
