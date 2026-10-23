@@ -29,7 +29,8 @@ class AuraServer {
   /// [turn] — адрес TURN-сервера (например turn:aura-msg.space:3478) и общий с coturn секрет
   /// (static-auth-secret): звонки, которым не хватило прямого соединения, идут через него.
   /// [push] — отправка push на устройство (см. Fcm); false — токен устарел.
-  AuraServer(String dbPath, {String? files, this.turn, this.push})
+  /// [linkTtl] — сколько живёт конверт привязки (см. [_postLink]).
+  AuraServer(String dbPath, {String? files, this.turn, this.push, this.linkTtl = const Duration(minutes: 10)})
     : db = sqlite3.open(dbPath),
       files = Directory(files ?? p.join(p.dirname(dbPath), 'files'))..createSync(recursive: true) {
     db.execute('''
@@ -121,6 +122,13 @@ class AuraServer {
   /// пишется на своё место. Запись держится и после конца загрузки, пока id есть в [_finished].
   final _sized = <String, _Sized>{};
 
+  /// Конверты привязки по новому устройству и новые устройства, которые их ждут.
+  // ponytail: в памяти, после перезапуска сервера привязку придётся начать заново.
+  final _links = <Device, ({String envelope, Timer expiry})>{};
+  final _linkWaiters = <Device, Completer<String?>>{};
+  final Duration linkTtl;
+  static const maxLink = 16 << 10;
+
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
 
@@ -135,6 +143,8 @@ class AuraServer {
       ..get('/api/devices/<nick>', _authed(_devices))
       ..get('/api/ice', _authed(_ice))
       ..put('/api/push', _authed(_putPush))
+      ..post('/api/link/<device>', _authed(_postLink))
+      ..get('/api/link', _authed(_getLink))
       ..get('/api/keys/<nick>/<device>', _authed(_bundle))
       ..post('/api/files', _authed(_upload))
       ..post('/api/files/<id>', _authed(_append))
@@ -340,6 +350,44 @@ class AuraServer {
       'signedPreKey': {'id': d['signed_prekey_id'], 'key': d['signed_prekey'], 'signature': d['signed_prekey_sig']},
       'preKey': pk == null ? null : {'id': pk['key_id'], 'key': pk['public_key']},
     });
+  }
+
+  // --- Привязка устройства ---
+
+  /// {envelope}: старое устройство с ключом передаёт конверт привязки (зашифрованный ключ аккаунта)
+  /// новому устройству [device] своего аккаунта, у которого ключа ещё нет. Сервер только пересылает его.
+  Future<Response> _postLink(Request req, Device me, String device) async {
+    final to = (nick: me.nick, device: int.tryParse(device) ?? 0);
+    final envelope = (await _json(req))['envelope'];
+    if (envelope is! String || envelope.isEmpty || envelope.length > maxLink) {
+      return _error(400, 'Некорректный конверт');
+    }
+    Row? row(Device d) =>
+        db.select('SELECT identity_key FROM devices WHERE nick = ? AND device = ?', [d.nick, d.device]).firstOrNull;
+    final target = row(to);
+    if (target == null || target['identity_key'] != null || row(me)?['identity_key'] == null) {
+      return _error(403, 'Привязать можно только новое устройство своего аккаунта');
+    }
+    if (_links.containsKey(to)) return _error(409, 'Конверт уже отправлен');
+    if (_linkWaiters.remove(to) case final waiter?) {
+      waiter.complete(envelope);
+    } else {
+      _links[to] = (envelope: envelope, expiry: Timer(linkTtl, () => _links.remove(to)));
+    }
+    return _ok({});
+  }
+
+  /// Новое устройство забирает свой конверт, ожидая его до 25 секунд (не дольше [linkTtl]).
+  Future<Response> _getLink(Request req, Device me) async {
+    if (_links.remove(me) case final ready?) {
+      ready.expiry.cancel();
+      return _ok({'envelope': ready.envelope});
+    }
+    const most = Duration(seconds: 25);
+    final waiter = _linkWaiters.putIfAbsent(me, Completer.new);
+    final envelope = await waiter.future.timeout(linkTtl < most ? linkTtl : most, onTimeout: () => null);
+    if (_linkWaiters[me] == waiter) _linkWaiters.remove(me);
+    return envelope == null ? _error(404, 'Конверта нет') : _ok({'envelope': envelope});
   }
 
   Device? _deviceFor(Object? token) {
