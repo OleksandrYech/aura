@@ -6,10 +6,11 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart'
-    show DuplicateMessageException, UntrustedIdentityException;
+    show Curve, DuplicateMessageException, ECKeyPair, ECPublicKey, UntrustedIdentityException;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'link.dart';
 import 'media.dart';
 import 'platform_media.dart';
 import 'signal.dart';
@@ -169,7 +170,17 @@ class AuraClient extends ChangeNotifier {
   Timer? _retry;
   int _backoff = 1;
 
-  bool get signedIn => token != null;
+  bool get signedIn => token != null && _keys != null;
+
+  /// Вход по паролю выполнен, но у аккаунта уже есть ключ: устройство ждёт привязки ([startLinking]).
+  bool get needsLink => token != null && _keys == null;
+
+  /// Ключ аккаунта, который сервер отдал при входе; конверт привязки обязан нести именно его.
+  String? _accountKey;
+
+  /// Почему привязка не удалась; null, пока всё идёт по плану.
+  String? linkError;
+  int _linkRun = 0;
 
   /// Адрес сервера: в Web это сайт, с которого открыто приложение, в мобильных — постоянный домен.
   static final server = kIsWeb ? Uri.base.origin : 'https://web.aura-msg.space';
@@ -194,9 +205,9 @@ class AuraClient extends ChangeNotifier {
       _gone.addAll((j['gone'] as List? ?? []).cast());
       groups.addAll((j['groups'] as Map<String, dynamic>? ?? {}).cast());
     }
-    if (signedIn && _keys != null) {
+    if (signedIn) {
       _connect();
-    } else if (signedIn) {
+    } else if (token != null) {
       await logout(); // вход сделан до шифрования: нужно войти заново
     }
   }
@@ -206,14 +217,26 @@ class AuraClient extends ChangeNotifier {
   Future<void> register(String nick, String password) =>
       _auth('/api/register', {'nick': nick, 'password': password});
 
-  Future<void> login(String nick, String password) =>
-      _auth('/api/login', {'nick': nick, 'password': password});
+  /// [link] — на аккаунт с ключом войти привязкой ([startLinking]), а не со своим новым ключом.
+  // ponytail: false по умолчанию, пока нет экранов привязки (PR 5); с PR 6–7 привязка обязательна.
+  Future<void> login(String nick, String password, {bool link = false}) =>
+      _auth('/api/login', {'nick': nick, 'password': password}, link: link);
 
-  Future<void> _auth(String path, Map body) async {
+  Future<void> _auth(String path, Map body, {bool link = false}) async {
     final res = await _request('POST', _api(path), body);
     token = res['token'];
-    // Каждый вход — новое устройство со своими ключами. Публикуем их до того, как считать вход выполненным.
-    final keys = SignalKeys.generate();
+    nick = res['nick'];
+    name = res['name'];
+    device = res['device'];
+    _accountKey = res['identityKey'];
+    linkError = null;
+    // Каждый вход — новое устройство. Ключ аккаунта создаёт только первое, остальные получают его привязкой.
+    if (link && _accountKey != null) return notifyListeners();
+    await _signIn(SignalKeys.generate());
+  }
+
+  /// Публикуем ключи устройства и только после этого считаем вход выполненным.
+  Future<void> _signIn(SignalKeys keys) async {
     try {
       await _request('PUT', _api('/api/keys'), keys.publicBundle());
     } catch (_) {
@@ -221,10 +244,7 @@ class AuraClient extends ChangeNotifier {
       rethrow;
     }
     _keys = keys;
-    nick = res['nick'];
     keys.allowed.add(nick!); // свои новые устройства — входы на этом же аккаунте
-    name = res['name'];
-    device = res['device'];
     await _prefs.setString('token', token!);
     await _prefs.setString('nick', nick!);
     await _prefs.setString('name', name!);
@@ -232,6 +252,59 @@ class AuraClient extends ChangeNotifier {
     await _saveKeys();
     notifyListeners();
     _connect();
+  }
+
+  /// Новое устройство: код для QR (временный публичный ключ, ник, номер устройства) и ожидание
+  /// конверта от старого устройства в фоне. Удачная привязка завершается входом ([signedIn]),
+  /// неудачная — [linkError]. Повторный вызов начинает заново с новым ключом.
+  String startLinking() {
+    final mine = Curve.generateKeyPair(), run = ++_linkRun;
+    linkError = null;
+    _awaitLink(mine, run);
+    return base64Url.encode(
+      utf8.encode(jsonEncode({'nick': nick, 'device': device, 'key': base64.encode(mine.publicKey.serialize())})),
+    );
+  }
+
+  Future<void> _awaitLink(ECKeyPair mine, int run) async {
+    bool current() => run == _linkRun && needsLink;
+    while (current()) {
+      final Map res;
+      try {
+        res = await _request('GET', _api('/api/link'), null);
+      } on ApiException {
+        // Конверта пока нет (сервер ждал 25 секунд) или нет связи.
+        await Future<void>.delayed(const Duration(seconds: 1));
+        continue;
+      }
+      if (!current()) return;
+      try {
+        final keys = SignalKeys.generate(LinkEnvelope.open('${res['envelope']}', mine, nick!, device!));
+        if (keys.identityKey != _accountKey) throw const FormatException('ключ не аккаунта');
+        return await _signIn(keys);
+      } on FormatException {
+        linkError = 'Конверт привязки не подходит. Начните привязку заново.';
+      } on ApiException catch (e) {
+        linkError = e.message;
+      }
+      return notifyListeners();
+    }
+  }
+
+  /// Старое устройство: отправить ключ аккаунта новому устройству по коду из его QR.
+  Future<void> linkDevice(String code) async {
+    final ({String? nick, int device, ECPublicKey key}) c;
+    try {
+      final j = jsonDecode(utf8.decode(base64Url.decode(code.trim()))) as Map;
+      c = (nick: j['nick'] as String?, device: j['device'] as int, key: Curve.decodePoint(base64.decode(j['key']), 0));
+    } catch (_) {
+      throw ApiException('Неверный код привязки');
+    }
+    if (c.nick != nick) throw ApiException('Код от другого аккаунта');
+    final identity = await _keys!.getIdentityKeyPair();
+    await _request('POST', _api('/api/link/${c.device}'), {
+      'envelope': LinkEnvelope.seal(c.key, identity, nick!, c.device),
+    });
   }
 
   Future<void> updateName(String newName) async {
@@ -330,7 +403,7 @@ class AuraClient extends ChangeNotifier {
     await ws?.sink.close();
     // Сервер удаляет устройство и его ключи; если связи нет, просто забываем их здесь.
     if (token != null) _request('POST', _api('/api/logout'), {}).ignore();
-    token = nick = name = device = _keys = null;
+    token = nick = name = device = _keys = _accountKey = linkError = null;
     connected = false;
     chats.clear();
     _files.clear();
