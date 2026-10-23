@@ -1,11 +1,14 @@
 import 'package:aura/client.dart';
 import 'package:aura/main.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() => FlutterSecureStorage.setMockInitialValues({}));
+
   testWidgets('регистрация проверяет поля до обращения к серверу', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await client.load();

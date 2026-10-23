@@ -11,6 +11,7 @@ import 'dart:io';
 import 'package:aura/client.dart';
 import 'package:aura/link.dart';
 import 'package:aura/signal.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart' show Curve;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -192,11 +193,22 @@ SignalKeys peerKeys(String nick) {
 }
 
 void main() {
+  setUp(() => FlutterSecureStorage.setMockInitialValues({}));
+
   setUpAll(_setUpNetwork);
 
   tearDown(() async {
     await client.logout().timeout(const Duration(seconds: 5), onTimeout: () {});
     await fake.server.close(force: true);
+  });
+
+  test('ключи переезжают из SharedPreferences в защищённое хранилище', () async {
+    await boot(); // старая версия хранила ключи в SharedPreferences
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('signal'), isNull);
+    expect(await const FlutterSecureStorage().read(key: 'signal'), isNotNull);
+    await client.logout();
+    expect(await const FlutterSecureStorage().read(key: 'signal'), isNull, reason: 'выход стирает ключи');
   });
 
   // --- Подмена ключей злонамеренным сервером ---

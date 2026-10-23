@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:libsignal_protocol_dart/libsignal_protocol_dart.dart'
     show Curve, DuplicateMessageException, ECKeyPair, ECPublicKey, UntrustedIdentityException;
@@ -199,7 +200,7 @@ class AuraClient extends ChangeNotifier {
     nick = _prefs.getString('nick');
     name = _prefs.getString('name');
     device = _prefs.getInt('device');
-    final keys = _prefs.getString('signal');
+    final keys = await _readKeys();
     if (keys != null && nick != null) _keys = SignalKeys.fromJson(keys)..trustOwn(nick!);
     final raw = _prefs.getString('chats');
     if (raw != null) {
@@ -456,6 +457,7 @@ class AuraClient extends ChangeNotifier {
     verified.clear();
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
+    if (!kIsWeb) await _secure.delete(key: 'signal');
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
       await _prefs.remove(k);
     }
@@ -1340,8 +1342,24 @@ class AuraClient extends ChangeNotifier {
     await _request('PUT', _api('/api/keys'), {'preKeys': preKeys});
   });
 
+  /// Ключи (включая приватный ключ аккаунта) — в Keychain/Keystore. В Web защищённого хранилища нет,
+  /// там они остаются в SharedPreferences (localStorage).
+  static const _secure = FlutterSecureStorage();
+
   Future<void> _saveKeys() async {
-    if (_keys != null) await _prefs.setString('signal', _keys!.toJson());
+    if (_keys == null) return;
+    kIsWeb ? await _prefs.setString('signal', _keys!.toJson()) : await _secure.write(key: 'signal', value: _keys!.toJson());
+  }
+
+  /// Ключи из хранилища; сохранённые старой версией в SharedPreferences переезжают в защищённое.
+  Future<String?> _readKeys() async {
+    final old = _prefs.getString('signal');
+    if (kIsWeb) return old;
+    if (old != null) {
+      await _secure.write(key: 'signal', value: old);
+      await _prefs.remove('signal');
+    }
+    return _secure.read(key: 'signal');
   }
 
   void _wsSend(Map<String, dynamic> msg) {
