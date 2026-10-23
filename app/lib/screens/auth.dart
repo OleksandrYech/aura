@@ -159,7 +159,7 @@ class _AuthScreenState extends State<_AuthScreen> {
 
     setState(() => _loading = true);
     try {
-      await (widget.register ? client.register(nick, _pwd.text) : client.login(nick, _pwd.text, link: true));
+      await (widget.register ? client.register(nick, _pwd.text) : client.login(nick, _pwd.text));
       // Корневой экран сам переключится на чаты или на привязку устройства.
       if (mounted) Navigator.popUntil(context, (r) => r.isFirst);
     } on ApiException catch (e) {

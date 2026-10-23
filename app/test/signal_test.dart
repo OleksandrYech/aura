@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:aura/signal.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -48,6 +50,21 @@ void main() {
     await anna.startSession('den', serverBundle(den, 1));
     final impostor = SignalKeys.generate().publicBundle();
     await expectLater(anna.startSession('den', serverBundle(impostor, 1)), throwsA(anything));
+  });
+
+  test('старые ключи по адресам сводятся к ключу самого старого устройства', () async {
+    final anna = SignalKeys.generate(), den = SignalKeys.generate(), den2 = SignalKeys.generate();
+    await anna.startSession('den', serverBundle(den.publicBundle(), 1));
+    final other = SignalKeys.fromJson(anna.toJson())..untrust('den');
+    await other.startSession('den', serverBundle(den2.publicBundle(), 2));
+    // Формат до одного ключа на аккаунт: «ник:устройство» → ключ, у каждого устройства свой.
+    final old = jsonDecode(anna.toJson());
+    old['sessions']['den:2'] = jsonDecode(other.toJson())['sessions']['den:2'];
+    old['trusted'] = {'den:2': den2.identityKey, 'den:1': den.identityKey};
+    final migrated = SignalKeys.fromJson(jsonEncode(old));
+    expect(migrated.identityOf('den'), den.identityKey);
+    expect(migrated.hasSession('den', 1), isTrue);
+    expect(migrated.hasSession('den', 2), isFalse, reason: 'сессия с чужим ключом забыта');
   });
 
   test('ключ отправителя в группе: шифрует для всех, переживает перезапуск и смену', () async {

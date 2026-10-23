@@ -16,15 +16,6 @@ class LinkScreen extends StatefulWidget {
 
 class _LinkScreenState extends State<LinkScreen> {
   late String _code = client.startLinking();
-  String? _error;
-
-  Future<void> _skip() async {
-    try {
-      await client.skipLinking();
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.message);
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -62,14 +53,11 @@ class _LinkScreenState extends State<LinkScreen> {
                     onPressed: () => Clipboard.setData(ClipboardData(text: _code)),
                   ),
                   const SizedBox(height: 16),
-                  if (client.linkError ?? _error case final error?) ...[
+                  if (client.linkError case final error?) ...[
                     Text('⚠ $error', style: TextStyle(fontSize: 13, color: c.ink)),
                     const SizedBox(height: 12),
                     FilledButton(
-                      onPressed: () => setState(() {
-                        _error = null;
-                        _code = client.startLinking();
-                      }),
+                      onPressed: () => setState(() => _code = client.startLinking()),
                       child: const Text('Новый код'),
                     ),
                   ] else
@@ -82,7 +70,6 @@ class _LinkScreenState extends State<LinkScreen> {
                       ],
                     ),
                   const SizedBox(height: 24),
-                  TextButton(onPressed: _skip, child: const Text('Старого устройства нет: войти без привязки')),
                   TextButton(onPressed: client.logout, child: const Text('Отмена')),
                 ],
               ),
