@@ -86,6 +86,7 @@ class AuraServer {
         FOREIGN KEY (recipient, recipient_device) REFERENCES devices(nick, device) ON DELETE CASCADE
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, recipient_device, sent_at);
+      CREATE INDEX IF NOT EXISTS messages_sender ON messages(recipient, recipient_device, sender);
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         nick TEXT NOT NULL
@@ -108,6 +109,27 @@ class AuraServer {
   /// Шифротекст одного сообщения для одного устройства, символов base64: хватает на альбом из 10 видео с превью.
   static const maxMessage = 500000;
 
+  /// Тело JSON-запроса: ключи и списки id занимают десятки КБ (A01).
+  static const maxJson = 64 << 10;
+
+  /// Кадр WebSocket до входа и после: сообщение с шифротекстом для 32 устройств (A11).
+  static const maxAuthFrame = 4 << 10, maxFrame = 32 * maxMessage + (64 << 10);
+
+  /// Код закрытия WebSocket при слишком большом кадре. Стандартный 1009 библиотека отправить не даёт.
+  static const tooBig = 4413;
+
+  /// Сколько ждать {type: auth} от нового соединения (A12).
+  static const authTimeout = Duration(seconds: 5);
+
+  /// Очередь одного отправителя к одному устройству, символов: больше не принимаем, пока не заберут (A15).
+  static const maxQueue = 10 << 20;
+
+  /// Неудачных входов на ник за [loginWindow], после — 429 (A03).
+  static const maxLogins = 5, loginWindow = Duration(minutes: 15);
+
+  /// Push «звонок» от одного отправителя одному получателю, больше — без push (A16).
+  static const maxCalls = 3, callWindow = Duration(minutes: 1);
+
   /// Файлы, которые сейчас догружаются частями, и устройство, которое их грузит.
   // ponytail: в памяти, после перезапуска сервера незаконченную загрузку придётся начать заново.
   final _growing = <String, Device>{};
@@ -123,6 +145,24 @@ class AuraServer {
 
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
+
+  /// События по ключу за окно: неудачные входы и push-звонки.
+  // ponytail: в памяти, после перезапуска сервера счётчики обнуляются.
+  final _hits = <String, List<int>>{};
+
+  /// Не больше [max] событий по [key] за [window]?
+  bool _over(String key, int max, Duration window) {
+    final since = _now() - window.inMilliseconds;
+    final list = _hits[key]?..removeWhere((t) => t < since);
+    if (list != null && list.isEmpty) _hits.remove(key);
+    return (list?.length ?? 0) >= max;
+  }
+
+  void _hit(String key) {
+    // Мусорные ключи (входы в несуществующие ники) не копятся: изредка чистим всё.
+    if (_hits.length > 10000) _hits.removeWhere((k, v) => !_over(k, 1, loginWindow));
+    _hits.putIfAbsent(key, () => []).add(_now());
+  }
 
   Handler get handler {
     final api = Router()
@@ -141,7 +181,13 @@ class AuraServer {
       ..get('/api/files/<id>', _authed(_download))
       ..post('/api/unsend', _authed(_unsend))
       ..get('/ws', webSocketHandler(_onSocket, pingInterval: const Duration(seconds: 30)));
-    return api.call;
+    return (req) async {
+      try {
+        return await api(req);
+      } on _TooLarge {
+        return _error(413, 'Слишком большой запрос');
+      }
+    };
   }
 
   void close() => db.close();
@@ -172,14 +218,18 @@ class AuraServer {
   Future<Response> _login(Request req) async {
     final body = await _json(req);
     final nick = (body['nick'] as String? ?? '').trim().toLowerCase();
+    // Перебор пароля: после серии ошибок ник закрыт на время, даже для верного пароля.
+    // ponytail: только по нику, поэтому злоумышленник может так закрыть чужой ник на 15 минут; добавить счёт по IP за прокси.
+    if (_over('login:$nick', maxLogins, loginWindow)) return _error(429, 'Слишком много попыток, попробуйте позже');
     final row = db.select('SELECT password_hash FROM users WHERE nick = ?', [nick]).firstOrNull;
     final password = body['password'] as String? ?? '';
     final stored = row?['password_hash'] as String?;
     // Хеширование в отдельном изоляте, чтобы не тормозить доставку сообщений.
-    // ponytail: нет ограничения попыток входа, добавить при открытой регистрации.
     if (stored == null || !await Isolate.run(() => verifyPassword(password, stored))) {
+      _hit('login:$nick');
       return _error(401, 'Неверный никнейм или пароль');
     }
+    _hits.remove('login:$nick');
     return _session(nick);
   }
 
@@ -541,11 +591,18 @@ class AuraServer {
 
   void _onSocket(WebSocketChannel ws, String? _) {
     Device? me;
+    // Не 4401: по нему клиент выходит из аккаунта, а медленная сеть — не повод.
+    final auth = Timer(authTimeout, () => ws.sink.close(4408, 'auth timeout'));
     ws.stream.listen(
       (raw) {
+        // ponytail: кадр уже прочитан в память библиотекой, полный лимит — на прокси перед сервером.
+        if (raw is! String || raw.length > (me == null ? maxAuthFrame : maxFrame)) {
+          ws.sink.close(tooBig, 'too big');
+          return;
+        }
         final Map<String, dynamic> msg;
         try {
-          msg = jsonDecode(raw as String) as Map<String, dynamic>;
+          msg = jsonDecode(raw) as Map<String, dynamic>;
         } catch (_) {
           ws.sink.close(4400, 'bad json');
           return;
@@ -557,6 +614,7 @@ class AuraServer {
             return;
           }
           me = d;
+          auth.cancel();
           _online.remove(d)?.sink.close(); // то же устройство переподключилось
           _online[d] = ws;
           ws.sink.add(jsonEncode({'type': 'ready', 'device': d.device, 'preKeys': _preKeyCount(d)}));
@@ -577,6 +635,7 @@ class AuraServer {
         }
       },
       onDone: () {
+        auth.cancel();
         if (me != null && _online[me] == ws) _online.remove(me);
       },
     );
@@ -608,6 +667,23 @@ class AuraServer {
     if (given.length != payloads.length || !given.containsAll(expected) || !expected.containsAll(given)) {
       return error('devices');
     }
+    // Очередь от этого отправителя к устройству получателя ограничена: иначе посторонний забьёт диск.
+    for (final p in payloads) {
+      final queued = db.select(
+        'SELECT coalesce(sum(length(body)), 0) AS n FROM messages WHERE recipient = ? AND recipient_device = ? AND sender = ?',
+        [to, p['device'], me.nick],
+      ).first['n'] as int;
+      if (queued + (p['body'] as String).length > maxQueue) return error('quota');
+    }
+    // Звонок будит полноэкранным уведомлением: от одного собеседника не чаще [maxCalls] в [callWindow].
+    var ring = wake;
+    if (wake == 'call') {
+      if (_over('call:${me.nick}>$to', maxCalls, callWindow)) {
+        ring = null;
+      } else {
+        _hit('call:${me.nick}>$to');
+      }
+    }
     final sentAt = _now();
     for (final p in payloads) {
       // Повтор того же id (переотправка после обрыва связи) не создаёт дубль.
@@ -624,7 +700,7 @@ class AuraServer {
       final d = (nick: to, device: p['device'] as int);
       // Будим и тех, кто на связи: свёрнутое приложение Android замораживает, и соединение
       // ещё живо, а сообщение не обрабатывается. Открытое на экране приложение push не показывает.
-      if (wake == 'message' || wake == 'call' || wake == 'end') _wake(d, wake);
+      if (ring == 'message' || ring == 'call' || ring == 'end') _wake(d, ring);
       _online[d]?.sink.add(
         jsonEncode({
           'type': 'message',
@@ -700,12 +776,26 @@ List<int> _pbkdf2(String password, List<int> salt, int iterations) {
 String _sha(String s) => sha256.convert(utf8.encode(s)).toString();
 int _now() => DateTime.now().millisecondsSinceEpoch;
 
+/// Тело JSON-запроса; больше [AuraServer.maxJson] — исключение, обработчик отвечает 413.
+/// Лишнее дочитывается и выбрасывается, а не хранится: иначе клиент не получит ответ из-за оборванной записи.
+// ponytail: бесконечное тело держит соединение, пока его не оборвёт прокси (у Cloudflare 100 МБ).
 Future<Map<String, dynamic>> _json(Request req) async {
+  final bytes = BytesBuilder(copy: false);
+  var size = 0;
+  await for (final chunk in req.read()) {
+    size += chunk.length;
+    if (size <= AuraServer.maxJson) bytes.add(chunk);
+  }
+  if (size > AuraServer.maxJson) throw const _TooLarge();
   try {
-    return jsonDecode(await req.readAsString()) as Map<String, dynamic>;
+    return jsonDecode(utf8.decode(bytes.takeBytes())) as Map<String, dynamic>;
   } catch (_) {
     return {};
   }
+}
+
+class _TooLarge implements Exception {
+  const _TooLarge();
 }
 
 /// Загрузка с известным размером: какие части (по offset) уже пришли и сколько байт записано.

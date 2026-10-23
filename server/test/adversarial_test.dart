@@ -1,0 +1,244 @@
+// Адверсариальные проверки сервера: каждый тест утверждает безопасное поведение.
+// Красный тест = подтверждённая уязвимость.
+@Timeout(Duration(seconds: 60))
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:server/server.dart';
+import 'package:shelf/shelf_io.dart' as io;
+import 'package:test/test.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+void main() {
+  late AuraServer aura;
+  late HttpServer http;
+  late Uri base;
+  final pushed = <(String, String)>[];
+
+  Future<void> start({bool withPush = false}) async {
+    aura = AuraServer(
+      ':memory:',
+      files: Directory.systemTemp.createTempSync('aura').path,
+      push: withPush
+          ? (token, kind) async {
+              pushed.add((token, kind));
+              return true;
+            }
+          : null,
+    );
+    http = await io.serve(aura.handler, 'localhost', 0);
+    base = Uri.parse('http://localhost:${http.port}');
+  }
+
+  setUp(() async {
+    pushed.clear();
+    await start();
+  });
+  tearDown(() async {
+    await http.close(force: true);
+    aura.close();
+  });
+
+  Future<void> restartWithPush() async {
+    await http.close(force: true);
+    aura.close();
+    await start(withPush: true);
+  }
+
+  Future<(int, dynamic)> raw(String method, String path, List<int> body, {String? token, String? range}) async {
+    final req = await HttpClient().openUrl(method, base.resolve(path));
+    if (token != null) req.headers.set('authorization', 'Bearer $token');
+    if (range != null) req.headers.set('range', range);
+    req.add(body);
+    final res = await req.close();
+    final text = await res.transform(utf8.decoder).join();
+    Object? data;
+    try {
+      data = jsonDecode(text);
+    } catch (_) {
+      data = text;
+    }
+    return (res.statusCode, data);
+  }
+
+  Future<(int, dynamic)> post(String path, Object body, {String method = 'POST', String? token}) =>
+      raw(method, path, utf8.encode(jsonEncode(body)), token: token);
+
+  Map keys(String identity, {int preKeys = 2, int from = 1}) => {
+    'registrationId': 7,
+    'identityKey': identity,
+    'signedPreKey': {'id': 1, 'key': 'spk', 'signature': 'sig'},
+    'preKeys': [
+      for (var i = from; i < from + preKeys; i++) {'id': i, 'key': 'pk$i'},
+    ],
+  };
+
+  Future<Map> user(String nick, {bool withKeys = true}) async {
+    final (s, u) = await post('/api/register', {'nick': nick, 'password': 'secret1'});
+    expect(s, 200);
+    if (withKeys) await post('/api/keys', keys('id_$nick'), method: 'PUT', token: u['token']);
+    return u;
+  }
+
+  Future<(WebSocketChannel, StreamIterator)> connect(String token) async {
+    final ws = WebSocketChannel.connect(base.replace(scheme: 'ws', path: '/ws'));
+    final it = StreamIterator(ws.stream.map((e) => jsonDecode(e as String)));
+    ws.sink.add(jsonEncode({'type': 'auth', 'token': token}));
+    expect(await it.moveNext().timeout(const Duration(seconds: 5)), isTrue);
+    expect(it.current['type'], 'ready');
+    return (ws, it);
+  }
+
+  Map sendMsg(String id, String to, String body, {int device = 1, String? push}) => {
+    'type': 'send',
+    'id': id,
+    'to': to,
+    'payloads': [
+      {'device': device, 'type': 2, 'body': body},
+    ],
+    'push': ?push,
+  };
+
+  // --- Входные данные HTTP ---
+  // A02, A04–A07 и A17 добавятся вместе с исправлениями этапа 4.
+
+  test('A01: огромное JSON-тело без авторизации отклоняется 413, а не читается в память целиком', () async {
+    final big = utf8.encode(jsonEncode({'nick': 'x' * (40 << 20), 'password': 'secret1'}));
+    final (status, _) = await raw('POST', '/api/register', big);
+    expect(status, 413, reason: 'сервер прочитал ${big.length >> 20} МБ без ограничения и ответил $status');
+  });
+
+  test('A03: перебор пароля ограничивается (429 после серии неудачных входов)', () async {
+    await user('victim', withKeys: false);
+    final codes = <int>[];
+    for (var i = 0; i < 12; i++) {
+      codes.add((await post('/api/login', {'nick': 'victim', 'password': 'guess$i'})).$1);
+    }
+    expect(codes, contains(429), reason: 'все попытки обработаны: $codes');
+  });
+
+  test('A08: путь с .. в id файла не выходит за каталог файлов', () async {
+    final u = await user('anna');
+    final codes = [
+      (await raw('GET', '/api/files/..%2F..%2Fetc%2Fpasswd', [], token: u['token'])).$1,
+      (await raw('POST', '/api/files/..%2Fx?offset=0', [1], token: u['token'])).$1,
+      (await raw('GET', '/api/files/%2E%2E', [], token: u['token'])).$1,
+    ];
+    expect(codes, everyElement(404));
+  });
+
+  test('A09: чужой не может удалить мой файл через /api/unsend', () async {
+    final anna = await user('anna');
+    final eve = await user('eve');
+    final (_, up) = await raw('POST', '/api/files', List.filled(10, 2), token: anna['token']);
+    await post('/api/unsend', {'files': [up['id']]}, token: eve['token']);
+    final (s, _) = await raw('GET', '/api/files/${up['id']}', [], token: anna['token']);
+    expect(s, 200);
+  });
+
+  test('A10: ключ личности устройства нельзя подменить, выход отзывает токен', () async {
+    final anna = await user('anna');
+    final (s, _) = await post('/api/keys', keys('id_other'), method: 'PUT', token: anna['token']);
+    expect(s, 409);
+    await post('/api/logout', {}, token: anna['token']);
+    expect((await raw('GET', '/api/ice', [], token: anna['token'])).$1, 401);
+  });
+
+  // --- WebSocket ---
+
+  test('A11: огромный кадр WebSocket до авторизации обрывается по размеру, а не парсится', () async {
+    final ws = WebSocketChannel.connect(base.replace(scheme: 'ws', path: '/ws'));
+    await ws.ready;
+    ws.sink.add(jsonEncode({'type': 'auth', 'token': 'A' * (30 << 20)}));
+    await ws.stream.drain<void>().timeout(const Duration(seconds: 20), onTimeout: () {});
+    // 1009 web_socket_channel отправить не даёт (только 1000 и 3000–4999), сервер закрывает своим кодом.
+    expect(ws.closeCode, AuraServer.tooBig, reason: 'сервер принял и разобрал 30 МБ от анонима, закрыл с ${ws.closeCode} ${ws.closeReason}');
+  });
+
+  test('A12: неавторизованное соединение WebSocket закрывается по тайм-ауту', () async {
+    final ws = WebSocketChannel.connect(base.replace(scheme: 'ws', path: '/ws'));
+    await ws.ready;
+    var closed = false;
+    await ws.stream.drain<void>().timeout(const Duration(seconds: 10), onTimeout: () {}).then((_) => closed = ws.closeCode != null);
+    await ws.sink.close();
+    expect(closed, isTrue, reason: 'анонимное соединение без auth живёт дольше 10 секунд');
+  });
+
+  test('A13: глубоко вложенный JSON не роняет сервер', () async {
+    final anna = await user('anna');
+    final (ws, _) = await connect(anna['token']);
+    ws.sink.add('${'[' * 200000}${']' * 200000}');
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    final (ws2, it2) = await connect(anna['token']);
+    ws2.sink.add(jsonEncode({'type': 'ping'}));
+    expect(await it2.moveNext().timeout(const Duration(seconds: 5)), isTrue);
+    expect(it2.current['type'], 'pong');
+    await ws.sink.close();
+    await ws2.sink.close();
+  });
+
+  test('A14: отправитель не может выдать себя за другого (поле from задаёт сервер)', () async {
+    final den = await user('den');
+    final eve = await user('eve');
+    final (eveWs, eveIn) = await connect(eve['token']);
+    eveWs.sink.add(jsonEncode({...sendMsg('m1', 'den', 'c'), 'from': 'anna', 'device': 5}));
+    await eveIn.moveNext().timeout(const Duration(seconds: 5));
+    final (denWs, denIn) = await connect(den['token']);
+    expect(await denIn.moveNext().timeout(const Duration(seconds: 5)), isTrue);
+    expect((denIn.current['from'], denIn.current['device']), ('eve', eve['device']));
+    await eveWs.sink.close();
+    await denWs.sink.close();
+  });
+
+  test('A15: очередь для офлайн-получателя ограничена (не принимает бесконечно по 500 КБ)', () async {
+    await user('den');
+    final eve = await user('eve');
+    final (ws, it) = await connect(eve['token']);
+    final body = 'A' * 450000;
+    var accepted = 0;
+    for (var i = 0; i < 60; i++) {
+      ws.sink.add(jsonEncode(sendMsg('m$i', 'den', body)));
+      await it.moveNext().timeout(const Duration(seconds: 10));
+      if (it.current['type'] == 'sent') accepted++;
+    }
+    final stored = aura.db.select("SELECT sum(length(body)) AS n FROM messages WHERE recipient = 'den'").first['n'] as int;
+    await ws.sink.close();
+    expect(accepted, lessThan(60), reason: 'принято $accepted из 60, в очереди ${stored >> 20} МБ для одного получателя');
+  });
+
+  test('A16: посторонний не может «звонить» push-ом без ограничения (спам full-screen уведомлением)', () async {
+    await restartWithPush();
+    final den = await user('den');
+    await post('/api/push', {'token': 'den-fcm'}, method: 'PUT', token: den['token']);
+    final eve = await user('eve');
+    final (ws, it) = await connect(eve['token']);
+    for (var i = 0; i < 20; i++) {
+      ws.sink.add(jsonEncode(sendMsg('c$i', 'den', 'garbage', push: 'call')));
+      await it.moveNext().timeout(const Duration(seconds: 5));
+    }
+    await ws.sink.close();
+    final calls = pushed.where((p) => p.$2 == 'call').length;
+    expect(calls, lessThanOrEqualTo(3), reason: 'за секунду ушло $calls push «Входящий звонок» от постороннего с мусором вместо шифротекста');
+  });
+
+  test('A18: сообщение для чужого устройства или лишнего устройства отклоняется', () async {
+    await user('den');
+    final eve = await user('eve');
+    final (ws, it) = await connect(eve['token']);
+    ws.sink.add(jsonEncode({
+      'type': 'send',
+      'id': 'x1',
+      'to': 'den',
+      'payloads': [
+        {'device': 1, 'type': 2, 'body': 'a'},
+        {'device': 77, 'type': 2, 'body': 'b'},
+      ],
+    }));
+    await it.moveNext().timeout(const Duration(seconds: 5));
+    expect(it.current['error'], 'devices');
+    await ws.sink.close();
+  });
+}
