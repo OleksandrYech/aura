@@ -142,6 +142,14 @@ class AuraClient extends ChangeNotifier {
 
   String nameOf(String nick) => nick == this.nick ? 'Вы' : names[nick] ?? nick;
 
+  /// Собеседники, с которыми пользователь сверил код безопасности; сбрасывается при смене их ключа.
+  final verified = <String>{};
+
+  void setVerified(String peer, bool on) {
+    on ? verified.add(peer) : verified.remove(peer);
+    _save();
+  }
+
   /// Время последнего прочтения чата.
   final lastRead = <String, int>{};
 
@@ -204,6 +212,7 @@ class AuraClient extends ChangeNotifier {
       _deletes.addAll((j['deletes'] as List? ?? []).cast());
       _gone.addAll((j['gone'] as List? ?? []).cast());
       groups.addAll((j['groups'] as Map<String, dynamic>? ?? {}).cast());
+      verified.addAll((j['verified'] as List? ?? []).cast());
     }
     if (signedIn) {
       _connect();
@@ -295,6 +304,15 @@ class AuraClient extends ChangeNotifier {
       }
       return notifyListeners();
     }
+  }
+
+  /// Старых устройств не осталось: начать заново с новым ключом аккаунта. Остальные устройства
+  /// выходят, у собеседников код безопасности меняется. Переписка на других устройствах не переносится.
+  Future<void> resetAccount(String password) async {
+    await _request('POST', _api('/api/identity/reset'), {'password': password});
+    _linkRun++;
+    _accountKey = null;
+    await _signIn(SignalKeys.generate());
   }
 
   /// Старое устройство: отправить ключ аккаунта новому устройству по коду из его QR.
@@ -411,6 +429,7 @@ class AuraClient extends ChangeNotifier {
     _devices.remove(peer);
     _keys!.untrust(peer);
     _newDevices.remove(peer);
+    verified.remove(peer);
     for (final m in [...?chats[peer]].where((m) => m.mine && m.status == Status.failed)) {
       retry(peer, m);
     }
@@ -434,6 +453,7 @@ class AuraClient extends ChangeNotifier {
     _devices.clear();
     _skSent.clear();
     _newDevices.clear();
+    verified.clear();
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
@@ -1329,7 +1349,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified]}));
     notifyListeners();
   }
 

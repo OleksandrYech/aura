@@ -337,6 +337,32 @@ void main() {
     expect((await post('/api/me', {'name': 'Den'}, method: 'PUT', token: den2['token'])).$1, 401);
   });
 
+  test('начать заново: только с паролем, старые устройства выходят, ключ аккаунта задаётся заново', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    final (oldWs, _) = await connect(den['token']);
+    final (_, fresh) = await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    Future<int> reset(String password) async =>
+        (await post('/api/identity/reset', {'password': password}, token: fresh['token'])).$1;
+
+    expect(await reset('wrong'), 401);
+    expect((await post('/api/keys', keys('idNew'), method: 'PUT', token: fresh['token'])).$1, 409);
+    expect(await reset('secret2'), 200);
+    await oldWs.sink.done;
+    expect(oldWs.closeCode, 4401, reason: 'старое устройство выходит');
+    expect((await post('/api/me', {'name': 'D'}, method: 'PUT', token: den['token'])).$1, 401);
+    expect((await post('/api/keys', keys('idNew'), method: 'PUT', token: fresh['token'])).$1, 200);
+    expect(await get('/api/devices/den', anna['token']), [
+      {'device': 2, 'identityKey': 'idNew', 'accountKey': 'idNew'},
+    ]);
+
+    for (var i = 0; i < AuraServer.maxLogins; i++) {
+      await reset('wrong');
+    }
+    expect(await reset('secret2'), 429, reason: 'перебор пароля через сброс ограничен');
+  });
+
   test('доставка шифротекста на каждое устройство', () async {
     final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});

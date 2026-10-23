@@ -272,7 +272,9 @@ void main() {
     expect(client.hasNewDevice('den'), isTrue);
     expect(client.chats['den']!.any((m) => m.update != null && m.text.contains('Код безопасности')), isTrue);
 
+    client.setVerified('den', true);
     await client.approveDevices('den');
+    expect(client.verified, isNot(contains('den')), reason: 'отметка «Сверено» снимается при смене ключа');
     expect(
       await waitFor(() => fake.frames.any((f) => f['id'] == m3.id && (f['payloads'] as List).any((p) => p['device'] == 3))),
       isTrue,
@@ -501,6 +503,28 @@ void main() {
 
     expect(await waitFor(() => client.linkError != null), isTrue);
     expect(client.signedIn, isFalse);
+  });
+
+  test('начать заново: без старых устройств вход с новым ключом аккаунта', () async {
+    fake = _Fake();
+    await fake.start();
+    anna = SignalKeys.generate();
+    annaPub = anna.publicBundle();
+    SharedPreferences.setMockInitialValues({});
+    await client.load();
+    Map<String, dynamic>? published;
+    String? password;
+    fake.routes['POST /api/login'] = (_) =>
+        {'token': 't2', 'nick': 'anna', 'name': 'Anna', 'device': 2, 'identityKey': annaPub['identityKey']};
+    fake.routes['POST /api/identity/reset'] = (body) => {'ok': password = jsonDecode(body)['password']};
+    fake.routes['PUT /api/keys'] = (body) => published = jsonDecode(body);
+
+    await client.login('anna', 'pw');
+    expect(client.needsLink, isTrue);
+    await client.resetAccount('pw');
+    expect(password, 'pw');
+    expect(client.signedIn, isTrue);
+    expect(published!['identityKey'], isNot(annaPub['identityKey']), reason: 'новый ключ аккаунта');
   });
 
   test('старое устройство отправляет конверт по коду из QR своего аккаунта', () async {
