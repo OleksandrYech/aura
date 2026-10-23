@@ -17,6 +17,48 @@ class LinkScreen extends StatefulWidget {
 class _LinkScreenState extends State<LinkScreen> {
   late String _code = client.startLinking();
 
+  /// «Начать заново»: новый ключ аккаунта, остальные устройства выходят.
+  Future<void> _reset() async {
+    final password = TextEditingController();
+    String? error;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Начать заново?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Аккаунт получит новый ключ. Все остальные ваши устройства выйдут, переписка на них не перенесётся, '
+                'а у собеседников изменится код безопасности. Делайте так, только если старых устройств больше нет.',
+              ),
+              TextField(
+                controller: password,
+                obscureText: true,
+                decoration: InputDecoration(labelText: 'Пароль', errorText: error),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Отмена')),
+            TextButton(
+              onPressed: () async {
+                try {
+                  await client.resetAccount(password.text);
+                  if (context.mounted) Navigator.pop(context);
+                } on ApiException catch (e) {
+                  setState(() => error = e.message);
+                }
+              },
+              child: const Text('Начать заново'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
@@ -70,6 +112,7 @@ class _LinkScreenState extends State<LinkScreen> {
                       ],
                     ),
                   const SizedBox(height: 24),
+                  TextButton(onPressed: _reset, child: const Text('Старых устройств нет: начать заново')),
                   TextButton(onPressed: client.logout, child: const Text('Отмена')),
                 ],
               ),

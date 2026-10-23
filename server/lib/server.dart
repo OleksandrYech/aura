@@ -199,6 +199,7 @@ class AuraServer {
       ..post('/api/register', _register)
       ..post('/api/login', _login)
       ..post('/api/logout', _authed(_logout))
+      ..post('/api/identity/reset', _authed(_resetIdentity))
       ..get('/api/users', _authed(_searchUsers))
       ..put('/api/me', _authed(_updateMe))
       ..put('/api/keys', _authed(_putKeys))
@@ -315,6 +316,33 @@ class AuraServer {
   Response _logout(Request req, Device me) {
     _online.remove(me)?.sink.close(4401, 'logout');
     db.execute('DELETE FROM devices WHERE nick = ? AND device = ?', [me.nick, me.device]);
+    return _ok({});
+  }
+
+  /// {password}: «Начать заново», когда старых устройств не осталось. Все другие устройства выходят (4401),
+  /// ключ аккаунта задаст следующий PUT /api/keys. Перебор пароля ограничен так же, как вход (A03).
+  Future<Response> _resetIdentity(Request req, Device me) async {
+    final body = await _json(req);
+    final password = body['password'] is String ? body['password'] as String : '';
+    final limit = 'login:${me.nick}';
+    if (_over(limit, maxLogins, loginWindow)) return _error(429, 'Слишком много попыток, попробуйте позже');
+    final stored = db.select('SELECT password_hash FROM users WHERE nick = ?', [me.nick]).first['password_hash'] as String;
+    if (!await Isolate.run(() => verifyPassword(password, stored))) {
+      _hit(limit);
+      return _error(401, 'Неверный пароль');
+    }
+    _hits.remove(limit);
+    for (final r in db.select('SELECT device FROM devices WHERE nick = ? AND device != ?', [me.nick, me.device])) {
+      _online.remove((nick: me.nick, device: r['device'] as int))?.sink.close(4401, 'reset');
+    }
+    db.execute('DELETE FROM devices WHERE nick = ? AND device != ?', [me.nick, me.device]);
+    db.execute('DELETE FROM prekeys WHERE nick = ?', [me.nick]);
+    db.execute(
+      'UPDATE devices SET identity_key = NULL, registration_id = NULL, signed_prekey_id = NULL, '
+      'signed_prekey = NULL, signed_prekey_sig = NULL WHERE nick = ?',
+      [me.nick],
+    );
+    db.execute('UPDATE users SET identity_key = NULL WHERE nick = ?', [me.nick]);
     return _ok({});
   }
 

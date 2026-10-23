@@ -969,10 +969,21 @@ class SafetyNumberDialog extends StatelessWidget {
             const SizedBox(height: 16),
             Text(
               'Сравните этот код с кодом у @$peer при встрече или по звонку. Если цифры совпадают, '
-              'сообщения между вами никто не может прочитать или подменить. Код меняется, когда кто-то из вас '
-              'входит на новом устройстве.',
+              'сообщения между вами никто не может прочитать или подменить. Код меняется, только если кто-то '
+              'из вас начал заново: новые устройства его не меняют.',
               style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.7)),
             ),
+            if (snap.hasData)
+              ListenableBuilder(
+                listenable: client,
+                builder: (context, _) => CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Сверено'),
+                  subtitle: const Text('Сбросится, если ключ собеседника изменится'),
+                  value: client.verified.contains(peer),
+                  onChanged: (v) => client.setVerified(peer, v ?? false),
+                ),
+              ),
           ],
         ),
       ),
