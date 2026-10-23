@@ -150,6 +150,7 @@ class AuraServer {
   final _linkWaiters = <Device, Completer<String?>>{};
   final Duration linkTtl;
   static const maxLink = 16 << 10;
+  static const maxPendingLinks = 3;
 
   /// Открытые WebSocket-соединения по устройству.
   final _online = <Device, WebSocketChannel>{};
@@ -436,6 +437,9 @@ class AuraServer {
       return _error(403, 'Привязать можно только новое устройство своего аккаунта');
     }
     if (_links.containsKey(to)) return _error(409, 'Конверт уже отправлен');
+    if (_links.keys.where((d) => d.nick == me.nick).length >= maxPendingLinks) {
+      return _error(429, 'Слишком много ожидающих привязок');
+    }
     if (_linkWaiters.remove(to) case final waiter?) {
       waiter.complete(envelope);
     } else {

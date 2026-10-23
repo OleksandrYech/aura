@@ -231,6 +231,14 @@ void main() {
     expect(await link(den, 2, 'e5'), 200);
     await Future.delayed(const Duration(milliseconds: 400));
     expect((await fetch(den2)).$1, 404, reason: 'конверт истёк');
+
+    for (var i = 0; i < AuraServer.maxPendingLinks; i++) {
+      await post('/api/login', {'nick': 'den', 'password': 'secret2'});
+    }
+    for (var d = 2; d < 2 + AuraServer.maxPendingLinks; d++) {
+      expect(await link(den, d), 200);
+    }
+    expect(await link(den, 2 + AuraServer.maxPendingLinks), 429, reason: 'не больше трёх ожидающих конвертов на аккаунт');
   });
 
   test('доставка шифротекста на каждое устройство', () async {
