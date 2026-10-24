@@ -153,6 +153,10 @@ class AuraServer {
   /// Неудачных входов на ник за [loginWindow], после — 429 (A03).
   static const maxLogins = 5, loginWindow = Duration(minutes: 15);
 
+  /// Регистраций на весь сервер за [registerWindow], дальше 429. Каждая считает PBKDF2, без лимита сервер греется.
+  // ponytail: общий лимит, не по IP: за туннелем Cloudflare адрес клиента не виден.
+  static const maxRegisters = 10, registerWindow = Duration(hours: 1);
+
   /// Push «звонок» от одного отправителя одному получателю, больше — без push (A16).
   static const maxCalls = 3, callWindow = Duration(minutes: 1);
 
@@ -237,6 +241,8 @@ class AuraServer {
 
   Future<Response> _register(Request req) async {
     final body = await _json(req);
+    if (_over('register', maxRegisters, registerWindow)) return _error(429, 'Слишком много регистраций, попробуйте позже');
+    _hit('register');
     final nick = (body['nick'] as String? ?? '').trim().toLowerCase();
     final password = body['password'] as String? ?? '';
     final name = (body['name'] as String? ?? '').trim();

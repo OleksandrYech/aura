@@ -66,10 +66,13 @@ Future<String?> compressVideo(String path, {void Function(double progress)? onPr
 Future<Directory> _localDir() async =>
     Directory('${(await getApplicationSupportDirectory()).path}/files').create(recursive: true);
 
-/// Имя локальной копии: id и расширение (по нему iOS узнаёт видео), без лишних символов из сообщения.
+/// Имя локальной копии: id, начало ключа и расширение (по нему iOS узнаёт видео), без лишних символов из сообщения.
+// ponytail: 8 байт ключа в имени; чужой файл с тем же id получит другое имя, а не чужую копию.
 String _localName(Map<String, dynamic> file) {
   final ext = RegExp(r'\.[A-Za-z0-9]{1,8}$').firstMatch(file['name'] as String)?[0] ?? '';
-  return '${(file['id'] as String).replaceAll(RegExp(r'[^0-9a-f]'), '')}$ext';
+  final id = (file['id'] as String).replaceAll(RegExp(r'[^0-9a-f]'), '');
+  final key = base64.decode(file['key'] as String).take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  return '$id$key$ext';
 }
 
 Future<bool> _complete(File f, Map<String, dynamic> file) async => await f.exists() && await f.length() == file['size'];
