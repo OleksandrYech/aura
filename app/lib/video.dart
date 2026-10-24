@@ -17,35 +17,32 @@ class VideoAttachment extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
     final thumb = file['thumb'] is String ? base64.decode(file['thumb']) : null;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Semantics(
-        button: true,
-        label: 'Видео ${file['name']}, ${formatSize(file['size'])}',
-        child: GestureDetector(
-          onTap: () => showDialog(context: context, builder: (_) => VideoDialog(file)),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(radiusMd),
-            child: Stack(alignment: Alignment.center, children: [
-              thumb != null
-                  ? Image.memory(thumb, fit: BoxFit.cover, gaplessPlayback: true)
-                  : Container(width: 220, height: 124, color: c.ink.withValues(alpha: 0.85)),
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle),
-                child: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 32),
-              ),
-              Positioned(
-                left: 8,
-                bottom: 6,
-                child: Text(
-                  formatSize(file['size']),
-                  style: const TextStyle(color: Colors.white, fontSize: 12, shadows: [Shadow(blurRadius: 4)]),
-                ),
-              ),
-            ]),
+    return Semantics(
+      button: true,
+      label: 'Видео ${file['name']}, ${formatSize(file['size'])}',
+      child: GestureDetector(
+        onTap: () => showDialog(context: context, builder: (_) => VideoDialog(file)),
+        child: Stack(alignment: Alignment.center, children: [
+          thumb != null
+              ? ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: previewMaxHeight),
+                  child: Image.memory(thumb, width: bubbleWidth, fit: BoxFit.cover, gaplessPlayback: true),
+                )
+              : Container(width: bubbleWidth, height: 146, color: c.ink.withValues(alpha: 0.85)),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle),
+            child: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 32),
           ),
-        ),
+          Positioned(
+            left: 8,
+            bottom: 6,
+            child: Text(
+              formatSize(file['size']),
+              style: const TextStyle(color: Colors.white, fontSize: 12, shadows: [Shadow(blurRadius: 4)]),
+            ),
+          ),
+        ]),
       ),
     );
   }

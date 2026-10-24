@@ -42,7 +42,14 @@ class AuraColors {
 }
 
 const radiusMd = 16.0;
-const radiusLg = 24.0;
+/// Пузырь сообщения; превью фото и видео скруглены так же.
+const radiusBubble = 12.0;
+
+/// Наибольшая ширина пузыря; фото и видео в нём занимают её целиком.
+const bubbleWidth = 260.0;
+
+/// Превью выше этого обрезается по краям, целиком фото видно при открытии.
+const previewMaxHeight = 360.0;
 
 /// Переключатель темы для всего приложения.
 final themeMode = ValueNotifier(ThemeMode.light);
