@@ -187,7 +187,7 @@ class Calls extends ChangeNotifier {
       if (on && _cam == null) {
         final cam = _cam = await navigator.mediaDevices.getUserMedia({
           'audio': false,
-          'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
+          'video': {'facingMode': 'user', 'width': 1920, 'height': 1080, 'frameRate': 30},
         });
         if (state == CallState.idle) {
           _stopCamera(); // звонок кончился, пока ждали доступ
@@ -207,6 +207,24 @@ class Calls extends ChangeNotifier {
       _stopCamera();
     }
     notifyListeners();
+  }
+
+  /// Потолок видео: 1080p, 30 к/с, до [maxVideoBitrate]. Ниже WebRTC опускается сам по оценке канала и загрузке
+  /// процессора: сначала битрейт, затем разрешение и частота кадров вместе (balanced), а когда связь лучше — обратно.
+  static const maxVideoBitrate = 4000000;
+
+  static RTCRtpParameters get videoParameters => RTCRtpParameters(
+    degradationPreference: RTCDegradationPreference.BALANCED,
+    encodings: [RTCRtpEncoding(maxBitrate: maxVideoBitrate, maxFramerate: 30, priority: RTCPriorityType.high)],
+  );
+
+  /// Параметры кодировщика принимаются только после согласования, поэтому — когда соединение установлено.
+  Future<void> _tuneVideo() async {
+    try {
+      await _videoSender?.setParameters(videoParameters);
+    } catch (e) {
+      debugPrint('AURA: параметры видео: $e'); // без них остаётся качество WebRTC по умолчанию
+    }
   }
 
   void _stopCamera() {
@@ -299,6 +317,7 @@ class Calls extends ChangeNotifier {
       if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected && state == CallState.connecting) {
         state = CallState.active;
         since = DateTime.now();
+        _tuneVideo();
         // Видеозвонок держат перед собой, а не у уха.
         if ((video || peerVideo) && !speaker) toggleSpeaker();
         notifyListeners();

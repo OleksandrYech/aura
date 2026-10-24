@@ -75,6 +75,9 @@ String _ext(String name) => name.split('.').last.toLowerCase();
 
 bool isImage(String name) => imageExtensions.contains(_ext(name));
 
+/// Фото или видео: в пузыре показывается превью, а не строка файла.
+bool isMedia(Map<String, dynamic> file) => file['voice'] != true && (file['video'] == true || isImage(file['name']));
+
 const _videoMimes = {'mp4': 'video/mp4', 'm4v': 'video/mp4', 'mov': 'video/quicktime', 'webm': 'video/webm'};
 
 /// Видео, которые умеют играть браузер, Android и iOS.

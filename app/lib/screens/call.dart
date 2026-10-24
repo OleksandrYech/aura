@@ -110,7 +110,11 @@ class _CallScreenState extends State<CallScreen> {
       ? calls.local
       : null;
 
-  bool get _onVideo => _big != null;
+  /// Был ли звонок видеозвонком, когда закончился: пока видна причина, вид остаётся тем же,
+  /// иначе экран за пару секунд перед закрытием перескакивал бы с видео на аватар.
+  bool _wasVideo = false;
+
+  bool get _onVideo => calls.state == CallState.idle ? _wasVideo : _big != null;
 
   @override
   Widget build(BuildContext context) {
@@ -118,10 +122,12 @@ class _CallScreenState extends State<CallScreen> {
     final name = calls.peer == null ? '' : client.title(calls.peer!);
     final live = calls.state != CallState.idle;
     final big = _big;
-    final ink = _onVideo ? Colors.white : c.ink;
+    if (calls.state != CallState.idle) _wasVideo = big != null;
+    final onVideo = _onVideo;
+    final ink = onVideo ? Colors.white : c.ink;
     final small = big == calls.remote && calls.video;
     return Material(
-      color: big != null ? Colors.black : c.cream,
+      color: onVideo ? Colors.black : c.cream,
       child: Stack(
         children: [
           if (big != null)
@@ -130,7 +136,8 @@ class _CallScreenState extends State<CallScreen> {
                 big,
                 // На вебе вид запоминает элемент видео при создании: при смене своего на собеседника нужен новый.
                 key: ObjectKey(big),
-                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                // Кадр целиком, с чёрными полосами: горизонтальное видео на вертикальном экране и наоборот не обрезается.
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                 mirror: big == calls.local && calls.front,
               ),
             ),

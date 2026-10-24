@@ -642,38 +642,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       child: GestureDetector(
                         onTap: m.status == Status.failed ? () => _retry(m) : null,
                         onLongPress: () => _menu(m),
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 260),
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                          decoration: BoxDecoration(
-                            color: m.mine ? c.lavender : c.thistle,
-                            borderRadius: BorderRadius.circular(radiusLg),
-                          ),
-                          child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                            if (m.from != null)
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: Text(client.nameOf(m.from!),
-                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: c.grayPurple)),
-                              ),
-                            if (m.file != null) Attachment(m.file!),
-                            if (m.files != null) Album(m.files!),
-                            if (m.text.isNotEmpty)
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                // Не SelectableText: выделение перехватило бы нажатия, текст копируется из меню.
-                                child: Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
-                              ),
-                            const SizedBox(height: 4),
-                            Row(mainAxisSize: MainAxisSize.min, children: [
-                              Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
-                              if (m.mine) ...[
-                                const SizedBox(width: 4),
-                                StatusIcon(m.status),
-                              ],
-                            ]),
-                          ]),
-                        ),
+                        child: MessageBubble(m),
                       ),
                     );
                   },
@@ -758,6 +727,80 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
+/// Пузырь сообщения. Фото и видео в нём от края до края: скруглены как сам пузырь, без рамки вокруг,
+/// а время без подписи лежит прямо на превью.
+class MessageBubble extends StatelessWidget {
+  const MessageBubble(this.m, {super.key});
+  final Message m;
+
+  static const _pad = EdgeInsets.symmetric(horizontal: 16, vertical: 12);
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    final media = m.files != null || (m.file != null && isMedia(m.file!));
+    final time = Row(mainAxisSize: MainAxisSize.min, children: [
+      Text(formatTime(m.time), style: TextStyle(fontSize: 11, color: c.ink.withValues(alpha: 0.55))),
+      if (m.mine) ...[
+        const SizedBox(width: 4),
+        StatusIcon(m.status),
+      ],
+    ]);
+    final name = m.from == null
+        ? null
+        : Align(
+            alignment: Alignment.centerLeft,
+            child: Text(client.nameOf(m.from!),
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: c.grayPurple)),
+          );
+    final text = m.text.isEmpty
+        ? null
+        : Align(
+            alignment: Alignment.centerLeft,
+            // Не SelectableText: выделение перехватило бы нажатия, текст копируется из меню.
+            child: Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
+          );
+    final preview = m.files != null ? Album(m.files!) : m.file != null ? Attachment(m.file!) : null;
+    return Container(
+      constraints: const BoxConstraints(maxWidth: bubbleWidth),
+      padding: media ? null : _pad,
+      clipBehavior: media ? Clip.antiAlias : Clip.none,
+      decoration: BoxDecoration(
+        color: m.mine ? c.lavender : c.thistle,
+        borderRadius: BorderRadius.circular(radiusBubble),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+        if (!media) ...[
+          ?name,
+          ?preview,
+          ?text,
+          const SizedBox(height: 4),
+          time,
+        ] else ...[
+          if (name != null) Padding(padding: const EdgeInsets.fromLTRB(16, 8, 16, 6), child: name),
+          if (text == null)
+            Stack(alignment: Alignment.bottomRight, children: [
+              preview!,
+              Container(
+                margin: const EdgeInsets.all(6),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(color: c.cream.withValues(alpha: 0.85), borderRadius: BorderRadius.circular(8)),
+                child: time,
+              ),
+            ])
+          else ...[
+            preview!,
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [text, const SizedBox(height: 4), time]),
+            ),
+          ],
+        ],
+      ]),
+    );
+  }
+}
+
 /// Вложение в пузыре: фото показываем сразу, остальные файлы сохраняются по нажатию.
 /// Байты скачиваются с сервера и расшифровываются на устройстве.
 class Attachment extends StatelessWidget {
@@ -769,45 +812,57 @@ class Attachment extends StatelessWidget {
     final String name = file['name'];
     if (file['voice'] == true) return VoicePlayer(file);
     if (file['video'] == true) return VideoAttachment(file);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: FutureBuilder(
-        future: isImage(name) ? client.fileBytes(file) : null,
-        builder: (context, snap) {
-          if (snap.data case final bytes?) {
-            return GestureDetector(
-              onTap: () => showImage(context, file, bytes),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(radiusMd),
-                child: Image.memory(bytes, fit: BoxFit.cover, semanticLabel: name),
-              ),
-            );
-          }
-          if (isImage(name) && snap.connectionState != ConnectionState.done) {
-            return Row(mainAxisSize: MainAxisSize.min, children: [
-              const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2)),
-              const SizedBox(width: 10),
-              Flexible(child: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis)),
-            ]);
-          }
-          return FileAttachment(file, error: snap.error);
-        },
-      ),
+    if (!isImage(name)) return Padding(padding: const EdgeInsets.only(bottom: 6), child: FileAttachment(file));
+    return FutureBuilder(
+      future: client.fileBytes(file),
+      builder: (context, snap) {
+        if (snap.data case final bytes?) {
+          return GestureDetector(
+            onTap: () => showImage(context, file, bytes),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: previewMaxHeight),
+              child: Image.memory(bytes, width: bubbleWidth, fit: BoxFit.cover, semanticLabel: name),
+            ),
+          );
+        }
+        return Padding(
+          padding: const EdgeInsets.all(12),
+          child: snap.connectionState != ConnectionState.done
+              ? Row(mainAxisSize: MainAxisSize.min, children: [
+                  const SizedBox.square(dimension: 24, child: CircularProgressIndicator(strokeWidth: 2)),
+                  const SizedBox(width: 10),
+                  Flexible(child: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis)),
+                ])
+              : FileAttachment(file, error: snap.error),
+        );
+      },
     );
   }
 }
 
-/// Фото на весь экран с увеличением и сохранением.
+/// Фото на весь экран, целиком и без скругления, с увеличением и сохранением.
 void showImage(BuildContext context, Map<String, dynamic> file, Uint8List bytes) => showDialog(
   context: context,
-  builder: (_) => Dialog(
-    insetPadding: const EdgeInsets.all(12),
-    child: Stack(alignment: Alignment.topRight, children: [
-      InteractiveViewer(child: Image.memory(bytes)),
-      IconButton(
-        tooltip: 'Сохранить',
-        icon: const Icon(Icons.download_outlined),
-        onPressed: () => FilePicker.saveFile(fileName: file['name'], bytes: bytes),
+  builder: (context) => Dialog.fullscreen(
+    backgroundColor: Colors.black,
+    child: Stack(children: [
+      Positioned.fill(child: InteractiveViewer(maxScale: 8, child: Image.memory(bytes, fit: BoxFit.contain))),
+      SafeArea(
+        child: Row(children: [
+          IconButton(
+            tooltip: 'Закрыть',
+            color: Colors.white,
+            icon: const Icon(Icons.close),
+            onPressed: () => Navigator.pop(context),
+          ),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Сохранить',
+            color: Colors.white,
+            icon: const Icon(Icons.download_outlined),
+            onPressed: () => FilePicker.saveFile(fileName: file['name'], bytes: bytes),
+          ),
+        ]),
       ),
     ]),
   ),
@@ -818,20 +873,13 @@ class Album extends StatelessWidget {
   const Album(this.files, {super.key});
   final List<Map<String, dynamic>> files;
 
-  static const _side = 112.0, _gap = 4.0; // две плитки с зазором — ширина пузыря без отступов
+  static const _gap = 2.0, _side = (bubbleWidth - _gap) / 2; // две плитки с зазором — вся ширина пузыря
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(bottom: 6),
-    child: Wrap(spacing: _gap, runSpacing: _gap, children: [
-      for (final (i, f) in files.indexed)
-        SizedBox(
-          width: i == 0 && files.length.isOdd ? _side * 2 + _gap : _side,
-          height: _side,
-          child: ClipRRect(borderRadius: BorderRadius.circular(radiusMd), child: _Tile(f)),
-        ),
-    ]),
-  );
+  Widget build(BuildContext context) => Wrap(spacing: _gap, runSpacing: _gap, children: [
+    for (final (i, f) in files.indexed)
+      SizedBox(width: i == 0 && files.length.isOdd ? bubbleWidth : _side, height: _side, child: _Tile(f)),
+  ]);
 }
 
 /// Плитка альбома: у видео превью из сообщения, фото скачивается и показывается сразу.
