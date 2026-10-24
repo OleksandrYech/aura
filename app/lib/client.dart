@@ -589,12 +589,13 @@ class AuraClient extends ChangeNotifier {
     if (old == null) return admins.contains(from) && members.contains(from);
     if (u['v'] is! int || u['v'] <= old['v']) return false;
     if (from == nick || this.admins(chat).contains(from)) return true;
+    // Не-админ может только выйти сам: состав и админы меняются ровно на него, админов не назначает.
     final rest = this.members(chat)..remove(from);
+    final oldAdmins = this.admins(chat);
     return u['name'] == old['name'] &&
         members.toSet().containsAll(rest) && rest.toSet().containsAll(members) &&
         admins.every((a) => rest.contains(a)) &&
-        // Админы те же, а если уходит единственный админ, он может назначить нового.
-        (admins.toSet().containsAll(this.admins(chat)..remove(from)) || (this.admins(chat)..remove(from)).isEmpty);
+        admins.toSet().containsAll(oldAdmins) && oldAdmins.toSet().containsAll(admins);
   }
 
   /// Строка о том, что изменилось в группе.
@@ -706,7 +707,7 @@ class AuraClient extends ChangeNotifier {
     }
     await Future.wait(running.toList());
     if (i != parts) throw ApiException('Файл изменился во время отправки');
-    if (keep != null) _files[id!] = Future.value(keep.takeBytes());
+    if (keep != null) _files[_cacheKey(id, base64.encode(key))] = Future.value(keep.takeBytes());
     return {'id': id, 'key': base64.encode(key), 'name': name, 'size': length, 'chunk': part, ...extra};
   }
 
@@ -728,7 +729,7 @@ class AuraClient extends ChangeNotifier {
   Future<void> _forgetting = Future.value();
 
   void _forget(Map<String, dynamic> file) {
-    _files.remove(file['id']);
+    _files.removeWhere((k, _) => k.startsWith('${file['id']}/'));
     _forgetting = _forgetting.then((_) => forgetFile(file));
   }
 
@@ -834,10 +835,13 @@ class AuraClient extends ChangeNotifier {
   // ponytail: только в памяти, сохранять на устройство, когда понадобится просмотр без сети.
   final _files = <String, Future<Uint8List>>{};
 
+  static String _cacheKey(Object? id, Object? key) => '$id/$key';
+
   /// Скачивает и расшифровывает вложение целиком. Для больших файлов есть [fileParts].
   Future<Uint8List> fileBytes(Map<String, dynamic> file) {
-    final String id = file['id'];
-    if (_files[id] case final cached?) return cached;
+    // Ключ кэша — id и ключ файла: одинаковый id с чужим ключом не должен отдать чужие байты.
+    final String cacheKey = _cacheKey(file['id'], file['key']);
+    if (_files[cacheKey] case final cached?) return cached;
     final bytes = () async {
       final all = BytesBuilder(copy: false);
       await for (final p in fileParts(file)) {
@@ -846,9 +850,9 @@ class AuraClient extends ChangeNotifier {
       return all.takeBytes();
     }();
     if ((file['size'] ?? 0) <= _cacheLimit) {
-      _files[id] = bytes;
+      _files[cacheKey] = bytes;
       bytes.then((_) {}, onError: (_) {
-        _files.remove(id); // после ошибки попробуем скачать заново
+        _files.remove(cacheKey); // после ошибки попробуем скачать заново
       });
     }
     return bytes;

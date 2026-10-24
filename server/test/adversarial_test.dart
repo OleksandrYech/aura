@@ -123,6 +123,15 @@ void main() {
     expect(codes, contains(429), reason: 'все попытки обработаны: $codes');
   });
 
+  test('регистрация: после лимита на сервер отвечаем 429, до него — 200', () async {
+    final codes = <int>[];
+    for (var i = 0; i < 12; i++) {
+      codes.add((await post('/api/register', {'nick': 'reg$i', 'password': 'secret123'})).$1);
+    }
+    expect(codes.take(10), everyElement(200), reason: 'первые регистрации проходят: $codes');
+    expect(codes.skip(10), everyElement(429), reason: 'дальше PBKDF2 не считаем: $codes');
+  });
+
   test('A02: неверные типы полей дают 400, а не 500', () async {
     final (s1, _) = await post('/api/register', {'nick': 123, 'password': 'secret1'});
     final (s2, _) = await post('/api/login', {'nick': 'anna', 'password': 42});
