@@ -434,6 +434,12 @@ class AuraClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Пользователь отклонил новый ключ собеседника: старый остаётся, сообщения так и не уходят.
+  /// При следующей отправке вопрос появится снова.
+  void rejectNewKey(String peer) {
+    if (_newDevices.remove(peer)) notifyListeners();
+  }
+
   /// Пользователь подтвердил новый ключ собеседника: забываем старый и шлём заново не отправленное.
   Future<void> approveDevices(String peer) async {
     _devices.remove(peer);

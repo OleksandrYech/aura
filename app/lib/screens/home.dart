@@ -650,6 +650,31 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
+          // Смена ключа собеседника: без решения пользователя сообщения не уходят.
+          ListenableBuilder(
+            listenable: client,
+            builder: (context, _) => !client.hasNewDevice(widget.peer)
+                ? const SizedBox.shrink()
+                : Container(
+                    margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+                    decoration: BoxDecoration(color: c.lavender, borderRadius: BorderRadius.circular(16)),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('У ${client.title(widget.peer)} новый ключ безопасности: так бывает, если собеседник '
+                          'начал заново. Сообщения не уходят, пока вы не решите. После принятия сверьте код безопасности.'),
+                      Wrap(alignment: WrapAlignment.end, children: [
+                        TextButton(
+                          onPressed: () => client.rejectNewKey(widget.peer),
+                          child: const Text('Отклонить'),
+                        ),
+                        TextButton(
+                          onPressed: () => client.approveDevices(widget.peer),
+                          child: const Text('Принять'),
+                        ),
+                      ]),
+                    ]),
+                  ),
+          ),
           if (_uploading > 0)
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
