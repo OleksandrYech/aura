@@ -40,8 +40,12 @@ void main() {
   });
 
   test('видео звонка: потолок качества выше 720p, при плохой связи WebRTC снижает и разрешение', () {
-    final p = Calls.videoParameters;
+    final p = Calls.videoParameters();
     expect(p.degradationPreference, RTCDegradationPreference.BALANCED);
     expect(p.encodings!.single.maxBitrate, greaterThanOrEqualTo(4000000));
+  });
+
+  test('видео звонка на Android с программным декодером не выше 720p-битрейта', () {
+    expect(Calls.videoParameters(sw: true).encodings!.single.maxBitrate, lessThanOrEqualTo(2500000));
   });
 }

@@ -28,6 +28,11 @@ class Calls extends ChangeNotifier {
   /// Своя камера включена; камера собеседника включена; своя камера — фронтальная.
   bool video = false, peerVideo = false, front = true;
 
+  /// Android декодирует видео программно (см. [_connect]): с 720p видео с ноутбука на телефоне шло, а после
+  /// подъёма до 1080p и 4 Мбит/с пропало. Такому собеседнику шлём не больше 720p, как до подъёма.
+  static final _sw = !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  bool _peerSw = false;
+
   /// Почему не включилась камера: показываем в звонке, иначе кнопка просто молча не срабатывает.
   String? cameraError;
 
@@ -101,7 +106,7 @@ class Calls extends ChangeNotifier {
       )).sender;
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc)});
+      client.sendCall(to, {'type': 'offer', 'id': _id, 'sdp': await _gathered(pc), 'sw': _sw});
       _timeout = Timer(ring, () => _finish('Нет ответа', notify: true));
     } catch (e) {
       debugPrint('AURA: звонок $to: $e');
@@ -133,6 +138,7 @@ class Calls extends ChangeNotifier {
         'sdp': await _gathered(pc),
         'device': client.device,
         'video': video,
+        'sw': _sw,
       });
     } catch (e) {
       debugPrint('AURA: ответ на звонок: $e');
@@ -187,7 +193,7 @@ class Calls extends ChangeNotifier {
       if (on && _cam == null) {
         final cam = _cam = await navigator.mediaDevices.getUserMedia({
           'audio': false,
-          'video': {'facingMode': 'user', 'width': 1920, 'height': 1080, 'frameRate': 30},
+          'video': {'facingMode': 'user', 'width': _peerSw ? 1280 : 1920, 'height': _peerSw ? 720 : 1080, 'frameRate': 30},
         });
         if (state == CallState.idle) {
           _stopCamera(); // звонок кончился, пока ждали доступ
@@ -209,19 +215,21 @@ class Calls extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Потолок видео: 1080p, 30 к/с, до [maxVideoBitrate]. Ниже WebRTC опускается сам по оценке канала и загрузке
-  /// процессора: сначала битрейт, затем разрешение и частота кадров вместе (balanced), а когда связь лучше — обратно.
-  static const maxVideoBitrate = 4000000;
+  /// Потолок видео: 1080p, 30 к/с, до [maxVideoBitrate]; собеседнику на Android — 720p и [swVideoBitrate].
+  /// Ниже WebRTC опускается сам по оценке канала и загрузке процессора: сначала битрейт, затем разрешение и частота кадров вместе (balanced), а когда связь лучше — обратно.
+  static const maxVideoBitrate = 4000000, swVideoBitrate = 2500000;
 
-  static RTCRtpParameters get videoParameters => RTCRtpParameters(
+  static RTCRtpParameters videoParameters({bool sw = false}) => RTCRtpParameters(
     degradationPreference: RTCDegradationPreference.BALANCED,
-    encodings: [RTCRtpEncoding(maxBitrate: maxVideoBitrate, maxFramerate: 30, priority: RTCPriorityType.high)],
+    encodings: [
+      RTCRtpEncoding(maxBitrate: sw ? swVideoBitrate : maxVideoBitrate, maxFramerate: 30, priority: RTCPriorityType.high),
+    ],
   );
 
   /// Параметры кодировщика принимаются только после согласования, поэтому — когда соединение установлено.
   Future<void> _tuneVideo() async {
     try {
-      await _videoSender?.setParameters(videoParameters);
+      await _videoSender?.setParameters(videoParameters(sw: _peerSw));
     } catch (e) {
       debugPrint('AURA: параметры видео: $e'); // без них остаётся качество WebRTC по умолчанию
     }
@@ -253,10 +261,14 @@ class Calls extends ChangeNotifier {
         // Таймер до _set: слушатель может сразу ответить, и accept() должен его отменить.
         _timeout = Timer(ring, () => _finish('Пропущенный звонок'));
         _set(CallState.ringing, from, s['id'], peerVideo: s['video'] == true);
+        _peerSw = s['sw'] == true;
       case 'answer' when mine && state == CallState.calling:
         _timeout?.cancel();
         state = CallState.connecting;
         peerVideo = s['video'] == true;
+        _peerSw = s['sw'] == true;
+        // Камеру включили, пока звонили: она снимает 1080p, а ответил телефон — переоткрываем в 720p.
+        if (_peerSw && video) _camera(false).then((_) => _camera(true));
         notifyListeners();
         _pc?.setRemoteDescription(RTCSessionDescription(s['sdp'], 'answer'));
         // Остальные устройства собеседника перестают звонить.
@@ -285,6 +297,7 @@ class Calls extends ChangeNotifier {
     cameraError = null;
     muted = speaker = false;
     this.peerVideo = peerVideo;
+    _peerSw = false;
     since = null;
     notifyListeners();
   }
