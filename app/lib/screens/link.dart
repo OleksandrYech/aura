@@ -133,7 +133,7 @@ class DevicesScreen extends StatefulWidget {
 }
 
 class _DevicesScreenState extends State<DevicesScreen> {
-  late Future<List<int>> _devices = client.myDevices();
+  late Future<List<Map<String, dynamic>>> _devices = client.myDevices();
 
   void _say(String text) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
 
@@ -215,8 +215,22 @@ class _DevicesScreenState extends State<DevicesScreen> {
     );
   }
 
-  Future<void> _unlink(int d) async {
-    if (!await _ask('Отвязать устройство №$d?', 'Оно выйдет из аккаунта и перестанет получать сообщения.', 'Отвязать')) {
+  static String _title(Map<String, dynamic> d) => d['name'] as String? ?? 'Устройство №${d['device']}';
+
+  /// Где и когда устройство вошло: место примерное, по IP в момент входа.
+  static String _details(Map<String, dynamic> d) {
+    final at = d['createdAt'] is int ? DateTime.fromMillisecondsSinceEpoch(d['createdAt'] as int) : null;
+    String two(int n) => n.toString().padLeft(2, '0');
+    return [
+      if (d['device'] == client.device) 'Это устройство',
+      if (d['place'] case final String place) place,
+      if (at != null) 'вход ${two(at.day)}.${two(at.month)}.${at.year}, ${at.hour}:${two(at.minute)}',
+    ].join(' · ');
+  }
+
+  Future<void> _unlink(Map<String, dynamic> device) async {
+    final d = device['device'] as int;
+    if (!await _ask('Отвязать «${_title(device)}»?', 'Оно выйдет из аккаунта и перестанет получать сообщения.', 'Отвязать')) {
       return;
     }
     try {
@@ -235,12 +249,12 @@ class _DevicesScreenState extends State<DevicesScreen> {
       builder: (context, snap) => ListView(
         children: [
           if (snap.hasError) ListTile(title: Text('⚠ ${snap.error}')),
-          for (final d in snap.data ?? const <int>[])
+          for (final d in snap.data ?? const <Map<String, dynamic>>[])
             ListTile(
               leading: const Icon(Icons.devices_outlined),
-              title: Text('Устройство №$d'),
-              subtitle: d == client.device ? const Text('Это устройство') : null,
-              trailing: d == client.device ? null : TextButton(onPressed: () => _unlink(d), child: const Text('Отвязать')),
+              title: Text(_title(d)),
+              subtitle: _details(d).isEmpty ? null : Text(_details(d)),
+              trailing: d['device'] == client.device ? null : TextButton(onPressed: () => _unlink(d), child: const Text('Отвязать')),
             ),
           Padding(
             padding: const EdgeInsets.all(20),

@@ -58,4 +58,37 @@ void main() {
     expect(client.chats['den']!.map((m) => m.text), ['привет']);
     expect(find.text('Выбрано: 2'), findsNothing);
   });
+
+  testWidgets('нажатие на цитату прокручивает к исходному сообщению и подсвечивает его', (tester) async {
+    Map<String, dynamic> msg(String id, String text, [Map<String, dynamic>? reply]) =>
+        {'id': id, 'mine': false, 'text': text, 'time': 1, 'status': 'read', 'reply': ?reply};
+    SharedPreferences.setMockInitialValues({
+      'nick': 'anna',
+      'chats': jsonEncode({
+        'chats': {
+          'den': [
+            msg('m0', 'самое первое'),
+            for (var i = 1; i < 60; i++) msg('m$i', 'сообщение $i'),
+            msg('r', 'ответ', {'id': 'm0', 'from': 'den', 'text': 'самое первое'}),
+          ],
+        },
+        'names': {},
+        'lastRead': {},
+      }),
+    });
+    await client.load();
+    await tester.pumpWidget(MaterialApp(theme: buildTheme(Brightness.light), home: const ChatScreen(peer: 'den')));
+    expect(find.text('самое первое', skipOffstage: true), findsOneWidget, reason: 'пока видна только цитата');
+
+    await tester.tap(find.byType(Quote));
+    await tester.pumpAndSettle();
+    expect(find.descendant(of: find.byType(Quote), matching: find.text('самое первое')), findsNothing, reason: 'ответ ушёл вниз');
+    final lit = find.byWidgetPredicate((w) => w is AnimatedContainer && w.key is GlobalKey && ![null, Colors.transparent].contains((w.decoration as BoxDecoration?)?.color));
+    expect(lit, findsOneWidget);
+    expect(find.descendant(of: lit, matching: find.text('сообщение 1')), findsNothing);
+    expect(find.descendant(of: lit, matching: find.byType(Quote)), findsNothing, reason: 'подсвечен оригинал, а не ответ');
+    expect(find.descendant(of: lit, matching: find.text('самое первое')), findsOneWidget);
+
+    await tester.pump(const Duration(seconds: 2));
+  });
 }
