@@ -87,7 +87,7 @@ class _PeoplePickerState extends State<PeoplePicker> {
           CheckboxListTile(
             value: _picked.contains(n),
             onChanged: (v) => setState(() => v! ? _picked.add(n) : _picked.remove(n)),
-            secondary: Avatar(client.nameOf(n), size: 40),
+            secondary: Avatar(client.nameOf(n), nick: n, size: 40),
             title: Text(client.nameOf(n)),
             subtitle: Text('@$n', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
           ),
@@ -208,7 +208,7 @@ class GroupScreen extends StatelessWidget {
             ),
             for (final m in members)
               ListTile(
-                leading: Avatar(client.nameOf(m), size: 40),
+                leading: Avatar(client.nameOf(m), nick: m, size: 40),
                 title: Text(client.nameOf(m)),
                 subtitle: Text('@$m', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
                 trailing: admins.contains(m) ? Text('админ', style: TextStyle(fontSize: 12, color: c.grayPurple)) : null,
