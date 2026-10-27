@@ -53,6 +53,23 @@ void main() {
     expect(parts.expand((p) => p).toList(), data);
   });
 
+  test('аватарки собеседников переживают перезапуск, слишком большие отбрасываются', () async {
+    SharedPreferences.setMockInitialValues({
+      'avatar': base64.encode([1, 2, 3]),
+      'chats': jsonEncode({
+        'chats': {},
+        'names': {},
+        'lastRead': {},
+        'avatars': {'oleg': base64.encode([4, 5]), 'spam': 'A' * (200 << 10), 'bad': '***'},
+      }),
+    });
+    client.avatars.clear();
+    await client.load();
+    expect(client.avatar, [1, 2, 3]);
+    expect(client.avatars.keys, ['oleg']);
+    expect(client.avatarOf('oleg'), [4, 5]);
+  });
+
   test('удаление у себя убирает альбом из истории и ждёт отправки на свои устройства', () async {
     final album = {
       'id': 'm1',

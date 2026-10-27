@@ -193,7 +193,7 @@ class _CallScreenState extends State<CallScreen> {
         const Spacer(),
       ] else ...[
         const Spacer(),
-        Avatar(name, size: 112),
+        Avatar(name, nick: calls.peer, size: 112),
         const SizedBox(height: 24),
         Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
         const SizedBox(height: 8),

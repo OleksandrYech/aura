@@ -61,13 +61,20 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class Avatar extends StatelessWidget {
-  const Avatar(this.name, {super.key, this.size = 48});
+  /// [nick] — чья аватарка: если она есть, показывается вместо инициалов.
+  const Avatar(this.name, {super.key, this.nick, this.size = 48});
   final String name;
+  final String? nick;
   final double size;
 
   @override
   Widget build(BuildContext context) {
     final c = AuraColors.of(context);
+    final photo = nick == null ? null : client.avatarOf(nick!);
+    if (photo != null) {
+      // Фото не квадратное: круг обрезает его по центру (cover).
+      return CircleAvatar(radius: size / 2, backgroundColor: c.lightGray, backgroundImage: MemoryImage(photo));
+    }
     final words = name.trim().split(RegExp(r'\s+')).where((w) => w.isNotEmpty);
     final initials = words.isEmpty ? '?' : words.take(2).map((w) => w[0]).join().toUpperCase();
     // Цвет зависит от имени, чтобы у собеседника он не менялся.
@@ -158,7 +165,7 @@ class ChatsTab extends StatelessWidget {
                         return ListTile(
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(radiusMd)),
                           contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          leading: Avatar(name),
+                          leading: Avatar(name, nick: peer),
                           title: Row(children: [
                             Expanded(child: Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500))),
                             Text(formatTime(last.time), style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.5))),
@@ -255,7 +262,7 @@ class _ContactsTabState extends State<ContactsTab> {
                 ),
               for (final u in users)
                 ListTile(
-                  leading: Avatar(u.name, size: 40),
+                  leading: Avatar(u.name, nick: u.nick, size: 40),
                   title: Text(u.name),
                   subtitle: Text('@${u.nick}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
                   onTap: () => openChat(context, u.nick),
@@ -584,7 +591,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ? () => Navigator.push(context, MaterialPageRoute(builder: (_) => GroupScreen(chat: widget.peer)))
               : null,
           child: Row(children: [
-            Avatar(name, size: 40),
+            Avatar(name, nick: widget.peer, size: 40),
             const SizedBox(width: 12),
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
