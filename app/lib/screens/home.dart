@@ -112,8 +112,9 @@ class ChatsTab extends StatelessWidget {
     return ListenableBuilder(
       listenable: client,
       builder: (context, _) {
-        final peers = client.chats.keys.where((p) => client.chats[p]!.isNotEmpty).toList()
+        final peers = client.chats.keys.where((p) => client.chats[p]!.isNotEmpty && !client.requests.contains(p)).toList()
           ..sort((a, b) => client.chats[b]!.last.time.compareTo(client.chats[a]!.last.time));
+        final requests = client.requests.where((p) => client.chats[p]?.isNotEmpty ?? false).toList();
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -139,6 +140,18 @@ class ChatsTab extends StatelessWidget {
                 ),
               ]),
             ),
+            if (requests.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(radiusMd)),
+                  tileColor: c.lavender,
+                  leading: const Icon(Icons.mark_email_unread_outlined),
+                  title: Text('Запросы на переписку: ${requests.length}'),
+                  subtitle: const Text('Сообщения от новых контактов ждут вашего решения'),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const RequestsScreen())),
+                ),
+              ),
             Expanded(
               child: peers.isEmpty
                   ? Center(
@@ -187,6 +200,38 @@ class ChatsTab extends StatelessWidget {
   }
 }
 
+/// Незнакомцы, написавшие первыми. Чат открывается как обычно, с выбором «Принять» или «Отклонить».
+class RequestsScreen extends StatelessWidget {
+  const RequestsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Запросы на переписку')),
+      body: ListenableBuilder(
+        listenable: client,
+        builder: (context, _) {
+          final peers = client.requests.where((p) => client.chats[p]?.isNotEmpty ?? false).toList();
+          if (peers.isEmpty) {
+            return Center(child: Text('Запросов нет', style: TextStyle(color: c.ink.withValues(alpha: 0.6))));
+          }
+          return ListView(padding: const EdgeInsets.all(12), children: [
+            for (final p in peers)
+              ListTile(
+                leading: Avatar(client.title(p), nick: p),
+                title: Text(client.title(p)),
+                subtitle: Text('@${client.handleOf(p)} · ${client.chats[p]!.last.preview}',
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                onTap: () => openChat(context, p),
+              ),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
 class ContactsTab extends StatefulWidget {
   const ContactsTab({super.key});
 
@@ -230,7 +275,7 @@ class _ContactsTabState extends State<ContactsTab> {
     final users = _found ??
         [
           for (final n in client.chats.keys)
-            if (!AuraClient.isGroup(n)) (nick: n, name: client.names[n] ?? n),
+            if (!AuraClient.isGroup(n) && !client.requests.contains(n)) (nick: n, name: client.names[n] ?? n),
         ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -246,7 +291,7 @@ class _ContactsTabState extends State<ContactsTab> {
               _debounce?.cancel();
               _debounce = Timer(const Duration(milliseconds: 300), () => _search(q));
             },
-            decoration: const InputDecoration(hintText: 'Точный никнейм собеседника', prefixIcon: Icon(Icons.search)),
+            decoration: const InputDecoration(hintText: '@nickname — точный никнейм собеседника', prefixIcon: Icon(Icons.search)),
           ),
         ),
         if (_error != null)
@@ -264,7 +309,7 @@ class _ContactsTabState extends State<ContactsTab> {
                 ListTile(
                   leading: Avatar(u.name, nick: u.nick, size: 40),
                   title: Text(u.name),
-                  subtitle: Text('@${u.nick}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+                  subtitle: Text('@${client.handleOf(u.nick)}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
                   onTap: () => openChat(context, u.nick),
                 ),
             ],
@@ -764,7 +809,7 @@ class _ChatScreenState extends State<ChatScreen> {
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(name, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500)),
-                Text(group ? 'Участники: ${client.members(widget.peer).length}' : '@${widget.peer}',
+                Text(group ? 'Участники: ${client.members(widget.peer).length}' : '@${client.handleOf(widget.peer)}',
                     style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.55))),
               ]),
             ),
@@ -843,6 +888,34 @@ class _ChatScreenState extends State<ChatScreen> {
                 );
               },
             ),
+          ),
+          // Запрос на переписку: пока не принят, собеседник не видит, что сообщения дошли.
+          ListenableBuilder(
+            listenable: client,
+            builder: (context, _) => !client.requests.contains(widget.peer)
+                ? const SizedBox.shrink()
+                : Container(
+                    margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+                    decoration: BoxDecoration(color: c.lavender, borderRadius: BorderRadius.circular(16)),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('${client.title(widget.peer)} (@${client.handleOf(widget.peer)}) хочет начать переписку. '
+                          'Пока вы не примете запрос, собеседник не узнает, что сообщения дошли и прочитаны.'),
+                      Wrap(alignment: WrapAlignment.end, children: [
+                        TextButton(
+                          onPressed: () {
+                            client.declineRequest(widget.peer);
+                            Navigator.pop(context);
+                          },
+                          child: const Text('Отклонить'),
+                        ),
+                        TextButton(
+                          onPressed: () => client.acceptRequest(widget.peer),
+                          child: const Text('Принять'),
+                        ),
+                      ]),
+                    ]),
+                  ),
           ),
           // Смена ключа собеседника: без решения пользователя сообщения не уходят.
           ListenableBuilder(
@@ -967,7 +1040,7 @@ class _ChatScreenState extends State<ChatScreen> {
 /// Выбор чата для пересылки: чаты, куда можно писать, сначала недавние.
 Future<String?> pickChat(BuildContext context) {
   final peers = client.chats.keys
-      .where((p) => client.chats[p]!.isNotEmpty && (!AuraClient.isGroup(p) || client.members(p).contains(client.nick)))
+      .where((p) => client.chats[p]!.isNotEmpty && !client.requests.contains(p) && (!AuraClient.isGroup(p) || client.members(p).contains(client.nick)))
       .toList()
     ..sort((a, b) => client.chats[b]!.last.time.compareTo(client.chats[a]!.last.time));
   return showDialog<String>(

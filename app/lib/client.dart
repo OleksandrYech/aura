@@ -142,13 +142,26 @@ class AuraClient extends ChangeNotifier {
   static final instance = AuraClient._();
 
   late SharedPreferences _prefs;
-  String? token, nick, name;
 
-  /// Переписка по никнейму собеседника.
+  /// [nick] — постоянный id аккаунта: им адресованы сессии Signal и переписка у собеседников.
+  /// [handle] — никнейм, который видят и по которому ищут; его можно сменить ([updateProfile]).
+  String? token, nick, name, handle;
+
+  /// Переписка по id собеседника.
   final chats = <String, List<Message>>{};
 
-  /// Отображаемые имена собеседников.
+  /// Отображаемые имена и никнеймы собеседников по id. Их присылает сервер с каждым сообщением.
   final names = <String, String>{};
+  final handles = <String, String>{};
+
+  String handleOf(String n) => n == nick ? handle ?? n : handles[n] ?? n;
+
+  /// Запросы на переписку: незнакомец написал первым. Пока запрос не принят, чат скрыт из списка,
+  /// не будит уведомлением, а собеседник не получает «доставлено» и «прочитано».
+  final requests = <String>{};
+
+  /// Отклонённые запросы: сообщения от них отбрасываются. Написать им самому — снять запрет.
+  final blocked = <String>{};
 
   /// Своя аватарка и аватарки собеседников: JPEG до [avatarSize] пикселей. На сервер не загружаются,
   /// а уходят собеседникам внутри зашифрованных сообщений, как в Signal.
@@ -238,6 +251,7 @@ class AuraClient extends ChangeNotifier {
     token = _prefs.getString('token');
     nick = _prefs.getString('nick');
     name = _prefs.getString('name');
+    handle = _prefs.getString('handle');
     device = _prefs.getInt('device');
     avatar = _decodeAvatar(_prefs.getString('avatar'));
     final keys = await _readKeys();
@@ -249,6 +263,9 @@ class AuraClient extends ChangeNotifier {
         chats[key] = [for (final m in value as List) Message.fromJson(m)];
       }
       names.addAll((j['names'] as Map<String, dynamic>).cast());
+      handles.addAll((j['handles'] as Map<String, dynamic>? ?? {}).cast());
+      requests.addAll((j['requests'] as List? ?? []).cast());
+      blocked.addAll((j['blocked'] as List? ?? []).cast());
       lastRead.addAll((j['lastRead'] as Map<String, dynamic>).cast());
       _deletes.addAll((j['deletes'] as List? ?? []).cast());
       _gone.addAll((j['gone'] as List? ?? []).cast());
@@ -306,6 +323,7 @@ class AuraClient extends ChangeNotifier {
     token = res['token'];
     nick = res['nick'];
     name = res['name'];
+    handle = res['handle'] ?? nick; // старый сервер никнейм не меняет
     device = res['device'];
     _accountKey = res['identityKey'];
     linkError = null;
@@ -327,6 +345,7 @@ class AuraClient extends ChangeNotifier {
     await _prefs.setString('token', token!);
     await _prefs.setString('nick', nick!);
     await _prefs.setString('name', name!);
+    await _prefs.setString('handle', handle ?? nick!);
     await _prefs.setInt('device', device!);
     await _saveKeys();
     notifyListeners();
@@ -426,10 +445,16 @@ class AuraClient extends ChangeNotifier {
     _devices.remove(nick);
   }
 
-  Future<void> updateName(String newName) async {
-    final res = await _request('PUT', _api('/api/me'), {'name': newName});
+  /// Имя и никнейм. Никнейм сервер проверяет на занятость; id аккаунта при этом не меняется,
+  /// поэтому переписка и ключи у собеседников остаются прежними.
+  Future<void> updateProfile(String newName, String newHandle) async {
+    final res = await _request('PUT', _api('/api/me'), {'name': newName, 'handle': newHandle});
     name = res['name'];
+    // Старый сервер никнейм не меняет и не возвращает.
+    if (res['handle'] == null && newHandle != handleOf(nick!)) throw ApiException('Сервер не поддерживает смену никнейма');
+    handle = res['handle'] ?? handle;
     await _prefs.setString('name', name!);
+    await _prefs.setString('handle', handleOf(nick!));
     notifyListeners();
   }
 
@@ -470,13 +495,51 @@ class AuraClient extends ChangeNotifier {
     }
   }
 
+  /// Поиск по точному никнейму, с @ или без.
   Future<List<({String nick, String name})>> searchUsers(String q) async {
+    q = q.trim().toLowerCase();
+    if (q.startsWith('@')) q = q.substring(1);
     final res = await _request('GET', _api('/api/users', {'q': q}), null) as List;
     final users = [for (final u in res) (nick: u['nick'] as String, name: u['name'] as String)];
-    for (final u in users) {
-      names[u.nick] = u.name;
+    for (final u in res) {
+      names[u['nick']] = u['name'];
+      handles[u['nick']] = u['handle'] ?? u['nick'];
     }
     return users;
+  }
+
+  /// Принять запрос на переписку: чат появляется в списке, собеседник получает «доставлено»
+  /// и «прочитано» за всё, что прислал. Решение уходит и на другие свои устройства.
+  void acceptRequest(String peer) {
+    if (!requests.remove(peer)) return;
+    _save();
+    final incoming = [...?chats[peer]].where((m) => !m.mine && m.update == null);
+    for (final s in [Status.delivered, Status.read]) {
+      final ids = [for (final m in incoming) if ((m.status == Status.read) == (s == Status.read)) m.id];
+      if (ids.isNotEmpty) _sendReceipt(peer, s, ids);
+    }
+    _serial(() => _sendCopy(nick!, _newId(), {'request': 'accept', 'peer': peer}));
+  }
+
+  /// Отклонить запрос: переписка удаляется, дальнейшие сообщения от собеседника отбрасываются.
+  /// Собеседник об этом не узнаёт: его сообщения так и остаются «отправлено».
+  void declineRequest(String peer) {
+    _decline(peer);
+    _serial(() => _sendCopy(nick!, _newId(), {'request': 'decline', 'peer': peer}));
+  }
+
+  void _decline(String peer) {
+    requests.remove(peer);
+    blocked.add(peer);
+    for (final m in chats.remove(peer) ?? <Message>[]) {
+      m.attachments.forEach(_forget);
+    }
+    _save();
+  }
+
+  /// Свой ответ (или сообщение с другого своего устройства) — согласие на переписку.
+  void _known(String peer) {
+    if (requests.remove(peer) | blocked.remove(peer)) _save();
   }
 
   /// Код безопасности с собеседником: сверьте его при встрече или по другому каналу.
@@ -575,11 +638,14 @@ class AuraClient extends ChangeNotifier {
     await ws?.sink.close();
     // Сервер удаляет устройство и его ключи; если связи нет, просто забываем их здесь.
     if (token != null) _request('POST', _api('/api/logout'), {}).ignore();
-    token = nick = name = device = _keys = _accountKey = linkError = avatar = null;
+    token = nick = name = handle = device = _keys = _accountKey = linkError = avatar = null;
     connected = false;
     chats.clear();
     _files.clear();
     names.clear();
+    handles.clear();
+    requests.clear();
+    blocked.clear();
     avatars.clear();
     _avatarSent.clear();
     lastRead.clear();
@@ -593,7 +659,7 @@ class AuraClient extends ChangeNotifier {
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     if (!kIsWeb) await _secure.delete(key: 'signal');
-    for (final k in ['token', 'nick', 'name', 'device', 'avatar', 'signal', 'chats', 'localFiles']) {
+    for (final k in ['token', 'nick', 'name', 'handle', 'device', 'avatar', 'signal', 'chats', 'localFiles']) {
       await _prefs.remove(k);
     }
     await clearLocalFiles();
@@ -647,6 +713,8 @@ class AuraClient extends ChangeNotifier {
               'text': reply.preview.length > 100 ? '${reply.preview.substring(0, 100)}…' : reply.preview,
             },
     );
+    if (requests.contains(to)) acceptRequest(to);
+    if (!isGroup(to)) _known(to);
     chats.putIfAbsent(to, () => []).add(m);
     _save();
     _deliver(to, m);
@@ -1108,6 +1176,8 @@ class AuraClient extends ChangeNotifier {
       for (final m in chats[peer] ?? <Message>[])
         if (!m.mine && m.status != Status.read) m..status = Status.read,
     ];
+    // Запрос можно прочитать, но «прочитано» уйдёт только с принятием ([acceptRequest]).
+    if (requests.contains(peer)) return _save();
     // В группе подтверждение уходит автору каждого сообщения.
     for (final from in {for (final m in unread) m.from ?? peer}) {
       _sendReceipt(from, Status.read, [for (final m in unread) if ((m.from ?? peer) == from) m.id]);
@@ -1312,6 +1382,11 @@ class AuraClient extends ChangeNotifier {
 
   Future<void> _handle(Map<String, dynamic> msg) async {
     final String id = msg['id'], from = msg['from'];
+    // Нынешние имя и никнейм отправителя от сервера (как и в поиске); старый сервер их не присылает.
+    if (from != nick) {
+      if (msg['name'] case final String n when n.isNotEmpty && n.length <= 64) names[from] = n;
+      if (msg['handle'] case final String h when h.isNotEmpty && h.length <= 32) handles[from] = h;
+    }
     // Дубль (повторная доставка) не расшифровываем второй раз.
     if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
@@ -1414,7 +1489,17 @@ class AuraClient extends ChangeNotifier {
           });
         }
       } else if (content?['call'] case final Map signal) {
-        onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
+        // Звонок от незнакомца или из непринятого запроса не звонит.
+        if (signal['type'] != 'offer' || from == nick || (chats.containsKey(from) && !requests.contains(from))) {
+          onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
+        }
+      } else if (content?['request'] case final String r when from == nick && !group) {
+        // Решение по запросу с другого своего устройства.
+        if (r == 'decline') {
+          _decline(peer);
+        } else if (r == 'accept') {
+          requests.remove(peer);
+        }
       } else if (content != null && content.containsKey('avatar')) {
         final a = _decodeAvatar(content['avatar']);
         if (from == nick) {
@@ -1440,8 +1525,14 @@ class AuraClient extends ChangeNotifier {
         debugPrint('AURA: $from не участник $peer'); // неизвестную группу принимаем: её описание может прийти позже
       } else if (text.isEmpty && file == null && files == null && update == null) {
         debugPrint('AURA: $id от $from: неизвестный тип сообщения'); // от новой версии: не показываем пустым
+      } else if (!group && from != nick && blocked.contains(peer)) {
+        debugPrint('AURA: $id от $from: запрос отклонён');
       } else {
         final mine = from == nick;
+        // Первое сообщение от незнакомца — запрос на переписку. Свою копию с другого устройства принимаем как ответ.
+        final request = !group && !mine && (requests.contains(peer) || !chats.containsKey(peer));
+        if (request) requests.add(peer);
+        if (!group && mine) _known(peer);
         if (update != null) {
           text = _describe(from, groups[peer], update);
           _applyGroup(peer, update);
@@ -1467,7 +1558,7 @@ class AuraClient extends ChangeNotifier {
                 fwd: fwd,
               ),
             );
-        if (!mine) {
+        if (!mine && !request) {
           _sendReceipt(from, Status.delivered, [id]);
           onIncoming?.call();
         }
@@ -1535,6 +1626,9 @@ class AuraClient extends ChangeNotifier {
       case 'ready':
         connected = true;
         _backoff = 1;
+        // Имя или никнейм могли смениться на другом своём устройстве.
+        if (msg['name'] case final String n) _prefs.setString('name', name = n);
+        if (msg['handle'] case final String h) _prefs.setString('handle', handle = h);
         if ((msg['preKeys'] as int) < SignalKeys.preKeyBatch ~/ 2) _refillPreKeys();
         if (_pushToken != null) _sendPushToken();
         // Переотправляем то, что не дошло до сервера; сервер отбрасывает дубли по id.
@@ -1620,7 +1714,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified], 'avatars': avatars.map((k, v) => MapEntry(k, base64.encode(v))), 'avatarSent': [..._avatarSent], 'newDevices': [..._newDevices], 'held': _held}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'handles': handles, 'requests': [...requests], 'blocked': [...blocked], 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified], 'avatars': avatars.map((k, v) => MapEntry(k, base64.encode(v))), 'avatarSent': [..._avatarSent], 'newDevices': [..._newDevices], 'held': _held}));
     notifyListeners();
   }
 

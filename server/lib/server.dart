@@ -108,6 +108,13 @@ class AuraServer {
     if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'seen_at')) {
       db.execute('ALTER TABLE devices ADD COLUMN seen_at INTEGER');
     }
+    // nick — постоянный id аккаунта (адрес Signal, ключ переписки у собеседников), handle — никнейм,
+    // по которому ищут и который можно сменить. Занятым считается ник, который чей-то id или чей-то handle:
+    // прежний id не достанется другому, и старые версии клиентов, знающие только id, не ошибутся адресатом.
+    if (!db.select('PRAGMA table_info(users)').any((c) => c['name'] == 'handle')) {
+      db.execute('ALTER TABLE users ADD COLUMN handle TEXT; UPDATE users SET handle = nick;');
+    }
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS users_handle ON users(handle)');
     // Название устройства от клиента и примерное место входа: видны только владельцу аккаунта.
     if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'label')) {
       db.execute('ALTER TABLE devices ADD COLUMN label TEXT; ALTER TABLE devices ADD COLUMN place TEXT;');
@@ -255,10 +262,9 @@ class AuraServer {
     if (name.length > 64) return _error(400, 'Имя длиннее 64 символов');
     final hash = await Isolate.run(() => hashPassword(password));
     // Проверка и вставка без await между ними, поэтому гонки двух регистраций нет.
-    if (db.select('SELECT 1 FROM users WHERE nick = ?', [nick]).isNotEmpty) {
-      return _error(409, 'Этот никнейм уже занят');
-    }
-    db.execute('INSERT INTO users (nick, name, password_hash, created_at) VALUES (?, ?, ?, ?)', [
+    if (_taken(nick, null)) return _error(409, 'Этот никнейм уже занят');
+    db.execute('INSERT INTO users (nick, handle, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)', [
+      nick,
       nick,
       name.isEmpty ? nick : name,
       hash,
@@ -267,10 +273,18 @@ class AuraServer {
     return _session(nick, req, body);
   }
 
+  /// Занят ли [nick] как чей-то id или никнейм, кроме аккаунта [me].
+  bool _taken(String nick, String? me) =>
+      db.select('SELECT 1 FROM users WHERE (nick = ? OR handle = ?) AND nick IS NOT ?', [nick, nick, me]).isNotEmpty;
+
   Future<Response> _login(Request req) async {
     final body = await _json(req);
     // Не строка — просто неверный вход, а не 400: ответ не должен отличаться от обычной ошибки.
-    final nick = (body['nick'] is String ? body['nick'] as String : '').trim().toLowerCase();
+    final typed = (body['nick'] is String ? body['nick'] as String : '').trim().toLowerCase();
+    // Входят по нынешнему никнейму или по прежнему (id): старые версии и привычка. Лимит — на аккаунт.
+    final nick = db.select('SELECT nick FROM users WHERE handle = ? OR nick = ?', [typed, typed]).firstOrNull?['nick']
+            as String? ??
+        typed;
     // Перебор пароля: после серии ошибок ник закрыт на время, даже для верного пароля.
     // ponytail: только по нику, поэтому злоумышленник может так закрыть чужой ник на 15 минут; добавить счёт по IP за прокси.
     if (_over('login:$nick', maxLogins, loginWindow)) return _error(429, 'Слишком много попыток, попробуйте позже');
@@ -295,21 +309,34 @@ class AuraServer {
     return _session(nick, req, body);
   }
 
-  /// Найти можно только по точному никнейму: список всех пользователей не раскрывается.
+  /// Найти можно только по точному нынешнему никнейму (с @ или без): ни по имени, ни по части,
+  /// ни по прежнему никнейму. Список всех пользователей не раскрывается.
   Response _searchUsers(Request req, Device me) {
-    final q = (req.url.queryParameters['q'] ?? '').trim().toLowerCase();
-    final rows = db.select('SELECT nick, name FROM users WHERE nick = ? AND nick != ?', [q, me.nick]);
+    var q = (req.url.queryParameters['q'] ?? '').trim().toLowerCase();
+    if (q.startsWith('@')) q = q.substring(1);
+    final rows = db.select('SELECT nick, name, handle FROM users WHERE handle = ? AND nick != ?', [q, me.nick]);
     return _ok([
-      for (final r in rows) {'nick': r['nick'], 'name': r['name']},
+      for (final r in rows) {'nick': r['nick'], 'name': r['name'], 'handle': r['handle']},
     ]);
   }
 
+  /// {name, handle?}: имя и, если передан, новый никнейм. Старые версии шлют только имя.
   Future<Response> _updateMe(Request req, Device me) async {
-    final name = ((await _json(req))['name'] as String? ?? '').trim();
+    final body = await _json(req);
+    final name = (body['name'] as String? ?? '').trim();
     if (name.isEmpty || name.length > 64) return _error(400, 'Введите имя');
+    if (body['handle'] case final String h) {
+      final handle = h.trim().toLowerCase();
+      if (!_nickRe.hasMatch(handle)) return _error(400, 'Никнейм: 3–32 символа, латиница, цифры и _');
+      if (_taken(handle, me.nick)) return _error(409, 'Этот никнейм уже занят');
+      db.execute('UPDATE users SET handle = ? WHERE nick = ?', [handle, me.nick]);
+    }
     db.execute('UPDATE users SET name = ? WHERE nick = ?', [name, me.nick]);
-    return _ok({'nick': me.nick, 'name': name});
+    return _ok({'nick': me.nick, 'name': name, 'handle': _profile(me.nick)['handle']});
   }
+
+  /// Имя и никнейм аккаунта [nick] — сервер отдаёт их вместе с каждым сообщением от него.
+  Row _profile(String nick) => db.select('SELECT name, handle FROM users WHERE nick = ?', [nick]).first;
 
   /// Каждый вход создаёт новое устройство. Номера устройств не повторяются,
   /// поэтому ключ на одном адресе «ник:устройство» никогда не меняется.
@@ -328,7 +355,7 @@ class AuraServer {
     ].whereType<String>().where((s) => s.isNotEmpty).join(', ');
     final token = base64Url.encode(List.generate(32, (_) => _random.nextInt(256)));
     final user = db.select(
-      'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, identity_key, next_device - 1 AS device',
+      'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, handle, identity_key, next_device - 1 AS device',
       [nick],
     ).first;
     db.execute('INSERT INTO devices (token_hash, nick, device, created_at, label, place) VALUES (?, ?, ?, ?, ?, ?)', [
@@ -343,6 +370,7 @@ class AuraServer {
       'token': token,
       'nick': nick,
       'name': user['name'],
+      'handle': user['handle'],
       'device': user['device'],
       'identityKey': user['identity_key'],
     });
@@ -813,8 +841,9 @@ class AuraServer {
   // Клиент → сервер: {type: auth, token}, {type: send, id, to, payloads: [{device, type, body}], push?}, {type: ack, id}
   // push: message, call или end (звонок отменён) — разбудить устройства получателя.
   // {type: ping} → {type: pong}: клиент проверяет, живо ли соединение.
-  // Сервер → клиент: {type: ready, device, preKeys}, {type: sent, id, to},
-  //   {type: message, id, from, device, ctype, body, sentAt}, {type: error, id?, to?, error}
+  // Сервер → клиент: {type: ready, device, preKeys, name, handle}, {type: sent, id, to},
+  //   {type: message, id, from, device, ctype, body, sentAt, name, handle}, {type: error, id?, to?, error}
+// from — постоянный id отправителя, name и handle — его нынешние имя и никнейм (их задаёт сервер, а не отправитель).
   // body — шифротекст Signal (base64), ctype — его тип (2 обычное, 3 с установкой сессии).
   // error: devices — список устройств получателя изменился, нужно запросить его заново.
 
@@ -846,7 +875,15 @@ class AuraServer {
           auth.cancel();
           _online.remove(d)?.sink.close(); // то же устройство переподключилось
           _online[d] = ws;
-          ws.sink.add(jsonEncode({'type': 'ready', 'device': d.device, 'preKeys': _preKeyCount(d)}));
+          // name и handle: другие свои устройства узнают о смене профиля при подключении.
+          final profile = _profile(d.nick);
+          ws.sink.add(jsonEncode({
+            'type': 'ready',
+            'device': d.device,
+            'preKeys': _preKeyCount(d),
+            'name': profile['name'],
+            'handle': profile['handle'],
+          }));
           _flush(d, ws);
           return;
         }
@@ -922,7 +959,7 @@ class AuraServer {
       ).firstOrNull?['sender'];
       if (other != null && other != me.nick) return error('id');
     }
-    final sentAt = _now();
+    final sentAt = _now(), profile = _profile(me.nick);
     for (final p in payloads) {
       // Повтор того же id (переотправка после обрыва связи) не создаёт дубль.
       db.execute('INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [
@@ -948,6 +985,8 @@ class AuraServer {
           'ctype': p['type'],
           'body': p['body'],
           'sentAt': sentAt,
+          'name': profile['name'],
+          'handle': profile['handle'],
         }),
       );
     }
@@ -956,7 +995,8 @@ class AuraServer {
 
   void _flush(Device me, WebSocketChannel ws) {
     final rows = db.select(
-      'SELECT id, sender, sender_device, type, body, sent_at FROM messages WHERE recipient = ? AND recipient_device = ? ORDER BY sent_at',
+      'SELECT id, sender, sender_device, type, body, sent_at, u.name, u.handle FROM messages '
+      'LEFT JOIN users u ON u.nick = sender WHERE recipient = ? AND recipient_device = ? ORDER BY sent_at',
       [me.nick, me.device],
     );
     for (final r in rows) {
@@ -969,6 +1009,8 @@ class AuraServer {
           'ctype': r['type'],
           'body': r['body'],
           'sentAt': r['sent_at'],
+          'name': r['name'],
+          'handle': r['handle'],
         }),
       );
     }

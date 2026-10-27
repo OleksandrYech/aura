@@ -37,7 +37,7 @@ class _SettingsTabState extends State<SettingsTab> {
             contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
             leading: Avatar(client.name ?? '', nick: client.nick, size: 56),
             title: Text(client.name ?? '', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
-            subtitle: Text('@${client.nick} · Изменить профиль', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+            subtitle: Text('@${client.handleOf(client.nick!)} · Изменить профиль', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen())),
           ),
         ),
@@ -108,7 +108,8 @@ class ProfileScreen extends StatefulWidget {
 
 class _ProfileScreenState extends State<ProfileScreen> {
   final _name = TextEditingController(text: client.name);
-  String? _error;
+  final _handle = TextEditingController(text: client.handleOf(client.nick!));
+  String? _error, _handleError;
   bool _saved = false, _saving = false;
 
   /// Фото из галереи, уменьшенное до [AuraClient.avatarSize]: так оно влезает в зашифрованное сообщение.
@@ -132,17 +133,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Future<void> _save() async {
     final name = _name.text.trim();
+    var handle = _handle.text.trim().toLowerCase();
+    if (handle.startsWith('@')) handle = handle.substring(1);
     setState(() {
       _error = name.isEmpty ? 'Введите имя' : null;
+      _handleError = RegExp(r'^[a-z0-9_]{3,32}$').hasMatch(handle) ? null : '3–32 символа: латиница, цифры и _';
       _saved = false;
     });
-    if (name.isEmpty) return;
+    if (_error != null || _handleError != null) return;
     setState(() => _saving = true);
     try {
-      await client.updateName(name);
+      await client.updateProfile(name, handle);
       if (mounted) setState(() => _saved = true);
     } on ApiException catch (e) {
-      if (mounted) setState(() => _error = e.message);
+      if (mounted) setState(() => e.status == 409 ? _handleError = e.message : _error = e.message);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -187,9 +191,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 const SizedBox(height: 22),
                 TextField(
-                  enabled: false,
-                  controller: TextEditingController(text: '@${client.nick}'),
-                  decoration: const InputDecoration(labelText: 'Никнейм'),
+                  controller: _handle,
+                  onChanged: (_) => setState(() => _saved = false),
+                  decoration: InputDecoration(
+                    labelText: 'Никнейм',
+                    prefixText: '@',
+                    helperText: 'По нему вас находят. Переписка и ключи при смене сохраняются.',
+                    errorText: _handleError,
+                  ),
                 ),
                 const SizedBox(height: 32),
                 if (_saved)

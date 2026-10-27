@@ -166,7 +166,8 @@ Future<void> boot({Map<String, dynamic>? groups, Map<String, dynamic>? chats}) a
 }
 
 /// Собеседник [from] (настоящий Signal) отправляет anna зашифрованное [content].
-Future<String> deliver(SignalKeys peer, String from, Map<String, dynamic> content, {String? id, int? sentAt}) async {
+Future<String> deliver(SignalKeys peer, String from, Map<String, dynamic> content,
+    {String? id, int? sentAt, Map<String, dynamic> extra = const {}}) async {
   if (!peer.hasSession('anna', 1)) await peer.startSession('anna', bundleOf(annaPub, 1, _nextPreKey++));
   final c = await peer.encrypt('anna', 1, jsonEncode(content));
   final mid = id ?? 'srv${_nextId++}';
@@ -178,6 +179,7 @@ Future<String> deliver(SignalKeys peer, String from, Map<String, dynamic> conten
     'ctype': c['type'],
     'body': c['body'],
     'sentAt': sentAt ?? DateTime.now().millisecondsSinceEpoch,
+    ...extra,
   });
   return mid;
 }
@@ -672,5 +674,39 @@ void main() {
     expect(f.fwd, 'den');
     expect(f.file, {'id': 'f', 'key': 'k', 'name': 'a.jpg', 'size': 3});
     expect(identical(f.file, m.file), isFalse);
+  });
+
+  test('запрос на переписку: до принятия собеседник не получает квитанций, отклонённый отбрасывается', () async {
+    await boot();
+    final eve = peerKeys('eve'), mal = peerKeys('mal');
+    Iterable<Map> sentTo(String n) => fake.frames.where((f) => f['type'] == 'send' && f['to'] == n);
+    final calls = <String>[];
+    client.onCall = (from, _, _, _) => calls.add(from);
+
+    await acked(await deliver(eve, 'eve', {'text': 'привет, это Ева'}, extra: {'name': 'Ева', 'handle': 'eva_new'}));
+    expect(client.requests, {'eve'});
+    expect(client.chats['eve']!.single.text, 'привет, это Ева');
+    expect((client.names['eve'], client.handleOf('eve')), ('Ева', 'eva_new'), reason: 'имя и никнейм — из конверта сервера');
+    client.markRead('eve');
+    await acked(await deliver(eve, 'eve', {'call': {'type': 'offer'}}));
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(sentTo('eve'), isEmpty, reason: 'ни «доставлено», ни «прочитано» до принятия');
+    expect(calls, isEmpty, reason: 'запрос не звонит');
+
+    client.acceptRequest('eve');
+    expect(client.requests, isEmpty);
+    expect(await waitFor(() => sentTo('eve').isNotEmpty), isTrue);
+    final p = (sentTo('eve').first['payloads'] as List).single;
+    expect(jsonDecode(await eve.decrypt('anna', 1, p['type'], p['body'])), containsPair('receipt', 'read'));
+    await acked(await deliver(eve, 'eve', {'call': {'type': 'offer'}}));
+    expect(calls, ['eve']);
+
+    await acked(await deliver(mal, 'mal', {'text': 'спам'}));
+    expect(client.requests, {'mal'});
+    client.declineRequest('mal');
+    expect(client.chats.containsKey('mal'), isFalse);
+    await acked(await deliver(mal, 'mal', {'text': 'ещё спам'}));
+    expect(client.chats.containsKey('mal'), isFalse, reason: 'отклонённый запрос не возвращается');
+    expect(sentTo('mal'), isEmpty);
   });
 }

@@ -77,10 +77,85 @@ void main() {
     await post('/api/register', {'nick': 'den_k', 'password': 'secret2'});
 
     expect(await get('/api/users?q=Den_K', anna['token']), [
-      {'nick': 'den_k', 'name': 'den_k'},
+      {'nick': 'den_k', 'name': 'den_k', 'handle': 'den_k'},
     ]);
+    expect(await get('/api/users?q=@den_k', anna['token']), hasLength(1), reason: 'с @ тоже');
     expect(await get('/api/users?q=den', anna['token']), isEmpty); // только точный никнейм
+    expect(await get('/api/users?q=den_k_', anna['token']), isEmpty);
     expect(await get('/api/users?q=', anna['token']), isEmpty);
+  });
+
+  test('смена никнейма: id остаётся, ищут по новому, занятые и прежние id не даются', () async {
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1', 'name': 'Анна'});
+    final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});
+    Future<(int, dynamic)> rename(Map t, String handle) =>
+        post('/api/me', {'name': 'Анна', 'handle': handle}, method: 'PUT', token: t['token']);
+
+    expect((await rename(anna, 'den')).$1, 409, reason: 'чужой никнейм');
+    expect((await rename(anna, 'A!')).$1, 400);
+    final (s, me) = await rename(anna, 'Anna_New');
+    expect(s, 200);
+    expect(me, {'nick': 'anna', 'name': 'Анна', 'handle': 'anna_new'});
+    expect(await get('/api/users?q=anna', den['token']), isEmpty, reason: 'по прежнему не находят');
+    expect(await get('/api/users?q=anna_new', den['token']), [
+      {'nick': 'anna', 'name': 'Анна', 'handle': 'anna_new'},
+    ]);
+    // Прежний никнейм — id аккаунта: его не взять ни при регистрации, ни сменой.
+    expect((await post('/api/register', {'nick': 'anna', 'password': 'secret3'})).$1, 409);
+    expect((await post('/api/register', {'nick': 'anna_new', 'password': 'secret3'})).$1, 409);
+    expect((await post('/api/me', {'name': 'Ден', 'handle': 'anna'}, method: 'PUT', token: den['token'])).$1, 409);
+    expect((await rename(anna, 'anna')).$1, 200, reason: 'свой id можно вернуть');
+    await rename(anna, 'anna_new');
+    // Старые версии шлют только имя: никнейм не трогается.
+    expect((await post('/api/me', {'name': 'Аня'}, method: 'PUT', token: anna['token'])).$2['handle'], 'anna_new');
+
+    // Вход по новому и по прежнему никнейму — в тот же аккаунт.
+    for (final n in ['anna_new', 'anna']) {
+      final (st, again) = await post('/api/login', {'nick': n, 'password': 'secret1'});
+      expect(st, 200);
+      expect(again, containsPair('nick', 'anna'));
+      expect(again, containsPair('handle', 'anna_new'));
+    }
+
+    // Получатель видит нынешние имя и никнейм отправителя в конверте; свои устройства — при подключении.
+    final a = (await post('/api/login', {'nick': 'anna', 'password': 'secret1'})).$2;
+    await post('/api/keys', keys('A'), method: 'PUT', token: a['token']);
+    await post('/api/keys', keys('D'), method: 'PUT', token: den['token']);
+    final (aws, ait) = await connect(a['token']);
+    expect(ait.current, containsPair('handle', 'anna_new'));
+    final (dws, dit) = await connect(den['token']);
+    aws.sink.add(jsonEncode({
+      'type': 'send',
+      'id': 'm1',
+      'to': 'den',
+      'payloads': [{'device': den['device'], 'type': 3, 'body': 'c'}],
+    }));
+    expect(await dit.moveNext(), isTrue);
+    expect(dit.current, containsPair('from', 'anna'));
+    expect(dit.current, containsPair('handle', 'anna_new'));
+    expect(dit.current, containsPair('name', 'Аня'));
+    await dws.sink.close();
+    final (dws2, dit2) = await connect(den['token']); // из очереди — тоже
+    expect(await dit2.moveNext(), isTrue);
+    expect(dit2.current, containsPair('handle', 'anna_new'));
+    await dws2.sink.close();
+    await aws.sink.close();
+  });
+
+  test('старая база: никнейм равен id', () async {
+    final path = '${Directory.systemTemp.createTempSync('aura').path}/old.db';
+    sqlite3.open(path)
+      ..execute('''
+        CREATE TABLE users (nick TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL,
+          created_at INTEGER NOT NULL, next_device INTEGER NOT NULL DEFAULT 1) STRICT;
+        PRAGMA user_version = 1;
+      ''')
+      ..execute('INSERT INTO users (nick, name, password_hash, created_at) VALUES (?, ?, ?, 0)', ['olga', 'Ольга', hashPassword('secret1')])
+      ..close();
+    AuraServer(path).close();
+    final db = sqlite3.open(path);
+    expect(db.select('SELECT handle FROM users').single['handle'], 'olga');
+    db.close();
   });
 
   test('серверы для звонка: STUN, а TURN с временным паролем, если задан', () async {
