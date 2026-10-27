@@ -344,6 +344,32 @@ void main() {
     }
   });
 
+  test('A19: собеседник сбросил ключ и молчит — смена видна при отправке, после «Принять» сообщение доходит', () async {
+    await boot();
+    final den = peerKeys('den');
+    await acked(await deliver(den, 'den', {'text': 'привет'}));
+    client.send('den', 'до сброса');
+    final m0 = client.chats['den']!.firstWhere((m) => m.text == 'до сброса');
+    expect(await waitFor(() => fake.frames.any((f) => f['id'] == m0.id)), isTrue);
+    expect(client.hasNewDevice('den'), isFalse);
+
+    final reset = SignalKeys.generate(), resetPub = reset.publicBundle();
+    fake.devices['den'] = [
+      {'device': 1, 'identityKey': resetPub['identityKey']},
+    ];
+    fake.bundles['den/1'] = bundleOf(resetPub, 1);
+    client.send('den', 'после сброса');
+    final m1 = client.chats['den']!.firstWhere((m) => m.text == 'после сброса');
+    expect(await waitFor(() => m1.status == Status.failed), isTrue, reason: 'по старой сессии не уходит');
+    expect(client.hasNewDevice('den'), isTrue);
+    expect(fake.frames.any((f) => f['id'] == m1.id), isFalse);
+
+    await client.approveDevices('den');
+    expect(await waitFor(() => fake.frames.any((f) => f['id'] == m1.id)), isTrue);
+    final p = (fake.frames.lastWhere((f) => f['id'] == m1.id)['payloads'] as List).single;
+    expect(jsonDecode(await reset.decrypt('anna', 1, p['type'], p['body']))['text'], 'после сброса');
+  });
+
   test('A20: код безопасности отражает ключ, на который реально шифруются сообщения', () async {
     await boot();
     final den = SignalKeys.generate(), denPub = den.publicBundle();

@@ -1148,16 +1148,29 @@ class AuraClient extends ChangeNotifier {
         }
       }
       await _sendCopy(nick!, m.id, _contentFor(to, m.content, nick!));
-    } else if (await _sendCopy(to, m.id, m.content)) {
-      await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
-      await _shareAvatar(to);
+    } else {
+      // Список устройств и их ключи берём свежими: открытая вкладка браузера иначе не заметит,
+      // что собеседник сбросил ключ (ponytail: запрос на каждое сообщение, кэшировать с TTL при нагрузке).
+      _devices.remove(to);
+      if (await _sendCopy(to, m.id, m.content)) {
+        await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
+        await _shareAvatar(to);
+      }
     }
   });
 
-  Future<List<int>> _devicesOf(String target) async => _devices[target] ??= [
-    for (final d in await _request('GET', _api('/api/devices/$target'), null) as List)
-      if (target != nick || d['device'] != device) d['device'] as int,
-  ];
+  /// Устройства [target]. Если сервер показывает не тот ключ, которому мы доверяем, собеседник
+  /// сменил ключ: при сбросе номер устройства прежний, и иначе мы бы молча слали по старой сессии.
+  /// Сервер так может лишь показать вопрос: принять ключ решает пользователь.
+  Future<List<int>> _devicesOf(String target) async => _devices[target] ??= await () async {
+    final list = await _request('GET', _api('/api/devices/$target'), null) as List;
+    final known = _keys?.identityOf(target);
+    if (target != nick && known != null && list.any((d) => d['identityKey'] != known)) _onNewDevice(target, null);
+    return [
+      for (final d in list)
+        if (target != nick || d['device'] != device) d['device'] as int,
+    ];
+  }();
 
   /// Сообщение в группу шифруется один раз своим ключом отправителя. Тем, у кого ключа ещё нет,
   /// он сначала уходит попарной сессией.
@@ -1210,13 +1223,13 @@ class AuraClient extends ChangeNotifier {
   /// или среди них новое неподтверждённое.
   Future<bool> _sendCopy(String target, String id, Map<String, dynamic> content) async {
     if (!connected || _keys == null) return false;
+    final keys = _keys!;
+    final devices = await _devicesOf(target);
     // Пока пользователь не решил насчёт нового ключа, старая сессия уже не дойдёт до собеседника.
     if (_newDevices.contains(target)) {
       _onNewDevice(target, id);
       return false;
     }
-    final keys = _keys!;
-    final devices = await _devicesOf(target);
     if (devices.isEmpty) return false;
     final payloads = [];
     for (final d in devices) {
