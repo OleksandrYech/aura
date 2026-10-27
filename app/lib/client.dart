@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
@@ -275,12 +276,30 @@ class AuraClient extends ChangeNotifier {
 
   // --- Аккаунт ---
 
-  Future<void> register(String nick, String password) =>
-      _auth('/api/register', {'nick': nick, 'password': password});
+  Future<void> register(String nick, String password) async =>
+      _auth('/api/register', {'nick': nick, 'password': password, 'deviceName': await _deviceName()});
 
   /// На аккаунт с ключом новое устройство входит привязкой ([startLinking]).
-  Future<void> login(String nick, String password) =>
-      _auth('/api/login', {'nick': nick, 'password': password});
+  Future<void> login(String nick, String password) async =>
+      _auth('/api/login', {'nick': nick, 'password': password, 'deviceName': await _deviceName()});
+
+  /// Название для списка устройств: модель телефона или браузер. Видно только владельцу аккаунта.
+  static Future<String?> _deviceName() async {
+    try {
+      final info = DeviceInfoPlugin();
+      if (kIsWeb) {
+        final w = await info.webBrowserInfo;
+        final browser = w.browserName == BrowserName.unknown ? 'Браузер' : w.browserName.name;
+        return [browser[0].toUpperCase() + browser.substring(1), w.platform].whereType<String>().join(', ');
+      }
+      if (defaultTargetPlatform == TargetPlatform.iOS) return (await info.iosInfo).modelName;
+      if (defaultTargetPlatform != TargetPlatform.android) return null;
+      final a = await info.androidInfo;
+      return '${a.manufacturer} ${a.model}';
+    } catch (_) {
+      return null; // без названия вход всё равно должен пройти
+    }
+  }
 
   Future<void> _auth(String path, Map body) async {
     final res = await _request('POST', _api(path), body);
@@ -393,10 +412,12 @@ class AuraClient extends ChangeNotifier {
     });
   }
 
-  /// Устройства своего аккаунта, включая это.
-  Future<List<int>> myDevices() async {
+  /// Устройства своего аккаунта, включая это: device, name, place (примерно, по IP при входе), createdAt.
+  Future<List<Map<String, dynamic>>> myDevices() async {
     _devices.remove(nick);
-    return [device!, ...await _devicesOf(nick!)]..sort();
+    final list = (await _request('GET', _api('/api/devices/$nick'), null) as List).cast<Map<String, dynamic>>();
+    if (!list.any((d) => d['device'] == device)) list.add({'device': device});
+    return list..sort((a, b) => (a['device'] as int).compareTo(b['device'] as int));
   }
 
   /// Отвязать другое устройство своего аккаунта: сервер удаляет его, и оно выходит.
