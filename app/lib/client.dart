@@ -33,7 +33,10 @@ class Message {
     this.files,
     this.from,
     this.update,
-  });
+    this.reply,
+    this.fwd,
+    Map<String, String>? reactions,
+  }) : reactions = reactions ?? {};
 
   final String id, text;
 
@@ -55,8 +58,19 @@ class Message {
   /// Все вложения сообщения.
   List<Map<String, dynamic>> get attachments => [?file, ...?files];
 
-  /// То, что уходит собеседнику внутри зашифрованного сообщения.
-  Map<String, dynamic> get content => {'text': text, 'file': ?file, 'files': ?files, 'groupUpdate': ?update};
+  /// Ответ на сообщение: {id, from, text} — снимок цитаты, он виден и после удаления оригинала.
+  final Map<String, dynamic>? reply;
+
+  /// Пересланное: имя автора оригинала.
+  final String? fwd;
+
+  /// Реакции по никнейму: одна от каждого участника. Уходят квитанциями ([AuraClient.react]).
+  final Map<String, String> reactions;
+
+  /// То, что уходит собеседнику внутри зашифрованного сообщения. Старые версии не знают reply и fwd
+  /// и показывают одно сообщение, без цитаты.
+  Map<String, dynamic> get content =>
+      {'text': text, 'file': ?file, 'files': ?files, 'groupUpdate': ?update, 'reply': ?reply, 'fwd': ?fwd};
 
   /// Строка для списка чатов.
   String get preview => text.isNotEmpty
@@ -83,6 +97,9 @@ class Message {
     'files': ?files,
     'from': ?from,
     'update': ?update,
+    'reply': ?reply,
+    'fwd': ?fwd,
+    if (reactions.isNotEmpty) 'reactions': reactions,
   };
   factory Message.fromJson(Map<String, dynamic> j) => Message(
     id: j['id'],
@@ -93,6 +110,9 @@ class Message {
     files: (j['files'] as List?)?.cast(),
     from: j['from'],
     update: j['update'],
+    reply: j['reply'],
+    fwd: j['fwd'],
+    reactions: j['reactions'] == null ? null : Map<String, String>.from(j['reactions']),
     // До статусов было поле pending.
     status: j['status'] != null
         ? Status.values.byName(j['status'])
@@ -561,7 +581,14 @@ class AuraClient extends ChangeNotifier {
 
   // --- Сообщения ---
 
-  void send(String to, String text, {Map<String, dynamic>? file, List<Map<String, dynamic>>? files}) {
+  void send(
+    String to,
+    String text, {
+    Map<String, dynamic>? file,
+    List<Map<String, dynamic>>? files,
+    Message? reply,
+    String? fwd,
+  }) {
     final m = Message(
       id: _newId(),
       mine: true,
@@ -570,10 +597,64 @@ class AuraClient extends ChangeNotifier {
       status: Status.pending,
       file: file,
       files: files,
+      fwd: fwd,
+      reply: reply == null
+          ? null
+          : {
+              'id': reply.id,
+              'from': authorOf(to, reply),
+              'text': reply.preview.length > 100 ? '${reply.preview.substring(0, 100)}…' : reply.preview,
+            },
     );
     chats.putIfAbsent(to, () => []).add(m);
     _save();
     _deliver(to, m);
+  }
+
+  /// Никнейм автора сообщения [m] из чата [chat].
+  String authorOf(String chat, Message m) => m.mine ? nick! : m.from ?? chat;
+
+  /// Пересылает сообщения [list] из [from] в чат [to] новыми сообщениями с теми же вложениями:
+  /// файлы на сервере не копируются, у пересланного те же id и ключи.
+  void forward(String from, List<Message> list, String to) {
+    for (final m in list) {
+      send(
+        to,
+        m.text,
+        file: m.file == null ? null : {...m.file!},
+        files: m.files?.map((f) => {...f}).toList(),
+        fwd: m.fwd ?? (m.mine ? name ?? nick! : nameOf(authorOf(from, m))),
+      );
+    }
+  }
+
+  static const reactionsAllowed = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+
+  /// Ставит реакцию [emoji] на [m] или снимает свою (null). Уходит квитанцией с неизвестным
+  /// старым версиям статусом: они её пропускают, а не показывают пустым сообщением.
+  // ponytail: без связи реакция остаётся только здесь, как и квитанции; ставить в очередь, если будут теряться.
+  void react(String chat, Message m, String? emoji) {
+    emoji == null ? m.reactions.remove(nick) : m.reactions[nick!] = emoji;
+    _save();
+    final content = {'receipt': 'react', 'ids': [m.id], 'emoji': emoji};
+    _serial(() async {
+      for (final r in [..._recipients(chat), nick!]) {
+        try {
+          await _sendCopy(r, _newId(), _contentFor(chat, content, r));
+        } catch (e) {
+          debugPrint('AURA: реакция для $r: $e');
+        }
+      }
+    });
+  }
+
+  void _onReact(String chat, String from, List ids, Object? emoji) {
+    if (emoji != null && (emoji is! String || emoji.isEmpty || emoji.length > 16)) return;
+    if (isGroup(chat) && from != nick && !members(chat).contains(from)) return;
+    for (final m in chats[chat] ?? <Message>[]) {
+      if (!ids.contains(m.id) || m.update != null) continue;
+      emoji == null ? m.reactions.remove(from) : m.reactions[from] = emoji as String;
+    }
   }
 
   // --- Группы ---
@@ -1176,8 +1257,9 @@ class AuraClient extends ChangeNotifier {
     if (!_gone.contains(id) && !chats.values.any((l) => l.any((m) => m.id == id)) && _keys != null) {
       var peer = from;
       String text;
-      Map<String, dynamic>? content, file, update;
+      Map<String, dynamic>? content, file, update, reply;
       List<Map<String, dynamic>>? files;
+      String? fwd;
       final int fromDevice = msg['device'];
       final hadSession = _keys!.hasSession(from, fromDevice);
       var drop = false;
@@ -1207,6 +1289,11 @@ class AuraClient extends ChangeNotifier {
           file = files = null;
         }
         update = content['groupUpdate'];
+        if (content['reply'] case final Map r when r['id'] is String && r['text'] is String && r['from'] is String?) {
+          final String t = r['text'];
+          reply = {'id': r['id'], 'from': r['from'], 'text': t.length > 120 ? t.substring(0, 120) : t};
+        }
+        if (content['fwd'] case final String f) fwd = f.length > 100 ? f.substring(0, 100) : f;
         if (content['group'] case final String g) {
           peer = '#$g';
         } else if (from == nick) {
@@ -1277,14 +1364,22 @@ class AuraClient extends ChangeNotifier {
           a == null ? avatars.remove(from) : avatars[from] = a;
         }
       } else if (content?['receipt'] case final String receipt) {
-        // Неизвестный статус (новая версия или мусор) пропускаем.
-        if (Status.values.asNameMap()[receipt] case final status?) _onReceipt(status, (content!['ids'] as List).cast());
+        final ids = content!['ids'];
+        if (ids is! List) {
+          // мусор
+        } else if (receipt == 'react') {
+          _onReact(peer, from, ids, content['emoji']);
+        } else if (Status.values.asNameMap()[receipt] case final status?) {
+          _onReceipt(status, ids.cast()); // неизвестный статус (новая версия или мусор) пропускаем
+        }
       } else if (content?['delete'] case final List ids) {
         _remove(peer, ids.toSet(), by: from == nick ? null : from);
       } else if (update != null && (!group || !_allowed(peer, from, update))) {
         debugPrint('AURA: изменение группы $peer от $from отклонено');
       } else if (group && update == null && from != nick && groups[peer] != null && !members(peer).contains(from)) {
         debugPrint('AURA: $from не участник $peer'); // неизвестную группу принимаем: её описание может прийти позже
+      } else if (text.isEmpty && file == null && files == null && update == null) {
+        debugPrint('AURA: $id от $from: неизвестный тип сообщения'); // от новой версии: не показываем пустым
       } else {
         final mine = from == nick;
         if (update != null) {
@@ -1308,6 +1403,8 @@ class AuraClient extends ChangeNotifier {
                 files: files,
                 from: group && !mine ? from : null,
                 update: update,
+                reply: reply,
+                fwd: fwd,
               ),
             );
         if (!mine) {

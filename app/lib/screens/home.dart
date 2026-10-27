@@ -285,7 +285,22 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _draft = TextEditingController();
+  final _focus = FocusNode();
   int _uploading = 0;
+
+  /// На какое сообщение отвечаем.
+  Message? _reply;
+
+  /// id выбранных сообщений; пока выбор не пуст, нажатие выбирает, а не открывает.
+  final _selected = <String>{};
+
+  List<Message> get _chosen => [
+    for (final m in client.chats[widget.peer] ?? <Message>[])
+      if (_selected.contains(m.id)) m,
+  ];
+
+  // В группе, из которой исключили или откуда вышли, писать нельзя.
+  bool get _member => !AuraClient.isGroup(widget.peer) || client.members(widget.peer).contains(client.nick);
 
   @override
   void initState() {
@@ -297,6 +312,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     client.removeListener(_markRead);
+    _focus.dispose();
     _ticker?.cancel();
     _recorder?.cancel().whenComplete(_recorder!.dispose);
     super.dispose();
@@ -311,8 +327,9 @@ class _ChatScreenState extends State<ChatScreen> {
   void _send() {
     final text = _draft.text.trim();
     if (text.isEmpty) return;
-    client.send(widget.peer, text);
+    client.send(widget.peer, text, reply: _reply);
     _draft.clear();
+    setState(() => _reply = null);
   }
 
   VoiceRecorder? _recorder;
@@ -538,40 +555,133 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ok == true) await client.approveDevices(widget.peer);
   }
 
-  /// Меню сообщения по долгому нажатию: копировать текст и удалить.
-  Future<void> _menu(Message m) async {
-    final choice = await showModalBottomSheet<String>(
+  PopupMenuItem<String> _item(String value, IconData icon, String label) => PopupMenuItem(
+    value: value,
+    child: Row(children: [Icon(icon, size: 20), const SizedBox(width: 12), Text(label)]),
+  );
+
+  /// Меню рядом с сообщением, как в Telegram: по долгому нажатию или правому клику.
+  /// Сверху реакции, ниже действия.
+  Future<void> _menu(Message m, Offset at) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final own = m.reactions[client.nick];
+    final choice = await showMenu<String>(
       context: context,
-      builder: (context) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          if (m.text.isNotEmpty)
-            ListTile(
-              leading: const Icon(Icons.copy_outlined),
-              title: const Text('Копировать'),
-              onTap: () => Navigator.pop(context, 'copy'),
-            ),
-          if (m.mine)
-            ListTile(
-              leading: const Icon(Icons.delete_forever_outlined),
-              title: const Text('Удалить у всех'),
-              subtitle: const Text('Пропадёт и у собеседника, файлы удалятся с сервера'),
-              onTap: () => Navigator.pop(context, 'all'),
-            ),
-          ListTile(
-            leading: const Icon(Icons.delete_outline),
-            title: const Text('Удалить у меня'),
-            subtitle: const Text('На всех ваших устройствах, вместе с файлами'),
-            onTap: () => Navigator.pop(context, 'me'),
+      position: RelativeRect.fromRect(at & Size.zero, Offset.zero & overlay.size),
+      items: [
+        if (_member)
+          PopupMenuItem(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            // Эмодзи шире ожидаемого на некоторых шрифтах: ряд ужимается, а не вылезает за меню.
+            child: FittedBox(fit: BoxFit.scaleDown, child: Row(mainAxisSize: MainAxisSize.min, children: [
+              for (final e in AuraClient.reactionsAllowed)
+                IconButton(
+                  tooltip: e,
+                  isSelected: own == e,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(width: 38, height: 40),
+                  onPressed: () => Navigator.pop(context, 'react:$e'),
+                  icon: Text(e, style: const TextStyle(fontSize: 20)),
+                ),
+            ])),
           ),
-        ]),
+        if (_member) _item('reply', Icons.reply, 'Ответить'),
+        if (m.text.isNotEmpty) _item('copy', Icons.copy_outlined, 'Копировать'),
+        _item('forward', Icons.shortcut, 'Переслать'),
+        _item('select', Icons.check_circle_outline, 'Выбрать'),
+        _item('delete', Icons.delete_outline, 'Удалить'),
+      ],
+    );
+    if (!mounted) return;
+    switch (choice) {
+      case final r? when r.startsWith('react:'):
+        final e = r.substring(6);
+        client.react(widget.peer, m, own == e ? null : e);
+      case 'reply':
+        setState(() => _reply = m);
+        _focus.requestFocus();
+      case 'copy':
+        await _copy([m]);
+      case 'forward':
+        await _forward([m]);
+      case 'select':
+        setState(() => _selected.add(m.id));
+      case 'delete':
+        await _delete([m]);
+    }
+  }
+
+  void _toggle(Message m) => setState(() => _selected.remove(m.id) || _selected.add(m.id));
+
+  /// Текст сообщений; у нескольких — с авторами, как в Telegram.
+  Future<void> _copy(List<Message> list) async {
+    final texts = [
+      for (final m in list)
+        if (m.text.isNotEmpty) list.length > 1 ? '${client.nameOf(client.authorOf(widget.peer, m))}: ${m.text}' : m.text,
+    ];
+    await Clipboard.setData(ClipboardData(text: texts.join('\n')));
+    if (!mounted) return;
+    setState(_selected.clear);
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Скопировано')));
+  }
+
+  Future<void> _forward(List<Message> list) async {
+    final to = await pickChat(context);
+    if (to == null || !mounted) return;
+    client.forward(widget.peer, list, to);
+    setState(_selected.clear);
+    if (to != widget.peer) {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ChatScreen(peer: to)));
+    }
+  }
+
+  /// У всех — только если все сообщения свои.
+  Future<void> _delete(List<Message> list) async {
+    final mine = list.every((m) => m.mine);
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(list.length == 1 ? 'Удалить сообщение?' : 'Удалить сообщения: ${list.length}?'),
+        content: Text(mine
+            ? 'У всех — пропадёт и у собеседника, файлы удалятся с сервера. У меня — на всех ваших устройствах.'
+            : 'На всех ваших устройствах, вместе с файлами.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Отмена')),
+          TextButton(onPressed: () => Navigator.pop(context, 'me'), child: const Text('У меня')),
+          if (mine) TextButton(onPressed: () => Navigator.pop(context, 'all'), child: const Text('У всех')),
+        ],
       ),
     );
-    switch (choice) {
-      case 'copy':
-        await Clipboard.setData(ClipboardData(text: m.text));
-      case 'all' || 'me':
-        client.delete(widget.peer, [m], everyone: choice == 'all');
+    if (choice == null || !mounted) return;
+    client.delete(widget.peer, list, everyone: choice == 'all');
+    setState(_selected.clear);
+  }
+
+  /// Реакции под сообщением: эмодзи и сколько раз; своя выделена, нажатие ставит или снимает её.
+  Widget _reactions(Message m, AuraColors c) {
+    final counts = <String, int>{};
+    for (final e in m.reactions.values) {
+      counts[e] = (counts[e] ?? 0) + 1;
     }
+    final own = m.reactions[client.nick];
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Wrap(spacing: 4, runSpacing: 4, children: [
+        for (final MapEntry(key: e, value: n) in counts.entries)
+          GestureDetector(
+            onTap: _member && _selected.isEmpty ? () => client.react(widget.peer, m, own == e ? null : e) : null,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: own == e ? c.lavender : c.thistle,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: own == e ? c.grayPurple : Colors.transparent),
+              ),
+              child: Text(n > 1 ? '$e $n' : e, style: const TextStyle(fontSize: 13)),
+            ),
+          ),
+      ]),
+    );
   }
 
   @override
@@ -579,10 +689,34 @@ class _ChatScreenState extends State<ChatScreen> {
     final c = AuraColors.of(context);
     final group = AuraClient.isGroup(widget.peer);
     final name = client.title(widget.peer);
-    // В группе, из которой исключили или откуда вышли, писать нельзя.
-    final member = !group || client.members(widget.peer).contains(client.nick);
-    return Scaffold(
-      appBar: AppBar(
+    final member = _member;
+    final selecting = _selected.isNotEmpty;
+    final chosen = _chosen;
+    // Назад в режиме выбора снимает выбор, а не закрывает чат.
+    return PopScope(
+      canPop: !selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) setState(_selected.clear);
+      },
+      child: Scaffold(
+      appBar: selecting
+          ? AppBar(
+              backgroundColor: c.cream,
+              shape: Border(bottom: BorderSide(color: c.lightGray)),
+              leading: IconButton(
+                tooltip: 'Отменить выбор',
+                icon: const Icon(Icons.close),
+                onPressed: () => setState(_selected.clear),
+              ),
+              title: Text('Выбрано: ${chosen.length}', style: const TextStyle(fontSize: 16)),
+              actions: [
+                if (chosen.any((m) => m.text.isNotEmpty))
+                  IconButton(tooltip: 'Копировать', icon: const Icon(Icons.copy_outlined), onPressed: () => _copy(chosen)),
+                IconButton(tooltip: 'Переслать', icon: const Icon(Icons.shortcut), onPressed: () => _forward(chosen)),
+                IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline), onPressed: () => _delete(chosen)),
+              ],
+            )
+          : AppBar(
         backgroundColor: c.cream,
         titleSpacing: 0,
         shape: Border(bottom: BorderSide(color: c.lightGray)),
@@ -643,13 +777,29 @@ class _ChatScreenState extends State<ChatScreen> {
                             textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: c.ink.withValues(alpha: 0.55))),
                       );
                     }
-                    return Align(
-                      alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
-                      // Не отправленное сообщение уходит заново по нажатию, долгое нажатие открывает меню.
-                      child: GestureDetector(
-                        onTap: m.status == Status.failed ? () => _retry(m) : null,
-                        onLongPress: () => _menu(m),
-                        child: MessageBubble(m),
+                    // Не отправленное сообщение уходит заново по нажатию, долгое нажатие или правый клик открывают меню.
+                    // При выборе нажатие по всей строке выбирает сообщение, вложения не открываются.
+                    return GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: _selected.isNotEmpty
+                          ? () => _toggle(m)
+                          : m.status == Status.failed
+                          ? () => _retry(m)
+                          : null,
+                      onLongPressStart: (d) => _selected.isNotEmpty ? _toggle(m) : _menu(m, d.globalPosition),
+                      onSecondaryTapDown: (d) => _menu(m, d.globalPosition),
+                      child: ColoredBox(
+                        color: _selected.contains(m.id) ? c.lavender.withValues(alpha: 0.45) : Colors.transparent,
+                        child: Align(
+                          alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
+                          child: IgnorePointer(
+                            ignoring: _selected.isNotEmpty,
+                            child: Column(
+                              crossAxisAlignment: m.mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                              children: [MessageBubble(m), if (m.reactions.isNotEmpty) _reactions(m, c)],
+                            ),
+                          ),
+                        ),
                       ),
                     );
                   },
@@ -694,6 +844,22 @@ class _ChatScreenState extends State<ChatScreen> {
                 LinearProgressIndicator(minHeight: 4, value: _progress, borderRadius: BorderRadius.circular(2)),
               ]),
             ),
+          if (_reply case final r? when member && _recorder == null)
+            Container(
+              margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              padding: const EdgeInsets.fromLTRB(12, 6, 0, 6),
+              decoration: BoxDecoration(color: c.lavender, borderRadius: BorderRadius.circular(16)),
+              child: Row(children: [
+                Icon(Icons.reply, color: c.grayPurple, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Quote(client.authorOf(widget.peer, r), r.preview)),
+                IconButton(
+                  tooltip: 'Не отвечать',
+                  icon: Icon(Icons.close, color: c.ink, size: 18),
+                  onPressed: () => setState(() => _reply = null),
+                ),
+              ]),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
             child: !member
@@ -726,6 +892,7 @@ class _ChatScreenState extends State<ChatScreen> {
               Expanded(
                 child: TextField(
                   controller: _draft,
+                  focusNode: _focus,
                   minLines: 1,
                   maxLines: 5,
                   textInputAction: TextInputAction.send,
@@ -755,6 +922,51 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ]),
       ),
+      ),
+    );
+  }
+}
+
+/// Выбор чата для пересылки: чаты, куда можно писать, сначала недавние.
+Future<String?> pickChat(BuildContext context) {
+  final peers = client.chats.keys
+      .where((p) => client.chats[p]!.isNotEmpty && (!AuraClient.isGroup(p) || client.members(p).contains(client.nick)))
+      .toList()
+    ..sort((a, b) => client.chats[b]!.last.time.compareTo(client.chats[a]!.last.time));
+  return showDialog<String>(
+    context: context,
+    builder: (context) => SimpleDialog(
+      title: const Text('Переслать в…'),
+      children: [
+        for (final p in peers)
+          ListTile(
+            leading: Avatar(client.title(p), nick: p, size: 36),
+            title: Text(client.title(p)),
+            onTap: () => Navigator.pop(context, p),
+          ),
+      ],
+    ),
+  );
+}
+
+/// Цитата: автор и начало сообщения, на которое отвечают.
+class Quote extends StatelessWidget {
+  const Quote(this.from, this.text, {super.key});
+  final String? from;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AuraColors.of(context);
+    return Container(
+      padding: const EdgeInsets.only(left: 8),
+      decoration: BoxDecoration(border: Border(left: BorderSide(color: c.grayPurple, width: 3))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        if (from != null)
+          Text(client.nameOf(from!), style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: c.grayPurple)),
+        Text(text.isEmpty ? 'Сообщение' : text,
+            maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.7))),
+      ]),
     );
   }
 }
@@ -793,6 +1005,21 @@ class MessageBubble extends StatelessWidget {
             child: Text(m.text, style: const TextStyle(fontSize: 15, height: 1.5)),
           );
     final preview = m.files != null ? Album(m.files!) : m.file != null ? Attachment(m.file!) : null;
+    // Над содержимым: от кого переслано и цитата, на что ответ.
+    final header = [
+      ?name,
+      if (m.fwd != null)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Text('Переслано от ${m.fwd}',
+              style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: c.grayPurple)),
+        ),
+      if (m.reply case final r?)
+        Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 6),
+          child: Align(alignment: Alignment.centerLeft, child: Quote(r['from'], r['text'])),
+        ),
+    ];
     return Container(
       constraints: const BoxConstraints(maxWidth: bubbleWidth),
       padding: media ? null : _pad,
@@ -803,13 +1030,14 @@ class MessageBubble extends StatelessWidget {
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
         if (!media) ...[
-          ?name,
+          ...header,
           ?preview,
           ?text,
           const SizedBox(height: 4),
           time,
         ] else ...[
-          if (name != null) Padding(padding: const EdgeInsets.fromLTRB(16, 8, 16, 6), child: name),
+          if (header.isNotEmpty)
+            Padding(padding: const EdgeInsets.fromLTRB(16, 8, 16, 6), child: Column(children: header)),
           if (text == null)
             Stack(alignment: Alignment.bottomRight, children: [
               preview!,

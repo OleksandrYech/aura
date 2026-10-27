@@ -561,4 +561,55 @@ void main() {
     final identity = LinkEnvelope.open(sent!, mine, 'anna', 2);
     expect(base64.encode(identity.getPublicKey().serialize()), annaPub['identityKey']);
   });
+
+  test('ответ, пересылка и реакции приходят внутри шифротекста; мусор и чужие реакции не применяются', () async {
+    await boot(chats: {
+      'den': [
+        {'id': 'm1', 'mine': true, 'text': 'привет', 'time': 1, 'status': 'read'},
+      ],
+    });
+    final den = peerKeys('den'), eve = peerKeys('eve');
+    await acked(await deliver(den, 'den', {
+      'text': 'и тебе',
+      'reply': {'id': 'm1', 'from': 'anna', 'text': 'привет'},
+      'fwd': 'Олег',
+    }));
+    final m = client.chats['den']!.last;
+    expect(m.reply, {'id': 'm1', 'from': 'anna', 'text': 'привет'});
+    expect(m.fwd, 'Олег');
+
+    await acked(await deliver(den, 'den', {'receipt': 'react', 'ids': ['m1'], 'emoji': '🔥'}));
+    await acked(await deliver(den, 'den', {'receipt': 'react', 'ids': ['m1'], 'emoji': 'x' * 100}));
+    await acked(await deliver(eve, 'eve', {'receipt': 'react', 'ids': ['m1'], 'emoji': '💩'}));
+    expect(client.chats['den']!.first.reactions, {'den': '🔥'}, reason: 'длинный мусор и реакция из чужого чата отброшены');
+    await acked(await deliver(den, 'den', {'receipt': 'react', 'ids': ['m1'], 'emoji': null}));
+    expect(client.chats['den']!.first.reactions, isEmpty);
+
+    await acked(await deliver(den, 'den', {'poll': 'из будущей версии'}));
+    expect(client.chats['den'], hasLength(2), reason: 'неизвестный тип не показывается пустым пузырём');
+  });
+
+  test('реакция уходит квитанцией, которую старые версии пропускают; пересылка — с теми же вложениями', () async {
+    await boot(chats: {
+      'den': [
+        {'id': 'm1', 'mine': false, 'text': '', 'time': 1, 'status': 'read', 'file': {'id': 'f', 'key': 'k', 'name': 'a.jpg', 'size': 3}},
+      ],
+    });
+    final den = peerKeys('den');
+    fake.bundles['den/1'] = bundleOf(den.publicBundle(), 1);
+    final m = client.chats['den']!.single;
+    client.react('den', m, '👍');
+    expect(m.reactions, {'anna': '👍'});
+    expect(await waitFor(() => fake.frames.any((f) => f['type'] == 'send' && f['to'] == 'den')), isTrue);
+    final p = (fake.frames.firstWhere((f) => f['type'] == 'send' && f['to'] == 'den')['payloads'] as List).single;
+    final content = jsonDecode(await den.decrypt('anna', 1, p['type'], p['body']));
+    expect(content, containsPair('receipt', 'react'));
+    expect(content, isNot(contains('text')), reason: 'без text старая версия не создаст сообщение');
+
+    client.forward('den', [m], 'den');
+    final f = client.chats['den']!.last;
+    expect(f.fwd, 'den');
+    expect(f.file, {'id': 'f', 'key': 'k', 'name': 'a.jpg', 'size': 3});
+    expect(identical(f.file, m.file), isFalse);
+  });
 }
