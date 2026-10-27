@@ -129,6 +129,21 @@ class AuraClient extends ChangeNotifier {
   /// Отображаемые имена собеседников.
   final names = <String, String>{};
 
+  /// Своя аватарка и аватарки собеседников: JPEG до [avatarSize] пикселей. На сервер не загружаются,
+  /// а уходят собеседникам внутри зашифрованных сообщений, как в Signal.
+  Uint8List? avatar;
+  final avatars = <String, Uint8List>{};
+
+  /// Кому уже ушла текущая аватарка; сбрасывается при смене.
+  final _avatarSent = <String>{};
+
+  static const avatarSize = 256;
+
+  /// Предел для чужой аватарки (символов base64): больше — мусор, не сохраняем.
+  static const _maxAvatar = 100 << 10;
+
+  Uint8List? avatarOf(String nick) => nick == this.nick ? avatar : avatars[nick];
+
   /// Группы по ключу чата ('#' и id): {name, members, admins, v}. Состав знают только устройства участников:
   /// сообщение группы шифруется попарно для каждого участника, сервер видит обычные личные сообщения.
   /// Менять группу могут админы, участник может только выйти. v растёт с каждым изменением, старое не применяется.
@@ -203,6 +218,7 @@ class AuraClient extends ChangeNotifier {
     nick = _prefs.getString('nick');
     name = _prefs.getString('name');
     device = _prefs.getInt('device');
+    avatar = _decodeAvatar(_prefs.getString('avatar'));
     final keys = await _readKeys();
     if (keys != null && nick != null) _keys = SignalKeys.fromJson(keys)..trustOwn(nick!);
     final raw = _prefs.getString('chats');
@@ -217,6 +233,10 @@ class AuraClient extends ChangeNotifier {
       _gone.addAll((j['gone'] as List? ?? []).cast());
       groups.addAll((j['groups'] as Map<String, dynamic>? ?? {}).cast());
       verified.addAll((j['verified'] as List? ?? []).cast());
+      for (final MapEntry(:key, :value) in (j['avatars'] as Map<String, dynamic>? ?? {}).entries) {
+        if (_decodeAvatar(value) case final a?) avatars[key] = a;
+      }
+      _avatarSent.addAll((j['avatarSent'] as List? ?? []).cast());
     }
     if (signedIn) {
       _connect();
@@ -368,6 +388,43 @@ class AuraClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Ставит или убирает ([jpeg] null) аватарку и рассылает её собеседникам и своим устройствам.
+  /// Остальные получат её вместе со следующим сообщением от вас ([_shareAvatar]).
+  Future<void> setAvatar(Uint8List? jpeg) async {
+    avatar = jpeg;
+    jpeg == null ? await _prefs.remove('avatar') : await _prefs.setString('avatar', base64.encode(jpeg));
+    _avatarSent.clear();
+    _save();
+    final contacts = {
+      nick!,
+      ...chats.keys.where((c) => !isGroup(c)),
+      for (final g in groups.keys) ...members(g),
+    };
+    // ponytail: убранная аватарка доходит только тем, кому ушла сейчас; кто был недоступен, видит старую.
+    for (final to in contacts) {
+      _serial(() => _shareAvatar(to, force: true));
+    }
+  }
+
+  /// Отправляет свою аватарку [to], если она ещё не уходила. Вызывать внутри [_serial].
+  Future<void> _shareAvatar(String to, {bool force = false}) async {
+    if (_avatarSent.contains(to) || (avatar == null && !force)) return;
+    final b64 = avatar == null ? null : base64.encode(avatar!);
+    if (await _sendCopy(to, _newId(), {'avatar': b64})) {
+      _avatarSent.add(to);
+      _save();
+    }
+  }
+
+  Uint8List? _decodeAvatar(Object? b64) {
+    if (b64 is! String || b64.length > _maxAvatar) return null;
+    try {
+      return base64.decode(b64);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<List<({String nick, String name})>> searchUsers(String q) async {
     final res = await _request('GET', _api('/api/users', {'q': q}), null) as List;
     final users = [for (final u in res) (nick: u['nick'] as String, name: u['name'] as String)];
@@ -458,11 +515,13 @@ class AuraClient extends ChangeNotifier {
     await ws?.sink.close();
     // Сервер удаляет устройство и его ключи; если связи нет, просто забываем их здесь.
     if (token != null) _request('POST', _api('/api/logout'), {}).ignore();
-    token = nick = name = device = _keys = _accountKey = linkError = null;
+    token = nick = name = device = _keys = _accountKey = linkError = avatar = null;
     connected = false;
     chats.clear();
     _files.clear();
     names.clear();
+    avatars.clear();
+    _avatarSent.clear();
     lastRead.clear();
     _deletes.clear();
     _gone.clear();
@@ -473,7 +532,7 @@ class AuraClient extends ChangeNotifier {
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
     if (!kIsWeb) await _secure.delete(key: 'signal');
-    for (final k in ['token', 'nick', 'name', 'device', 'signal', 'chats', 'localFiles']) {
+    for (final k in ['token', 'nick', 'name', 'device', 'avatar', 'signal', 'chats', 'localFiles']) {
       await _prefs.remove(k);
     }
     await clearLocalFiles();
@@ -990,6 +1049,7 @@ class AuraClient extends ChangeNotifier {
       await _sendCopy(nick!, m.id, _contentFor(to, m.content, nick!));
     } else if (await _sendCopy(to, m.id, m.content)) {
       await _sendCopy(nick!, m.id, {...m.content, 'peer': to});
+      await _shareAvatar(to);
     }
   });
 
@@ -1018,6 +1078,7 @@ class AuraClient extends ChangeNotifier {
           'payloads': [for (final d in devices) {'device': d, 'type': SignalKeys.groupType, 'body': body}],
           'push': ?(r == nick ? null : 'message'),
         });
+        if (r != nick) await _shareAvatar(r);
       } catch (e) {
         debugPrint('AURA: в группу для $r: $e');
       }
@@ -1207,6 +1268,14 @@ class AuraClient extends ChangeNotifier {
         }
       } else if (content?['call'] case final Map signal) {
         onCall?.call(from, msg['device'], msg['sentAt'], signal.cast());
+      } else if (content != null && content.containsKey('avatar')) {
+        final a = _decodeAvatar(content['avatar']);
+        if (from == nick) {
+          avatar = a; // поставили на другом своём устройстве
+          a == null ? await _prefs.remove('avatar') : await _prefs.setString('avatar', content['avatar']);
+        } else {
+          a == null ? avatars.remove(from) : avatars[from] = a;
+        }
       } else if (content?['receipt'] case final String receipt) {
         // Неизвестный статус (новая версия или мусор) пропускаем.
         if (Status.values.asNameMap()[receipt] case final status?) _onReceipt(status, (content!['ids'] as List).cast());
@@ -1394,7 +1463,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified]}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified], 'avatars': avatars.map((k, v) => MapEntry(k, base64.encode(v))), 'avatarSent': [..._avatarSent]}));
     notifyListeners();
   }
 

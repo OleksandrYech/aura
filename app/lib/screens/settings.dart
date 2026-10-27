@@ -1,7 +1,9 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../client.dart';
 import '../lock.dart';
+import '../platform_media.dart';
 import '../theme.dart';
 import 'home.dart';
 import 'link.dart';
@@ -33,7 +35,7 @@ class _SettingsTabState extends State<SettingsTab> {
           listenable: client,
           builder: (context, _) => ListTile(
             contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-            leading: Avatar(client.name ?? '', size: 56),
+            leading: Avatar(client.name ?? '', nick: client.nick, size: 56),
             title: Text(client.name ?? '', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
             subtitle: Text('@${client.nick} · Изменить профиль', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen())),
@@ -109,6 +111,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String? _error;
   bool _saved = false, _saving = false;
 
+  /// Фото из галереи, уменьшенное до [AuraClient.avatarSize]: так оно влезает в зашифрованное сообщение.
+  Future<void> _pickAvatar() async {
+    try {
+      final files = await AppLock.whilePicking(() => FilePicker.pickFiles(type: FileType.image));
+      if (files.isEmpty) return;
+      final jpeg = await shrinkImage(await files.first.readAsBytes(), max: AuraClient.avatarSize, quality: 80);
+      if (jpeg == null) throw const FormatException('не изображение');
+      await client.setAvatar(jpeg);
+      if (mounted) setState(() {});
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Не удалось открыть фото');
+    }
+  }
+
+  Future<void> _removeAvatar() async {
+    await client.setAvatar(null);
+    if (mounted) setState(() {});
+  }
+
   Future<void> _save() async {
     final name = _name.text.trim();
     setState(() {
@@ -139,7 +160,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(28, 16, 28, 32),
               children: [
-                Center(child: Avatar(_name.text, size: 96)),
+                Center(
+                  child: Semantics(
+                    button: true,
+                    label: 'Сменить фото профиля',
+                    child: GestureDetector(
+                      onTap: _pickAvatar,
+                      child: Stack(children: [
+                        Avatar(_name.text, nick: client.nick, size: 96),
+                        Positioned(
+                          right: 0,
+                          bottom: 0,
+                          child: CircleAvatar(radius: 16, backgroundColor: c.ink, child: Icon(Icons.photo_camera, size: 18, color: c.cream)),
+                        ),
+                      ]),
+                    ),
+                  ),
+                ),
+                if (client.avatar != null)
+                  Center(child: TextButton(onPressed: _removeAvatar, child: const Text('Удалить фото'))),
                 const SizedBox(height: 28),
                 TextField(
                   controller: _name,
