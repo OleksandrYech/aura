@@ -309,6 +309,41 @@ void main() {
     expect(client.hasNewDevice('den'), isTrue);
   });
 
+  test('A19: собеседник сбросил ключ на том же устройстве — после «Принять» переписка идёт в обе стороны', () async {
+    await boot();
+    final den = peerKeys('den');
+    await acked(await deliver(den, 'den', {'text': 'привет'}));
+    client.send('den', 'до сброса');
+    final m0 = client.chats['den']!.firstWhere((m) => m.text == 'до сброса');
+    expect(await waitFor(() => fake.frames.any((f) => f['id'] == m0.id)), isTrue);
+    fake.push({'type': 'sent', 'id': m0.id, 'to': 'den'});
+    expect(await waitFor(() => m0.status == Status.sent), isTrue);
+
+    // Номер устройства тот же, ключ новый: сервер сообщения по старой сессии принимает.
+    final reset = SignalKeys.generate(), resetPub = reset.publicBundle();
+    fake.devices['den'] = [
+      {'device': 1, 'identityKey': resetPub['identityKey']},
+    ];
+    fake.bundles['den/1'] = bundleOf(resetPub, 1);
+    await acked(await deliver(reset, 'den', {'text': 'я начал заново'}));
+    expect(client.hasNewDevice('den'), isTrue);
+    expect([for (final m in client.chats['den']!) m.text], isNot(contains('я начал заново')));
+
+    client.send('den', 'пока не принято');
+    final m1 = client.chats['den']!.firstWhere((m) => m.text == 'пока не принято');
+    expect(await waitFor(() => m1.status == Status.failed), isTrue, reason: 'по старой сессии не уходит');
+    expect(fake.frames.any((f) => f['id'] == m1.id), isFalse);
+
+    await client.approveDevices('den');
+    expect(await waitFor(() => client.chats['den']!.any((m) => m.text == 'я начал заново')), isTrue,
+        reason: 'отложенное входящее читается после принятия');
+    for (final m in [m0, m1]) {
+      expect(await waitFor(() => fake.frames.where((f) => f['id'] == m.id && f['to'] == 'den').length > (m == m0 ? 1 : 0)), isTrue);
+      final p = (fake.frames.lastWhere((f) => f['id'] == m.id && f['to'] == 'den')['payloads'] as List).single;
+      expect(jsonDecode(await reset.decrypt('anna', 1, p['type'], p['body']))['text'], m.text);
+    }
+  });
+
   test('A20: код безопасности отражает ключ, на который реально шифруются сообщения', () async {
     await boot();
     final den = SignalKeys.generate(), denPub = den.publicBundle();
