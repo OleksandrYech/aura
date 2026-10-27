@@ -217,6 +217,10 @@ class AuraClient extends ChangeNotifier {
       _gone.addAll((j['gone'] as List? ?? []).cast());
       groups.addAll((j['groups'] as Map<String, dynamic>? ?? {}).cast());
       verified.addAll((j['verified'] as List? ?? []).cast());
+      _newDevices.addAll((j['newDevices'] as List? ?? []).cast());
+      for (final MapEntry(:key, :value) in (j['held'] as Map<String, dynamic>? ?? {}).entries) {
+        _held[key] = (value as List).cast();
+      }
     }
     if (signedIn) {
       _connect();
@@ -408,6 +412,9 @@ class AuraClient extends ChangeNotifier {
   /// Собеседники, у которых появилось неподтверждённое устройство (см. [approveDevices]).
   final _newDevices = <String>{};
 
+  /// Входящие с новым ключом: расшифруем, если пользователь его примет.
+  final _held = <String, List<Map<String, dynamic>>>{};
+
   bool hasNewDevice(String peer) => _newDevices.contains(peer);
 
   /// У собеседника устройство с другим ключом аккаунта: сообщение не уходит, пока пользователь не подтвердит.
@@ -437,16 +444,28 @@ class AuraClient extends ChangeNotifier {
   /// Пользователь отклонил новый ключ собеседника: старый остаётся, сообщения так и не уходят.
   /// При следующей отправке вопрос появится снова.
   void rejectNewKey(String peer) {
-    if (_newDevices.remove(peer)) notifyListeners();
+    _newDevices.remove(peer);
+    _held.remove(peer);
+    _save();
+    notifyListeners();
   }
 
-  /// Пользователь подтвердил новый ключ собеседника: забываем старый и шлём заново не отправленное.
+  /// Пользователь подтвердил новый ключ собеседника: забываем старый, читаем отложенные входящие
+  /// и шлём заново не доставленное. «Отправлено» без «доставлено» тоже: при сбросе ключа номер
+  /// устройства собеседника не меняется, и такие сообщения ушли по старой сессии, которую он не прочтёт.
   Future<void> approveDevices(String peer) async {
     _devices.remove(peer);
     _keys!.untrust(peer);
     _newDevices.remove(peer);
     verified.remove(peer);
-    for (final m in [...?chats[peer]].where((m) => m.mine && m.status == Status.failed)) {
+    for (final msg in _held.remove(peer) ?? <Map<String, dynamic>>[]) {
+      _serial(() async {
+        await _handle(msg);
+        notifyListeners();
+      });
+    }
+    _save();
+    for (final m in [...?chats[peer]].where((m) => m.mine && (m.status == Status.failed || m.status == Status.sent))) {
       retry(peer, m);
     }
   }
@@ -469,6 +488,7 @@ class AuraClient extends ChangeNotifier {
     _devices.clear();
     _skSent.clear();
     _newDevices.clear();
+    _held.clear();
     verified.clear();
     groups.clear();
     // Адрес сервера оставляем, чтобы не вводить его заново.
@@ -1048,6 +1068,11 @@ class AuraClient extends ChangeNotifier {
   /// или среди них новое неподтверждённое.
   Future<bool> _sendCopy(String target, String id, Map<String, dynamic> content) async {
     if (!connected || _keys == null) return false;
+    // Пока пользователь не решил насчёт нового ключа, старая сессия уже не дойдёт до собеседника.
+    if (_newDevices.contains(target)) {
+      _onNewDevice(target, id);
+      return false;
+    }
     final keys = _keys!;
     final devices = await _devicesOf(target);
     if (devices.isEmpty) return false;
@@ -1160,6 +1185,7 @@ class AuraClient extends ChangeNotifier {
         drop = true;
         text = '';
       } on UntrustedIdentityException {
+        _held.putIfAbsent(from, () => []).add(msg);
         _onNewDevice(from, null);
         drop = true;
         text = '';
@@ -1394,7 +1420,7 @@ class AuraClient extends ChangeNotifier {
   }
 
   void _save() {
-    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified]}));
+    _prefs.setString('chats', jsonEncode({'chats': chats, 'names': names, 'lastRead': lastRead, 'deletes': _deletes, 'gone': [..._gone], 'groups': groups, 'verified': [...verified], 'newDevices': [..._newDevices], 'held': _held}));
     notifyListeners();
   }
 
