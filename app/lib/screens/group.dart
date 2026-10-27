@@ -34,7 +34,7 @@ class _PeoplePickerState extends State<PeoplePicker> {
   Future<void> _search(String q) async {
     if (q.trim().isEmpty) return;
     try {
-      final users = await client.searchUsers(q.trim().toLowerCase());
+      final users = await client.searchUsers(q);
       if (mounted) setState(() => _found.addAll(users.map((u) => u.nick).where((n) => !_found.contains(n))));
     } on ApiException catch (_) {}
   }
@@ -47,7 +47,7 @@ class _PeoplePickerState extends State<PeoplePicker> {
     final people = {
       ..._found,
       for (final chat in client.chats.keys)
-        if (!AuraClient.isGroup(chat)) chat,
+        if (!AuraClient.isGroup(chat) && !client.requests.contains(chat)) chat,
     }.where((n) => n != client.nick && !widget.exclude.contains(n)).toList();
     return Scaffold(
       appBar: AppBar(
@@ -89,7 +89,7 @@ class _PeoplePickerState extends State<PeoplePicker> {
             onChanged: (v) => setState(() => v! ? _picked.add(n) : _picked.remove(n)),
             secondary: Avatar(client.nameOf(n), nick: n, size: 40),
             title: Text(client.nameOf(n)),
-            subtitle: Text('@$n', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+            subtitle: Text('@${client.handleOf(n)}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
           ),
       ]),
     );
@@ -210,7 +210,7 @@ class GroupScreen extends StatelessWidget {
               ListTile(
                 leading: Avatar(client.nameOf(m), nick: m, size: 40),
                 title: Text(client.nameOf(m)),
-                subtitle: Text('@$m', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
+                subtitle: Text('@${client.handleOf(m)}', style: TextStyle(fontSize: 13, color: c.ink.withValues(alpha: 0.55))),
                 trailing: admins.contains(m) ? Text('админ', style: TextStyle(fontSize: 12, color: c.grayPurple)) : null,
                 onTap: admin && m != client.nick ? () => _member(context, m) : null,
               ),
