@@ -157,6 +157,25 @@ void main() {
     await annaWs.sink.close();
   });
 
+  test('название, место и время входа видит только владелец', () async {
+    final req = await HttpClient().postUrl(base.resolve('/api/register'));
+    req.headers
+      ..set('cf-ipcountry', 'UA')
+      ..set('cf-ipcity', 'Kyiv');
+    req.add(utf8.encode(jsonEncode({'nick': 'den', 'password': 'secret2', 'deviceName': '  Pixel 8  '})));
+    final den = jsonDecode(await (await req.close()).transform(utf8.decoder).join());
+    await post('/api/keys', keys('idDen'), method: 'PUT', token: den['token']);
+    final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
+
+    final [mine] = await get('/api/devices/den', den['token']) as List;
+    expect(mine, containsPair('name', 'Pixel 8'));
+    expect(mine, containsPair('place', 'Kyiv, UA'));
+    expect(mine['createdAt'], isA<int>());
+    expect(await get('/api/devices/den', anna['token']), [
+      {'device': 1, 'identityKey': id('idDen'), 'accountKey': id('idDen')},
+    ], reason: 'собеседник не видит название и место');
+  });
+
   test('ключи: публикация, выдача и одноразовые prekey', () async {
     final (_, anna) = await post('/api/register', {'nick': 'anna', 'password': 'secret1'});
     final (_, den) = await post('/api/register', {'nick': 'den', 'password': 'secret2'});

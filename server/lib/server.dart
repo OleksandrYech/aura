@@ -108,6 +108,10 @@ class AuraServer {
     if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'seen_at')) {
       db.execute('ALTER TABLE devices ADD COLUMN seen_at INTEGER');
     }
+    // Название устройства от клиента и примерное место входа: видны только владельцу аккаунта.
+    if (!db.select('PRAGMA table_info(devices)').any((c) => c['name'] == 'label')) {
+      db.execute('ALTER TABLE devices ADD COLUMN label TEXT; ALTER TABLE devices ADD COLUMN place TEXT;');
+    }
     // Один ключ на аккаунт: устройства со своим ключом (входы до привязки) удаляются вместе с очередью
     // и при следующем подключении получают 4401 — их надо привязать заново.
     db.execute('''
@@ -260,7 +264,7 @@ class AuraServer {
       hash,
       _now(),
     ]);
-    return _session(nick);
+    return _session(nick, req, body);
   }
 
   Future<Response> _login(Request req) async {
@@ -288,7 +292,7 @@ class AuraServer {
     );
     final devices = db.select('SELECT count(*) AS n FROM devices WHERE nick = ?', [nick]).first['n'] as int;
     if (devices >= maxDevices) return _error(403, 'Слишком много устройств: отвяжите лишние в настройках');
-    return _session(nick);
+    return _session(nick, req, body);
   }
 
   /// Найти можно только по точному никнейму: список всех пользователей не раскрывается.
@@ -309,17 +313,31 @@ class AuraServer {
 
   /// Каждый вход создаёт новое устройство. Номера устройств не повторяются,
   /// поэтому ключ на одном адресе «ник:устройство» никогда не меняется.
-  Response _session(String nick) {
+  /// Название устройства присылает клиент. Место — город и страна из заголовков Cloudflare
+  /// (cf-ipcity есть, только если в зоне включены заголовки местоположения); IP не сохраняется.
+  Response _session(String nick, Request req, Map body) {
+    String? short(Object? s) {
+      final t = s is String ? s.trim() : '';
+      return t.isEmpty ? null : t.substring(0, min(t.length, 64));
+    }
+
+    final country = req.headers['cf-ipcountry'];
+    final place = [
+      req.headers['cf-ipcity'],
+      if (country != 'XX' && country != 'T1') country,
+    ].whereType<String>().where((s) => s.isNotEmpty).join(', ');
     final token = base64Url.encode(List.generate(32, (_) => _random.nextInt(256)));
     final user = db.select(
       'UPDATE users SET next_device = next_device + 1 WHERE nick = ? RETURNING name, identity_key, next_device - 1 AS device',
       [nick],
     ).first;
-    db.execute('INSERT INTO devices (token_hash, nick, device, created_at) VALUES (?, ?, ?, ?)', [
+    db.execute('INSERT INTO devices (token_hash, nick, device, created_at, label, place) VALUES (?, ?, ?, ?, ?, ?)', [
       _sha(token),
       nick,
       user['device'],
       _now(),
+      short(body['deviceName']),
+      short(place),
     ]);
     return _ok({
       'token': token,
@@ -451,7 +469,7 @@ class AuraServer {
 
   /// Устройства собеседника, готовые принимать сообщения (с ключами).
   List<Row> _readyDevices(String nick) => db.select(
-    'SELECT device, identity_key FROM devices WHERE nick = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL ORDER BY device',
+    'SELECT device, identity_key, label, place, created_at FROM devices WHERE nick = ? AND identity_key IS NOT NULL AND signed_prekey IS NOT NULL ORDER BY device',
     [nick],
   );
 
@@ -498,11 +516,18 @@ class AuraServer {
   }
 
   /// accountKey — ключ аккаунта, одинаковый во всех записях: список остаётся списком для старых клиентов.
+  /// Название, место и время входа получает только владелец аккаунта.
   Response _devices(Request req, Device me, String nick) {
-    final account = db.select('SELECT identity_key FROM users WHERE nick = ?', [nick.toLowerCase()]).firstOrNull;
+    nick = nick.toLowerCase();
+    final account = db.select('SELECT identity_key FROM users WHERE nick = ?', [nick]).firstOrNull;
     return _ok([
-      for (final r in _readyDevices(nick.toLowerCase()))
-        {'device': r['device'], 'identityKey': r['identity_key'], 'accountKey': account?['identity_key']},
+      for (final r in _readyDevices(nick))
+        {
+          'device': r['device'],
+          'identityKey': r['identity_key'],
+          'accountKey': account?['identity_key'],
+          if (nick == me.nick) ...{'name': r['label'], 'place': r['place'], 'createdAt': r['created_at']},
+        },
     ]);
   }
 
