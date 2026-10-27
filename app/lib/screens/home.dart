@@ -294,6 +294,38 @@ class _ChatScreenState extends State<ChatScreen> {
   /// id выбранных сообщений; пока выбор не пуст, нажатие выбирает, а не открывает.
   final _selected = <String>{};
 
+  final _scroll = ScrollController();
+
+  /// Ключи построенных пузырей по id: по ним список докручивается до сообщения.
+  final _keys = <String, GlobalKey>{};
+
+  /// Сообщение, к которому перешли по цитате: подсвечено, пока не погаснет [_flashTimer].
+  String? _flash;
+  Timer? _flashTimer;
+
+  /// Переход к сообщению по цитате ответа. Список строит только видимое, поэтому листаем
+  /// к старым сообщениям, пока пузырь не появится, и докручиваем к нему.
+  Future<void> _jumpTo(String id) async {
+    if (!(client.chats[widget.peer] ?? []).any((m) => m.id == id)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Сообщение удалено')));
+      return;
+    }
+    while (mounted && _keys[id]?.currentContext == null) {
+      final p = _scroll.position;
+      if (p.pixels >= p.maxScrollExtent) return; // не нашли (не должно случаться)
+      _scroll.jumpTo(min(p.pixels + p.viewportDimension, p.maxScrollExtent));
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    if (!mounted) return;
+    await Scrollable.ensureVisible(_keys[id]!.currentContext!, alignment: 0.5, duration: const Duration(milliseconds: 300));
+    if (!mounted) return;
+    setState(() => _flash = id);
+    _flashTimer?.cancel();
+    _flashTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _flash = null);
+    });
+  }
+
   List<Message> get _chosen => [
     for (final m in client.chats[widget.peer] ?? <Message>[])
       if (_selected.contains(m.id)) m,
@@ -313,6 +345,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     client.removeListener(_markRead);
     _focus.dispose();
+    _scroll.dispose();
+    _flashTimer?.cancel();
     _ticker?.cancel();
     _recorder?.cancel().whenComplete(_recorder!.dispose);
     super.dispose();
@@ -765,6 +799,7 @@ class _ChatScreenState extends State<ChatScreen> {
               builder: (context, _) {
                 final messages = client.chats[widget.peer] ?? const [];
                 return ListView.separated(
+                  controller: _scroll,
                   reverse: true, // новые сообщения снизу и всегда в поле зрения
                   padding: const EdgeInsets.all(16),
                   itemCount: messages.length,
@@ -788,15 +823,17 @@ class _ChatScreenState extends State<ChatScreen> {
                           : null,
                       onLongPressStart: (d) => _selected.isNotEmpty ? _toggle(m) : _menu(m, d.globalPosition),
                       onSecondaryTapDown: (d) => _menu(m, d.globalPosition),
-                      child: ColoredBox(
-                        color: _selected.contains(m.id) ? c.lavender.withValues(alpha: 0.45) : Colors.transparent,
+                      child: AnimatedContainer(
+                        key: _keys.putIfAbsent(m.id, GlobalKey.new),
+                        duration: const Duration(milliseconds: 300),
+                        color: _selected.contains(m.id) || _flash == m.id ? c.lavender.withValues(alpha: 0.45) : Colors.transparent,
                         child: Align(
                           alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
                           child: IgnorePointer(
                             ignoring: _selected.isNotEmpty,
                             child: Column(
                               crossAxisAlignment: m.mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-                              children: [MessageBubble(m), if (m.reactions.isNotEmpty) _reactions(m, c)],
+                              children: [MessageBubble(m, onQuote: _jumpTo), if (m.reactions.isNotEmpty) _reactions(m, c)],
                             ),
                           ),
                         ),
@@ -974,8 +1011,11 @@ class Quote extends StatelessWidget {
 /// Пузырь сообщения. Фото и видео в нём от края до края: скруглены как сам пузырь, без рамки вокруг,
 /// а время без подписи лежит прямо на превью.
 class MessageBubble extends StatelessWidget {
-  const MessageBubble(this.m, {super.key});
+  const MessageBubble(this.m, {super.key, this.onQuote});
   final Message m;
+
+  /// Нажатие на цитату ответа: id сообщения, на которое ответили.
+  final void Function(String id)? onQuote;
 
   static const _pad = EdgeInsets.symmetric(horizontal: 16, vertical: 12);
 
@@ -1017,7 +1057,10 @@ class MessageBubble extends StatelessWidget {
       if (m.reply case final r?)
         Padding(
           padding: const EdgeInsets.only(top: 2, bottom: 6),
-          child: Align(alignment: Alignment.centerLeft, child: Quote(r['from'], r['text'])),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: GestureDetector(onTap: () => onQuote?.call(r['id']), child: Quote(r['from'], r['text'])),
+          ),
         ),
     ];
     return Container(
