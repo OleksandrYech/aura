@@ -85,20 +85,25 @@ Future<void> _then(Future<void> Function() f) {
 Future<void> _show(String kind) async {
   await _ready;
   if (kind == 'call') {
+    await _notes
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.deleteNotificationChannel(channelId: 'calls');
     await _notes.show(
       id: _callId,
       title: 'AURA',
       body: 'Входящий звонок',
       notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
-          'calls',
+          'ring', // звук канала не меняется после создания: прежний 'calls' с мелодией AURA удаляем
           'Звонки',
           importance: Importance.max,
           priority: Priority.max,
           category: AndroidNotificationCategory.call,
           fullScreenIntent: true,
           ongoing: true,
-          sound: const RawResourceAndroidNotificationSound('aura_ring'),
+          // Мелодия, выбранная в телефоне. Как рингтон она звучит и в динамике, даже с наушниками.
+          sound: const UriAndroidNotificationSound('content://settings/system/ringtone'),
+          audioAttributesUsage: AudioAttributesUsage.notificationRingtone,
           additionalFlags: Int32List.fromList([4]), // FLAG_INSISTENT: мелодия повторяется
           timeoutAfter: 45000, // дольше звонок не ждёт
           actions: const [

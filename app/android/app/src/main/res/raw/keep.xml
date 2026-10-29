@@ -1,3 +1,3 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Release-сборка выкидывает ресурсы, на которые код ссылается только по имени: без них уведомления молча не показываются. -->
-<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@raw/aura_ring,@drawable/ic_notification" />
+<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@drawable/ic_notification" />
