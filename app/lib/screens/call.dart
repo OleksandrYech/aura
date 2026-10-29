@@ -141,7 +141,8 @@ class _CallScreenState extends State<CallScreen> {
                 mirror: big == calls.local && calls.front,
               ),
             ),
-          SafeArea(child: _controls(c, name, live, ink)),
+          // Во весь экран: без кнопок (звонок уже завершён) колонка иначе сжалась бы до текста в левом верхнем углу.
+          Positioned.fill(child: SafeArea(child: _controls(c, name, live, ink))),
           if (small)
             SafeArea(
               child: Align(
