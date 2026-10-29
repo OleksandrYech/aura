@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -72,6 +73,12 @@ class Calls extends ChangeNotifier {
       };
 
   final _tone = AudioPlayer();
+
+  /// Входящий на телефоне звонит нативно: на Android мелодией из настроек телефона, на iOS своей
+  /// (системная приложениям недоступна), и всегда через динамик, даже с наушниками.
+  static const _ringtone = MethodChannel('aura/ring');
+  static final _nativeRing =
+      !kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS);
   String? _playing;
 
   /// Гудки, пока ждём ответа, мелодия входящего и короткие сигналы, когда звонок закончился.
@@ -87,7 +94,9 @@ class Calls extends ChangeNotifier {
     // По очереди: иначе поздний stop может прийти раньше раннего play, и гудки не смолкнут.
     _toneQueue = _toneQueue.then((_) async {
       await _tone.stop();
+      if (_nativeRing) await _ringtone.invokeMethod('stop');
       if (want == null || want != _playing) return;
+      if (want == 'ringtone' && _nativeRing) return _ringtone.invokeMethod('start');
       await _tone.setReleaseMode(want == 'end' ? ReleaseMode.stop : ReleaseMode.loop);
       await _tone.play(AssetSource('sounds/$want.wav'));
     }).catchError((Object e) => debugPrint('AURA: звук звонка: $e'));
