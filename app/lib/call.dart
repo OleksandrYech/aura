@@ -60,6 +60,20 @@ class Calls extends ChangeNotifier {
     client.onCall = _onSignal;
     addListener(_sound);
     AppLifecycleListener(onStateChange: (_) => _sound());
+    // Гудки как разговор: в трубку у уха, а с громкой связью в динамик. Без этого Android играет их
+    // как музыку, всегда в нижний динамик. ponytail: только Android; на iOS контекст плеера общий
+    // для всего приложения, и голосовые сообщения тоже ушли бы в трубку.
+    if (_phone && defaultTargetPlatform == TargetPlatform.android) {
+      _toneQueue = _tone
+          .setAudioContext(AudioContext(
+            android: const AudioContextAndroid(
+              usageType: AndroidUsageType.voiceCommunication,
+              contentType: AndroidContentType.speech,
+              audioFocus: AndroidAudioFocus.none, // фокус держит WebRTC, иначе гудки замолкнут при его старте
+            ),
+          ))
+          .catchError((Object e) => debugPrint('AURA: звук звонка: $e'));
+    }
   }
 
   /// Свёрнутое приложение на Android звонит уведомлением, а не своей мелодией: Android замораживает
@@ -77,7 +91,7 @@ class Calls extends ChangeNotifier {
   /// Входящий на телефоне звонит нативно: на Android мелодией из настроек телефона, на iOS своей
   /// (системная приложениям недоступна), и всегда через динамик, даже с наушниками.
   static const _ringtone = MethodChannel('aura/ring');
-  static final _nativeRing =
+  static final _phone =
       !kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS);
   String? _playing;
 
@@ -94,11 +108,11 @@ class Calls extends ChangeNotifier {
     // По очереди: иначе поздний stop может прийти раньше раннего play, и гудки не смолкнут.
     _toneQueue = _toneQueue.then((_) async {
       await _tone.stop();
-      if (_nativeRing) await _ringtone.invokeMethod('stop');
+      if (_phone) await _ringtone.invokeMethod('stop');
       if (want == null || want != _playing) return;
-      if (want == 'ringtone' && _nativeRing) return _ringtone.invokeMethod('start');
+      if (want == 'ringtone' && _phone) return _ringtone.invokeMethod('start');
       await _tone.setReleaseMode(want == 'end' ? ReleaseMode.stop : ReleaseMode.loop);
-      await _tone.play(AssetSource('sounds/$want.wav'));
+      await _tone.play(AssetSource('sounds/$want.wav'), volume: want == 'ringback' ? 0.75 : 1);
     }).catchError((Object e) => debugPrint('AURA: звук звонка: $e'));
   }
 
@@ -320,6 +334,8 @@ class Calls extends ChangeNotifier {
       _audioReady = true;
     }
     _mic = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    // WebRTC по умолчанию начинает с громкой связи; начинаем с трубки, как показывает кнопка «Динамик».
+    if (_phone) await Helper.setSpeakerphoneOn(speaker);
     final pc = _pc = await createPeerConnection({'iceServers': await client.iceServers()});
     for (final t in _mic!.getAudioTracks()) {
       await pc.addTrack(t, _mic!);
